@@ -9,7 +9,7 @@ Stakeholders in modern enterprises often require immediate insights from structu
 Designed for a 1-week rapid prototyping cycle, this solution integrates multiple AI paradigms to deliver a secure, scalable, and highly accurate query generation pipeline. Crucially, the architecture strictly separates the generative reasoning environment from the local data execution environment, ensuring absolute data privacy.
 
 ### 🧠 Integrated AI Paradigms
-1. **Generative AI (LLMs):** Utilizing `gemini-2.0-flash` strictly as a translation layer (Natural Language → SQLite syntax).
+1. **Generative AI (LLMs):** Utilizing `gemini-2.5-flash` strictly as a translation layer (Natural Language → SQLite syntax).
 2. **Structural Knowledge Representation:** Deterministic extraction and injection of the database schema (Data Definition Language) into the LLM context, grounding the model to prevent hallucinations.
 3. **Deterministic Logic / Expert Rules:** A programmatic safety boundary that intercepts the generated SQL and evaluates it against strict read-only rules prior to execution.
 
@@ -60,7 +60,6 @@ Before running the app, you must convert the raw CSV files into the local SQLite
 ```bash
 python scripts/init_database.py
 ```
-*This script uses Pandas to ingest `students.csv`, `courses.csv`, and `grades.csv`, creating `university_agent.db`.*
 
 ### Step 2: Launch the App
 Start the Streamlit interface:
@@ -93,4 +92,4 @@ This MVP was intentionally designed with specific constraints to explore the tra
 * **Scalability vs. Context Limits:** The current architecture utilizes **Static Schema Injection**, which is highly efficient and 100% accurate for small-to-medium databases. However, for enterprise databases containing thousands of tables, this approach would exceed the LLM's context window. 
     * *Future Optimization:* Implementing a **Retrieval-Augmented Generation (RAG)** pipeline using vector embeddings to dynamically retrieve only the mathematically relevant table schemas before generating the SQL.
 * **Flexibility vs. Security:** While GenAI is highly flexible, it introduces the risk of generating destructive code (e.g., hallucinating a `DROP TABLE` command). This project explicitly trades some generative flexibility for strict data security by routing all LLM outputs through a deterministic logic gate before local execution.
-* **Cost vs. Latency:** By choosing `gemini-2.0-flash` over heavier models (like GPT-4 or Gemini 1.5 Pro), the system achieves near-instantaneous translation (low latency) at a fraction of the compute cost, which is the optimal configuration for a user-facing chatbot interface.
+* **Cost vs. Latency:** By choosing `gemini-2.5-flash` over heavier models (like GPT-4 or Gemini 1.5 Pro), the system achieves near-instantaneous translation (low latency) at a fraction of the compute cost, which is the optimal configuration for a user-facing chatbot interface.
