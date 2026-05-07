@@ -27,6 +27,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from langchain_community.chat_models import ChatOllama
+from langchain_core.messages import HumanMessage, SystemMessage
+
 import pandas as pd
 try:
     import google.generativeai as genai  # type: ignore
@@ -321,7 +324,7 @@ ADDITONAL RULES - COMPARATIVE QUESTIONS (must follow):
 """
 
 
-def generate_sql(user_question: str, schema_text: str, *, model_name: str = "gemini-2.5-flash") -> str:
+def generate_sql(user_question: str, schema_text: str, *, model_name: str) -> str:
     """
     Call Gemini (google-generativeai) to generate SQL from a question + schema.
 
@@ -334,55 +337,11 @@ def generate_sql(user_question: str, schema_text: str, *, model_name: str = "gem
       We handle this with execution-time error handling and safety checks.
     - Prompt-injection risk exists (e.g., user asks to "DROP TABLE"). We still
       deterministically block dangerous tokens before execution.
+
+    Dynamically routes to Gemini API or Local Ollama based on the model_name.
+
     """
-    if genai is None:
-        raise ModuleNotFoundError(
-            "google-generativeai is not installed. Run: pip install google-generativeai"
-        )
-
-    # Load from `.env` (gitignored) if present. Safe to call repeatedly.
     load_env()
-
-    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY is missing. Set it in `.env` or environment variables.")
-
-    genai.configure(api_key=api_key)
-
-#use gemini-api
-#     model = genai.GenerativeModel(
-#         model_name,
-#         system_instruction=SQL_TRANSLATION_SYSTEM_PROMPT,
-#     )
-
-#     prompt = f"""\
-# ### SQLite schema (DDL)
-# {schema_text}
-
-# ### User question
-# {user_question}
-# """
-
-#     response = model.generate_content(
-#         contents=prompt,
-#         generation_config={
-#             "temperature": 0.0,
-#             "max_output_tokens": 512,
-#         },
-#     )
-
-#     sql = (response.text or "").strip()
-
-#     # Defensive cleanup: if the model "helpfully" returns code fences, remove them.
-#     sql = re.sub(r"^```(?:sql)?\s*", "", sql, flags=re.IGNORECASE).strip()
-#     sql = re.sub(r"\s*```$", "", sql).strip()
-
-#     return sql
-
-#use local llm (gemma3)
-    model = ChatOllama(model='gemma3',
-                        temperature=0.0,
-                        num_predict=512)
 
     prompt = f"""\
 ### SQLite schema (DDL)
@@ -391,17 +350,55 @@ def generate_sql(user_question: str, schema_text: str, *, model_name: str = "gem
 ### User question
 {user_question}
 """
+    raw_output = ""
 
     try:
-        response = model.invoke([SystemMessage(content=SQL_TRANSLATION_SYSTEM_PROMPT),
-                                HumanMessage(content=prompt),])
+        # Route 1: GEMINI API
+        if "gemini" in model_name.lower():
+            if genai is None:
+                raise ModuleNotFoundError("google-generativeai is not installed.")
+            
+            api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+            if not api_key:
+                raise ValueError("GEMINI_API_KEY is missing in .env")
+            
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(
+                model_name,
+                system_instruction=SQL_TRANSLATION_SYSTEM_PROMPT,
+            )
+            response = model.generate_content(
+                contents=prompt,
+                generation_config={
+                    "temperature": 0.0,
+                    "max_output_tokens": 512,
+                },
+            )
+            raw_output = (response.text or "").strip()
 
-        raw_output = (response.content or "").strip()
+        # Route 2: LOCAL OLLAMA
+        else:
+            model = ChatOllama(
+                model=model_name,
+                temperature=0.0,
+                num_predict=512
+            )
+            response = model.invoke([
+                SystemMessage(content=SQL_TRANSLATION_SYSTEM_PROMPT),
+                HumanMessage(content=prompt)
+            ])
+            # Use .content for LangChain
+            raw_output = (response.content or "").strip()
+
+        # ==========================================
+        # BULLETPROOF EXTRACTION (Applied to BOTH)
+        # ==========================================
         sql = raw_output # Default fallback
         
+        # Look for all markdown code blocks in the chatty response
         blocks = re.findall(r"```(?:sql)?\s*(.*?)\s*```", raw_output, flags=re.IGNORECASE | re.DOTALL)
-        
         if blocks:
+            # Find the first block that is actually a query
             for block in blocks:
                 if re.search(r"(?is)^\s*(SELECT|WITH)\b", block):
                     sql = block
@@ -409,15 +406,15 @@ def generate_sql(user_question: str, schema_text: str, *, model_name: str = "gem
             else:
                 sql = blocks[0]
         else:
+            # Fallback: hunt for a SELECT statement ending in a semicolon
             match = re.search(r"(?is)(SELECT\b.*?;)", raw_output)
             if match:
                 sql = match.group(1)
 
-        return sql.strip()  
+        return sql.strip() 
 
-        return sql
     except Exception as e:
-        return f"Error connecting to local LLM: {e}"
+        return f"Error connecting to LLM: {e}"
 
 
 _DANGEROUS_SQL_PATTERN = re.compile(
@@ -496,7 +493,7 @@ def ask_database(
     question: str,
     *,
     db_path: str = "university_agent.db",
-    model_name: str = "gemini-2.5-flash",
+    model_name: str,
 ) -> QueryResult:
     """
     End-to-end Text-to-SQL agent wrapper:
@@ -531,12 +528,45 @@ def ask_database(
         return QueryResult(columns=["error"], rows=[(f"{type(e).__name__}: {e}",)])
 
 
+def ask_database_with_sql(
+    question: str,
+    *,
+    db_path: str = "university_agent.db",
+    model_name: str,
+) -> tuple[str, QueryResult]:
+    """
+    Same as `ask_database`, but also returns the generated SQL string for UI display.
+
+    Returns:
+      (sql_text, QueryResult)
+    """
+    if not os.path.exists(db_path):
+        raise FileNotFoundError("input database not found")
+
+    schema_text = get_schema(db_path)
+    sql = generate_sql(question, schema_text, model_name=model_name)
+
+    if "UNANSWERABLE_WITH_GIVEN_SCHEMA" in sql:
+        return sql, QueryResult(columns=["error"], rows=[("UNANSWERABLE_WITH_GIVEN_SCHEMA",)])
+
+    if not is_safe_query(sql):
+        return sql, QueryResult(
+            columns=["error", "sql"],
+            rows=[("BLOCKED_UNSAFE_SQL", sql)],
+        )
+
+    try:
+        return sql, execute_query(db_path, sql)
+    except Exception as e:
+        return sql, QueryResult(columns=["error"], rows=[(f"{type(e).__name__}: {e}",)])
+
+
 def ask_from_files(
     question: str,
     file_paths: list[str] | str,
     *,
     output_db_path: str = "dynamic_agent.db",
-    model_name: str = "gemini-2.5-flash",
+    model_name: str,
 ) -> QueryResult:
     """
     Auto-select workflow:
