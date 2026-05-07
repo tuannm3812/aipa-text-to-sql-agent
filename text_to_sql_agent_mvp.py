@@ -23,20 +23,72 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-try:
-    import google.generativeai as genai  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover
-    genai = None
 
 try:
     from dotenv import load_dotenv  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
     load_dotenv = None
+
+
+DEFAULT_MODEL_NAME = "gemini-2.5-flash"
+DEFAULT_OLLAMA_MODEL = "gemma3"
+DEFAULT_PROVIDER = "gemini"
+DEFAULT_MAX_ROWS = 1_000
+DEFAULT_SQLITE_PROGRESS_STEPS = 100_000
+
+
+def _load_gemini_sdk() -> Any:
+    try:
+        import google.generativeai as genai  # type: ignore
+    except ModuleNotFoundError as e:  # pragma: no cover
+        raise ModuleNotFoundError(
+            "google-generativeai is not installed. Run: pip install google-generativeai"
+        ) from e
+    return genai
+
+
+def _load_ollama_sdk() -> tuple[Any, Any, Any]:
+    try:
+        from langchain_ollama import ChatOllama  # type: ignore
+        from langchain_core.messages import HumanMessage, SystemMessage  # type: ignore
+    except ModuleNotFoundError as e:  # pragma: no cover
+        raise ModuleNotFoundError(
+            "Ollama support requires langchain-ollama and langchain-core. "
+            "Run: pip install langchain-ollama langchain-core"
+        ) from e
+    return ChatOllama, HumanMessage, SystemMessage
+
+
+def _strip_code_fences(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^```(?:sql)?\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\s*```$", "", text).strip()
+    return text
+
+
+def _extract_sql_from_text(raw_output: str) -> str:
+    raw_output = raw_output.strip()
+    blocks = re.findall(
+        r"```(?:sql)?\s*(.*?)\s*```",
+        raw_output,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for block in blocks:
+        if re.search(r"(?is)^\s*(SELECT|WITH)\b", block):
+            return block.strip()
+    if blocks:
+        return blocks[0].strip()
+
+    match = re.search(r"(?is)\b(SELECT|WITH)\b.*?;?$", raw_output)
+    if match:
+        return raw_output[match.start():].strip()
+    return raw_output
 
 
 def load_env(env_path: str | None = None) -> None:
@@ -146,7 +198,7 @@ def write_university_db(db_path: str = "university_agent.db") -> str:
     if os.path.exists(db_path):
         os.remove(db_path)
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.execute("PRAGMA foreign_keys = ON;")
 
         # Write tables (initially without constraints)
@@ -198,6 +250,7 @@ def write_university_db(db_path: str = "university_agent.db") -> str:
             PRAGMA foreign_keys = ON;
             """
         )
+        conn.commit()
 
     return db_path
 
@@ -227,7 +280,9 @@ def ingest_csvs_to_db(csv_file_paths: list[str], output_db_path: str = "dynamic_
     if out_path.exists():
         out_path.unlink()
 
-    with sqlite3.connect(str(out_path)) as conn:
+    used_table_names: set[str] = set()
+
+    with closing(sqlite3.connect(str(out_path))) as conn:
         for csv_path_str in csv_file_paths:
             csv_path = Path(csv_path_str)
             if not csv_path.exists():
@@ -235,11 +290,31 @@ def ingest_csvs_to_db(csv_file_paths: list[str], output_db_path: str = "dynamic_
             if csv_path.suffix.lower() != ".csv":
                 raise ValueError(f"Not a .csv file: {csv_path}")
 
-            table_name = csv_path.stem
+            table_name = normalize_table_name(csv_path.stem, used_table_names)
+            used_table_names.add(table_name)
             df = pd.read_csv(csv_path)
             df.to_sql(table_name, conn, if_exists="replace", index=False)
+        conn.commit()
 
     return str(out_path)
+
+
+def normalize_table_name(raw_name: str, existing_names: set[str] | None = None) -> str:
+    """Convert a CSV filename stem into a conservative SQLite table name."""
+    cleaned = re.sub(r"[^0-9a-zA-Z_]+", "_", raw_name).strip("_").lower()
+    if not cleaned:
+        cleaned = "table"
+    if cleaned[0].isdigit():
+        cleaned = f"table_{cleaned}"
+    if existing_names is None or cleaned not in existing_names:
+        return cleaned
+
+    i = 2
+    candidate = f"{cleaned}_{i}"
+    while candidate in existing_names:
+        i += 1
+        candidate = f"{cleaned}_{i}"
+    return candidate
 
 
 # ============================================================
@@ -255,7 +330,7 @@ def get_schema(db_path: str) -> str:
     - It scales poorly: as schema grows, prompt length grows and costs/latency rise.
     - Still, for small-to-medium schemas in an MVP, it's a strong baseline.
     """
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         rows = conn.execute(
             """
             SELECT sql
@@ -321,7 +396,13 @@ ADDITONAL RULES - COMPARATIVE QUESTIONS (must follow):
 """
 
 
-def generate_sql(user_question: str, schema_text: str, *, model_name: str = "gemini-2.5-flash") -> str:
+def generate_sql(
+    user_question: str,
+    schema_text: str,
+    *,
+    model_name: str = DEFAULT_MODEL_NAME,
+    provider: str | None = None,
+) -> str:
     """
     Call Gemini (google-generativeai) to generate SQL from a question + schema.
 
@@ -335,54 +416,8 @@ def generate_sql(user_question: str, schema_text: str, *, model_name: str = "gem
     - Prompt-injection risk exists (e.g., user asks to "DROP TABLE"). We still
       deterministically block dangerous tokens before execution.
     """
-    if genai is None:
-        raise ModuleNotFoundError(
-            "google-generativeai is not installed. Run: pip install google-generativeai"
-        )
-
-    # Load from `.env` (gitignored) if present. Safe to call repeatedly.
     load_env()
-
-    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
-    if not api_key:
-        raise ValueError("GEMINI_API_KEY is missing. Set it in `.env` or environment variables.")
-
-    genai.configure(api_key=api_key)
-
-#use gemini-api
-#     model = genai.GenerativeModel(
-#         model_name,
-#         system_instruction=SQL_TRANSLATION_SYSTEM_PROMPT,
-#     )
-
-#     prompt = f"""\
-# ### SQLite schema (DDL)
-# {schema_text}
-
-# ### User question
-# {user_question}
-# """
-
-#     response = model.generate_content(
-#         contents=prompt,
-#         generation_config={
-#             "temperature": 0.0,
-#             "max_output_tokens": 512,
-#         },
-#     )
-
-#     sql = (response.text or "").strip()
-
-#     # Defensive cleanup: if the model "helpfully" returns code fences, remove them.
-#     sql = re.sub(r"^```(?:sql)?\s*", "", sql, flags=re.IGNORECASE).strip()
-#     sql = re.sub(r"\s*```$", "", sql).strip()
-
-#     return sql
-
-#use local llm (gemma3)
-    model = ChatOllama(model='gemma3',
-                        temperature=0.0,
-                        num_predict=512)
+    selected_provider = (provider or os.environ.get("TEXT_TO_SQL_PROVIDER") or DEFAULT_PROVIDER).strip().lower()
 
     prompt = f"""\
 ### SQLite schema (DDL)
@@ -392,32 +427,42 @@ def generate_sql(user_question: str, schema_text: str, *, model_name: str = "gem
 {user_question}
 """
 
-    try:
-        response = model.invoke([SystemMessage(content=SQL_TRANSLATION_SYSTEM_PROMPT),
-                                HumanMessage(content=prompt),])
+    if selected_provider == "gemini":
+        genai = _load_gemini_sdk()
+        api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY is missing. Set it in `.env` or environment variables.")
 
-        raw_output = (response.content or "").strip()
-        sql = raw_output # Default fallback
-        
-        blocks = re.findall(r"```(?:sql)?\s*(.*?)\s*```", raw_output, flags=re.IGNORECASE | re.DOTALL)
-        
-        if blocks:
-            for block in blocks:
-                if re.search(r"(?is)^\s*(SELECT|WITH)\b", block):
-                    sql = block
-                    break
-            else:
-                sql = blocks[0]
-        else:
-            match = re.search(r"(?is)(SELECT\b.*?;)", raw_output)
-            if match:
-                sql = match.group(1)
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(
+            model_name,
+            system_instruction=SQL_TRANSLATION_SYSTEM_PROMPT,
+        )
+        response = model.generate_content(
+            contents=prompt,
+            generation_config={
+                "temperature": 0.0,
+                "max_output_tokens": 512,
+            },
+        )
+        return _strip_code_fences(response.text or "")
 
-        return sql.strip()  
+    if selected_provider == "ollama":
+        ChatOllama, HumanMessage, SystemMessage = _load_ollama_sdk()
+        model = ChatOllama(
+            model=model_name or DEFAULT_OLLAMA_MODEL,
+            temperature=0.0,
+            num_predict=512,
+        )
+        response = model.invoke(
+            [
+                SystemMessage(content=SQL_TRANSLATION_SYSTEM_PROMPT),
+                HumanMessage(content=prompt),
+            ]
+        )
+        return _extract_sql_from_text(str(response.content or ""))
 
-        return sql
-    except Exception as e:
-        return f"Error connecting to local LLM: {e}"
+    raise ValueError("Unsupported provider. Use 'gemini' or 'ollama'.")
 
 
 _DANGEROUS_SQL_PATTERN = re.compile(
@@ -470,9 +515,63 @@ def is_safe_query(sql_string: str) -> bool:
 class QueryResult:
     columns: list[str]
     rows: list[tuple[Any, ...]]
+    sql: str | None = None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
 
 
-def execute_query(db_path: str, sql_string: str) -> QueryResult:
+def _read_only_sqlite_connection(db_path: str) -> sqlite3.Connection:
+    resolved = Path(db_path).resolve()
+    uri = f"{resolved.as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON;")
+    conn.set_authorizer(_sqlite_read_only_authorizer)
+    return conn
+
+
+def _sqlite_read_only_authorizer(action: int, *_args: Any) -> int:
+    denied_actions = {
+        sqlite3.SQLITE_INSERT,
+        sqlite3.SQLITE_UPDATE,
+        sqlite3.SQLITE_DELETE,
+        sqlite3.SQLITE_TRANSACTION,
+        sqlite3.SQLITE_ATTACH,
+        sqlite3.SQLITE_DETACH,
+        sqlite3.SQLITE_ALTER_TABLE,
+        sqlite3.SQLITE_DROP_TABLE,
+        sqlite3.SQLITE_DROP_INDEX,
+        sqlite3.SQLITE_DROP_TRIGGER,
+        sqlite3.SQLITE_DROP_VIEW,
+        sqlite3.SQLITE_CREATE_INDEX,
+        sqlite3.SQLITE_CREATE_TABLE,
+        sqlite3.SQLITE_CREATE_TRIGGER,
+        sqlite3.SQLITE_CREATE_VIEW,
+        sqlite3.SQLITE_CREATE_TEMP_INDEX,
+        sqlite3.SQLITE_CREATE_TEMP_TABLE,
+        sqlite3.SQLITE_CREATE_TEMP_TRIGGER,
+        sqlite3.SQLITE_CREATE_TEMP_VIEW,
+        sqlite3.SQLITE_DROP_TEMP_INDEX,
+        sqlite3.SQLITE_DROP_TEMP_TABLE,
+        sqlite3.SQLITE_DROP_TEMP_TRIGGER,
+        sqlite3.SQLITE_DROP_TEMP_VIEW,
+        sqlite3.SQLITE_PRAGMA,
+        sqlite3.SQLITE_REINDEX,
+        sqlite3.SQLITE_ANALYZE,
+    }
+    return sqlite3.SQLITE_DENY if action in denied_actions else sqlite3.SQLITE_OK
+
+
+def execute_query(
+    db_path: str,
+    sql_string: str,
+    *,
+    max_rows: int = DEFAULT_MAX_ROWS,
+    progress_steps: int = DEFAULT_SQLITE_PROGRESS_STEPS,
+) -> QueryResult:
     """
     Execute a SQL query against SQLite and return all rows.
 
@@ -480,12 +579,24 @@ def execute_query(db_path: str, sql_string: str) -> QueryResult:
     - `fetchall()` is fine for MVP/small results. For large outputs you'd paginate
       or stream results.
     """
-    with sqlite3.connect(db_path) as conn:
-        conn.row_factory = sqlite3.Row
+    if max_rows < 1:
+        raise ValueError("max_rows must be at least 1")
+
+    with closing(_read_only_sqlite_connection(db_path)) as conn:
+        if progress_steps > 0:
+            conn.set_progress_handler(lambda: 1, progress_steps)
         cur = conn.execute(sql_string)
-        rows = cur.fetchall()
+        rows = cur.fetchmany(max_rows + 1)
         columns = [d[0] for d in cur.description] if cur.description else []
-        return QueryResult(columns=columns, rows=[tuple(r) for r in rows])
+        capped_rows = rows[:max_rows]
+        if len(rows) > max_rows:
+            return QueryResult(
+                columns=columns,
+                rows=[tuple(r) for r in capped_rows],
+                sql=sql_string,
+                error=f"RESULT_TRUNCATED_TO_{max_rows}_ROWS",
+            )
+        return QueryResult(columns=columns, rows=[tuple(r) for r in capped_rows], sql=sql_string)
 
 
 # ============================================================
@@ -496,7 +607,8 @@ def ask_database(
     question: str,
     *,
     db_path: str = "university_agent.db",
-    model_name: str = "gemini-2.5-flash",
+    model_name: str = DEFAULT_MODEL_NAME,
+    provider: str | None = None,
 ) -> QueryResult:
     """
     End-to-end Text-to-SQL agent wrapper:
@@ -512,15 +624,17 @@ def ask_database(
 
     try:
         schema_text = get_schema(db_path)
-        sql = generate_sql(question, schema_text, model_name=model_name)
+        sql = generate_sql(question, schema_text, model_name=model_name, provider=provider)
 
         if "UNANSWERABLE_WITH_GIVEN_SCHEMA" in sql:
-            return QueryResult(columns=["error"], rows=[("UNANSWERABLE_WITH_GIVEN_SCHEMA",)])
+            return QueryResult(columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA")
 
         if not is_safe_query(sql):
             return QueryResult(
-                columns=["error", "sql"],
-                rows=[("BLOCKED_UNSAFE_SQL", sql)],
+                columns=[],
+                rows=[],
+                sql=sql,
+                error="BLOCKED_UNSAFE_SQL",
             )
 
         return execute_query(db_path, sql)
@@ -528,7 +642,7 @@ def ask_database(
     except Exception as e:
         # For an MVP, we return a compact message.
         # In production you'd log full stack traces and implement retries/timeouts.
-        return QueryResult(columns=["error"], rows=[(f"{type(e).__name__}: {e}",)])
+        return QueryResult(columns=[], rows=[], error=f"{type(e).__name__}: {e}")
 
 
 def ask_from_files(
@@ -536,7 +650,8 @@ def ask_from_files(
     file_paths: list[str] | str,
     *,
     output_db_path: str = "dynamic_agent.db",
-    model_name: str = "gemini-2.5-flash",
+    model_name: str = DEFAULT_MODEL_NAME,
+    provider: str | None = None,
 ) -> QueryResult:
     """
     Auto-select workflow:
@@ -554,11 +669,11 @@ def ask_from_files(
     if exts == {".db"}:
         if len(paths) != 1:
             raise ValueError("Provide exactly one .db file path")
-        return ask_database(question, db_path=paths[0], model_name=model_name)
+        return ask_database(question, db_path=paths[0], model_name=model_name, provider=provider)
 
     if exts == {".csv"}:
         db_path = ingest_csvs_to_db(paths, output_db_path=output_db_path)
-        return ask_database(question, db_path=db_path, model_name=model_name)
+        return ask_database(question, db_path=db_path, model_name=model_name, provider=provider)
 
     raise ValueError(f"Unsupported or mixed file types: {sorted(exts)}")
 
