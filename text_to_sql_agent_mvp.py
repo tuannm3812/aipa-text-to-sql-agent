@@ -23,6 +23,8 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import math
+from collections import Counter
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +45,24 @@ DEFAULT_MAX_ROWS = 1_000
 DEFAULT_SQLITE_PROGRESS_STEPS = 100_000
 DEFAULT_RAG_TOP_K = 6
 DEFAULT_RAG_NEIGHBORS = 1
+
+RAG_SYNONYMS = {
+    "client": ["customer", "customers"],
+    "clients": ["customer", "customers"],
+    "buyer": ["customer", "customers"],
+    "buyers": ["customer", "customers"],
+    "income": ["revenue", "amount", "sales"],
+    "revenue": ["amount", "sales", "total"],
+    "sale": ["sales", "amount"],
+    "sales": ["sale", "amount", "revenue"],
+    "spend": ["amount", "sales"],
+    "course": ["courses", "class"],
+    "classes": ["courses", "course"],
+    "student": ["students", "learner"],
+    "patients": ["patient", "healthcare"],
+    "patient": ["patients", "healthcare"],
+    "region": ["location", "area"],
+}
 
 
 _STOPWORDS = {
@@ -367,6 +387,13 @@ def _tokenize_for_rag(text: str) -> list[str]:
     return expanded
 
 
+def _expand_query_tokens(tokens: list[str]) -> list[str]:
+    expanded = list(tokens)
+    for token in tokens:
+        expanded.extend(RAG_SYNONYMS.get(token, []))
+    return expanded
+
+
 def get_schema_chunks(db_path: str) -> list[SchemaChunk]:
     """
     Build table-level schema chunks for retrieval.
@@ -422,27 +449,79 @@ def retrieve_schema_chunks(
     """
     Retrieve the most relevant schema chunks for a natural-language question.
 
-    This is a lexical RAG baseline: exact token overlap is weighted higher for
-    table/column names than generic DDL text. It is deterministic, local, and
-    enough to demonstrate the RAG architecture before adding embeddings.
+    This is a deterministic hybrid retriever:
+    - BM25-style scoring over schema text
+    - extra boosts for table and column matches
+    - synonym expansion for common business terms
+    - foreign-key graph expansion for joinable neighbor tables
     """
-    chunks = get_schema_chunks(db_path)
-    if not chunks:
-        return []
-    if top_k <= 0 or len(chunks) <= top_k:
-        return chunks
+    return retrieve_schema_context(
+        db_path,
+        question,
+        top_k=top_k,
+        include_neighbors=include_neighbors,
+    ).chunks
 
-    question_tokens = set(_tokenize_for_rag(question))
+
+def retrieve_schema_context(
+    db_path: str,
+    question: str,
+    *,
+    top_k: int = DEFAULT_RAG_TOP_K,
+    include_neighbors: int = DEFAULT_RAG_NEIGHBORS,
+) -> SchemaRetrievalResult:
+    chunks = get_schema_chunks(db_path)
+    query_tokens = _tokenize_for_rag(question)
+    expanded_tokens = _expand_query_tokens(query_tokens)
+
+    if not chunks:
+        return SchemaRetrievalResult([], query_tokens, expanded_tokens, top_k)
+    if top_k <= 0:
+        return SchemaRetrievalResult(chunks, query_tokens, expanded_tokens, top_k)
+
+    doc_tokens = [_tokenize_for_rag(chunk.search_text) for chunk in chunks]
+    doc_lengths = [len(tokens) or 1 for tokens in doc_tokens]
+    avg_doc_len = sum(doc_lengths) / len(doc_lengths)
+
+    doc_freq: Counter[str] = Counter()
+    for tokens in doc_tokens:
+        doc_freq.update(set(tokens))
+
+    query_counter = Counter(expanded_tokens)
     scored: list[SchemaChunk] = []
-    for chunk in chunks:
+    for chunk, tokens, doc_len in zip(chunks, doc_tokens, doc_lengths):
+        token_counts = Counter(tokens)
         table_tokens = set(_tokenize_for_rag(chunk.table_name))
         column_tokens = set(_tokenize_for_rag(" ".join(chunk.columns)))
-        text_tokens = set(_tokenize_for_rag(chunk.search_text))
+        text_token_set = set(tokens)
 
         score = 0.0
-        score += 6.0 * len(question_tokens & table_tokens)
-        score += 3.0 * len(question_tokens & column_tokens)
-        score += 1.0 * len(question_tokens & text_tokens)
+        matched_terms: set[str] = set()
+        reasons: list[str] = []
+
+        for token, query_weight in query_counter.items():
+            if token not in token_counts:
+                continue
+            matched_terms.add(token)
+            idf = math.log(1 + (len(chunks) - doc_freq[token] + 0.5) / (doc_freq[token] + 0.5))
+            tf = token_counts[token]
+            denominator = tf + 1.5 * (1 - 0.75 + 0.75 * doc_len / avg_doc_len)
+            score += idf * ((tf * 2.5) / denominator) * max(1, query_weight)
+
+        table_matches = sorted(set(expanded_tokens) & table_tokens)
+        column_matches = sorted(set(expanded_tokens) & column_tokens)
+        weak_matches = sorted(set(expanded_tokens) & text_token_set)
+        if table_matches:
+            score += 8.0 * len(table_matches)
+            reasons.append(f"table match: {', '.join(table_matches)}")
+            matched_terms.update(table_matches)
+        if column_matches:
+            score += 4.0 * len(column_matches)
+            reasons.append(f"column match: {', '.join(column_matches)}")
+            matched_terms.update(column_matches)
+        if weak_matches and not (table_matches or column_matches):
+            reasons.append(f"schema text match: {', '.join(weak_matches[:6])}")
+
         scored.append(
             SchemaChunk(
                 table_name=chunk.table_name,
@@ -451,6 +530,8 @@ def retrieve_schema_chunks(
                 foreign_tables=chunk.foreign_tables,
                 search_text=chunk.search_text,
                 score=score,
+                matched_terms=sorted(matched_terms),
+                match_reasons=reasons,
             )
         )
 
@@ -462,17 +543,33 @@ def retrieve_schema_chunks(
     if include_neighbors > 0:
         chunk_by_name = {chunk.table_name: chunk for chunk in scored}
         frontier = list(selected)
-        for _ in range(include_neighbors):
+        for depth in range(include_neighbors):
             next_frontier: list[SchemaChunk] = []
             for chunk in frontier:
                 for neighbor in chunk.foreign_tables:
                     if neighbor in chunk_by_name and neighbor not in selected_names:
                         selected_names.add(neighbor)
-                        next_frontier.append(chunk_by_name[neighbor])
+                        neighbor_chunk = chunk_by_name[neighbor]
+                        next_frontier.append(
+                            SchemaChunk(
+                                table_name=neighbor_chunk.table_name,
+                                ddl=neighbor_chunk.ddl,
+                                columns=neighbor_chunk.columns,
+                                foreign_tables=neighbor_chunk.foreign_tables,
+                                search_text=neighbor_chunk.search_text,
+                                score=max(neighbor_chunk.score, chunk.score * (0.35 / (depth + 1))),
+                                matched_terms=neighbor_chunk.matched_terms or [],
+                                match_reasons=[
+                                    *(neighbor_chunk.match_reasons or []),
+                                    f"foreign-key neighbor of {chunk.table_name}",
+                                ],
+                            )
+                        )
             selected.extend(next_frontier)
             frontier = next_frontier
 
-    return sorted(selected, key=lambda c: c.table_name)
+    selected = sorted(selected, key=lambda c: (-c.score, c.table_name))
+    return SchemaRetrievalResult(selected, query_tokens, expanded_tokens, top_k)
 
 
 def retrieve_relevant_schema(
@@ -482,8 +579,7 @@ def retrieve_relevant_schema(
     top_k: int = DEFAULT_RAG_TOP_K,
 ) -> str:
     """Return retrieved DDL snippets for the prompt."""
-    chunks = retrieve_schema_chunks(db_path, question, top_k=top_k)
-    return "\n\n".join(chunk.ddl for chunk in chunks)
+    return retrieve_schema_context(db_path, question, top_k=top_k).schema_text
 
 
 SQL_TRANSLATION_SYSTEM_PROMPT = """\
@@ -671,6 +767,40 @@ class SchemaChunk:
     foreign_tables: list[str]
     search_text: str
     score: float = 0.0
+    matched_terms: list[str] | None = None
+    match_reasons: list[str] | None = None
+
+
+@dataclass(frozen=True)
+class SchemaRetrievalResult:
+    chunks: list[SchemaChunk]
+    query_tokens: list[str]
+    expanded_tokens: list[str]
+    top_k: int
+    strategy: str = "hybrid-bm25-graph"
+
+    @property
+    def schema_text(self) -> str:
+        return "\n\n".join(chunk.ddl for chunk in self.chunks)
+
+    @property
+    def report(self) -> str:
+        if not self.chunks:
+            return "No schema chunks were retrieved."
+        lines = [
+            f"Schema RAG strategy: {self.strategy}",
+            f"Query tokens: {', '.join(self.query_tokens) or '(none)'}",
+            f"Expanded tokens: {', '.join(self.expanded_tokens) or '(none)'}",
+            "",
+            "Retrieved tables:",
+        ]
+        for chunk in self.chunks:
+            terms = ", ".join(chunk.matched_terms or []) or "fallback"
+            reasons = "; ".join(chunk.match_reasons or [])
+            lines.append(f"- {chunk.table_name} (score={chunk.score:.2f}; terms={terms})")
+            if reasons:
+                lines.append(f"  {reasons}")
+        return "\n".join(lines)
 
 
 def _read_only_sqlite_connection(db_path: str) -> sqlite3.Connection:

@@ -89,6 +89,48 @@ class TextToSqlAgentTests(unittest.TestCase):
             self.assertIn("customers", names)
             self.assertNotIn("courses", names)
 
+    def test_schema_rag_expands_business_synonyms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test.db"
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute("CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, name TEXT)")
+                conn.execute(
+                    "CREATE TABLE sales (sale_id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL, "
+                    "FOREIGN KEY(customer_id) REFERENCES customers(customer_id))"
+                )
+                conn.execute("CREATE TABLE courses (course_id INTEGER PRIMARY KEY, course_name TEXT)")
+                conn.commit()
+
+            context = agent.retrieve_schema_context(
+                str(db_path),
+                "revenue by client",
+                top_k=1,
+            )
+            names = {chunk.table_name for chunk in context.chunks}
+
+            self.assertIn("sales", names)
+            self.assertIn("customers", names)
+            self.assertIn("revenue", context.expanded_tokens)
+            self.assertIn("customer", context.expanded_tokens)
+            self.assertIn("Schema RAG strategy", context.report)
+
+    def test_retrieve_relevant_schema_returns_only_selected_ddl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test.db"
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.execute("CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, name TEXT)")
+                conn.execute("CREATE TABLE courses (course_id INTEGER PRIMARY KEY, course_name TEXT)")
+                conn.commit()
+
+            schema = agent.retrieve_relevant_schema(
+                str(db_path),
+                "customer names",
+                top_k=1,
+            )
+
+            self.assertIn("CREATE TABLE customers", schema)
+            self.assertNotIn("CREATE TABLE courses", schema)
+
     def test_ask_database_uses_retrieved_schema_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "test.db"

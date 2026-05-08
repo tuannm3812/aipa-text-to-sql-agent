@@ -140,6 +140,9 @@ def _render_assistant_turn(msg: dict) -> None:
             if msg.get("schema_text"):
                 with st.expander("Schema (DDL)", expanded=False):
                     st.code(msg["schema_text"], language="sql")
+            if msg.get("rag_report"):
+                with st.expander("Schema RAG retrieval report", expanded=False):
+                    st.text(msg["rag_report"])
 
 
 def main() -> None:
@@ -318,16 +321,18 @@ def main() -> None:
             df_out = _result_to_dataframe(result)
 
         schema_text: str | None = None
+        rag_report: str | None = None
         try:
-            schema_text = (
-                backend.retrieve_relevant_schema(
+            if use_rag:
+                rag_context = backend.retrieve_schema_context(
                     db_path_to_query,
                     prompt.strip(),
                     top_k=rag_top_k,
                 )
-                if use_rag
-                else backend.get_schema(db_path_to_query)
-            )
+                schema_text = rag_context.schema_text
+                rag_report = rag_context.report
+            else:
+                schema_text = backend.get_schema(db_path_to_query)
         except Exception:
             pass
 
@@ -339,6 +344,7 @@ def main() -> None:
                 "blocked_sql": blocked_sql,
                 "df": df_out,
                 "schema_text": schema_text,
+                "rag_report": rag_report,
             }
         )
         st.rerun()

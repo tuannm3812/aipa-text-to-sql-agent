@@ -24,14 +24,21 @@ The current branch supports two LLM backends:
 
 ## Schema RAG
 
-The project now includes a local schema RAG layer. It does not read or embed row data. It only indexes:
+The project includes an advanced local schema RAG layer. It does not read or embed row data. It only indexes:
 
 - table names
 - column names
 - `CREATE TABLE` DDL
 - foreign-key neighbor tables
 
-At question time, the backend scores schema chunks against the user's words, retrieves the top tables, includes directly related foreign-key tables, and sends only those DDL snippets to the LLM.
+At question time, the backend:
+
+1. tokenizes the user question
+2. expands common business synonyms such as `client -> customer` and `revenue -> amount/sales`
+3. scores schema chunks with a BM25-style lexical ranking
+4. adds stronger boosts for exact table and column matches
+5. expands through foreign-key neighbors so joinable tables are included
+6. sends only the selected DDL snippets to the LLM
 
 This improves:
 
@@ -40,7 +47,7 @@ This improves:
 - table selection accuracy
 - privacy, because only metadata is retrieved
 
-In the Streamlit sidebar you can toggle schema RAG and adjust how many tables are retrieved.
+In the Streamlit sidebar you can toggle schema RAG and adjust how many tables are retrieved. Each answer also includes an optional retrieval report showing selected tables, scores, matched terms, and graph-expansion reasons.
 
 ## Safety Model
 
@@ -123,4 +130,4 @@ python -m unittest discover -s tests
 
 ## Notes
 
-This is still an MVP. The most important next improvements are embedding-based schema retrieval, SQL parser-based validation, stronger query repair, and richer charting.
+This is still an MVP. The most important next improvements are persistent embedding-based schema retrieval, SQL parser-based validation, stronger query repair, and richer charting.
