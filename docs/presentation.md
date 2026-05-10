@@ -55,7 +55,7 @@ Speaker note: Distinguish design decisions from implementation details.
 - Schema recall, prompt savings, and selected tables shown for RAG evaluation.
 - Demo datasets: university, retail, healthcare.
 
-Speaker note: Show the live app or screenshots here.
+Speaker note: Show the live app or screenshots here. Use the Retail Analytics example and generated SQL screenshot.
 
 ## Slide 6: Evaluation Design
 
@@ -77,6 +77,7 @@ Fill after running:
 | Ollama Gemma3 | TODO | TODO | TODO | TODO |
 
 Speaker note: Explain at least one success and one failure case.
+Use the Gold SQL dashboard screenshot to show repeatable evaluation evidence.
 
 ## Slide 8: Ethics and Limitations
 

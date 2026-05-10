@@ -99,6 +99,13 @@ Results table to fill after running:
 
 Note: Gemini free-tier API quotas may interrupt a full benchmark. If this occurs, report the completed cases separately and state that the run was quota-limited. The script supports `--delay-seconds`, `--max-cases`, `--max-retries`, and `--resume` for controlled testing.
 
+Recommended figures:
+
+- Figure 1: Streamlit interface with provider/model controls and demo database selector.
+- Figure 2: Retail demo result table with generated SQL.
+- Figure 3: Retrieved schema context and Schema RAG retrieval report.
+- Figure 4: Evaluation dashboard showing Gold SQL baseline results.
+
 Interpretation should discuss which question types are easiest, where joins fail, whether Schema RAG improves table selection, and how local LLM performance compares with Gemini.
 
 ## 5. Critical Reflection
