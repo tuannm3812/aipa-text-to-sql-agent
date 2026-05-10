@@ -44,7 +44,7 @@ Speaker note: This slide maps directly to the rubric's AI method explanation.
 5. Validate read-only query.
 6. Execute locally and display results.
 
-Speaker note: Distinguish design decisions from implementation details.
+Speaker note: Distinguish design decisions from implementation details. Use `docs/architecture.drawio` exported as PNG for this slide.
 
 ## Slide 5: Prototype Features
 

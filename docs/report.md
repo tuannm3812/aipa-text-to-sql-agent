@@ -66,6 +66,8 @@ The model workflow is:
 
 The upgraded RAG layer also decomposes the user question into entities/metrics, aggregations, filters/dimensions, and comparison terms. This does not replace the LLM; it provides explainable retrieval signals that help justify why particular tables were selected. Schema chunks are cached by database path, modification time, and file size to improve repeated-query performance.
 
+The system architecture is summarised in `docs/architecture.drawio`, which can be exported as a figure for the final PDF report.
+
 Design decisions are separated from implementation details. The design choice is to use schema-only RAG for privacy and scalability. The implementation detail is a local BM25-style scorer rather than a vector database. The design choice is to support both hosted and local LLMs. The implementation detail is Gemini API for hosted generation and Ollama through LangChain for local generation.
 
 ## 4. Empirical Analysis and Results
