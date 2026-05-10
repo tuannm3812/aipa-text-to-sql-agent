@@ -2,6 +2,19 @@
 
 An AI-assisted decision support prototype that translates natural-language questions into safe, locally executed SQLite queries.
 
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://aipa-text-to-sql-agent.streamlit.app/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
+[![Gemini](https://img.shields.io/badge/LLM-Gemini-4285F4)](https://ai.google.dev/)
+[![Ollama](https://img.shields.io/badge/Local%20LLM-Ollama-111111)](https://ollama.com/)
+[![SQLite](https://img.shields.io/badge/Database-SQLite-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
+
+**Live demo:** https://aipa-text-to-sql-agent.streamlit.app/
+
+![Text-to-SQL semantic-layer concept](https://substackcdn.com/image/fetch/$s_!tTOS!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F16cb83ea-b843-4f1d-bf5b-7fa57ce034c5_484x462.png)
+
+Image credit: Vu Trinh / Holistics article, ["Why is Text-to-SQL so hard?"](https://www.holistics.io/blog/text-to-sql/).
+
 ## What It Does
 
 The app lets a user connect a local SQLite database or upload CSV files, ask a plain-English question, and receive a table of results. The LLM only receives schema metadata, not raw database rows.
@@ -21,6 +34,19 @@ The current branch supports two LLM backends:
 6. Python validates that the SQL is read-only and avoids SQLite internals.
 7. SQLite executes the query locally in read-only mode.
 8. Streamlit renders the result table.
+
+## Inspiration From Text-to-SQL Research and BI Practice
+
+The Holistics article ["Why is Text-to-SQL so hard?"](https://www.holistics.io/blog/text-to-sql/) argues that reliable Text-to-SQL is difficult because natural language is ambiguous, enterprise schemas are complex, and SQL is a strict execution language. It highlights semantic layers as a way to ground AI systems in governed business concepts, relationships, and metric definitions instead of asking a model to guess from raw table names.
+
+Our prototype applies the same idea at assignment scale:
+
+- The schema/RAG layer acts as a lightweight semantic layer over SQLite.
+- Hybrid retrieval selects relevant tables, columns, foreign-key relationships, and safe categorical hints.
+- The generated SQL is shown to users for verification.
+- SQL execution is governed through read-only validation and local execution.
+
+Unlike a full BI semantic layer such as Holistics AQL, our tool still generates SQL directly. The trade-off is that our prototype is simpler and flexible for arbitrary SQLite databases, but less governed than a production semantic-layer system with centrally defined metrics.
 
 ## Schema RAG
 
