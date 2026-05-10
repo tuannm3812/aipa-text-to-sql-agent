@@ -66,6 +66,14 @@ In the Streamlit sidebar you can toggle schema RAG and adjust how many tables ar
 |-- app.py                         # Streamlit frontend
 |-- text_to_sql_agent_mvp.py        # Backend pipeline
 |-- requirements.txt                # Dependencies
+|-- evaluation/
+|   `-- cases.json                  # Text-to-SQL benchmark cases
+|-- scripts/
+|   `-- evaluate_text_to_sql.py     # Automatic model evaluation
+|-- docs/
+|   |-- report.md                   # Assignment report draft
+|   |-- presentation.md             # Presentation outline
+|   `-- deployment.md               # Streamlit Community checklist
 |-- data/
 |   |-- customers.csv               # Small CSV sample
 |   |-- sales.csv                   # Small CSV sample
@@ -127,6 +135,35 @@ python -c "import text_to_sql_agent_mvp as a; a.write_university_db('data/univer
 ```bash
 python -m unittest discover -s tests
 ```
+
+## Run Evaluation
+
+The evaluation harness compares generated SQL results with gold SQL results.
+Use `gold` mode first to verify that the benchmark and databases are healthy:
+
+```bash
+python scripts/evaluate_text_to_sql.py --mode gold
+```
+
+Then run an LLM evaluation:
+
+```bash
+python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemini-2.5-flash
+python scripts/evaluate_text_to_sql.py --mode llm --provider ollama --model gemma3
+```
+
+Outputs are written to `evaluation/results/` as CSV and Markdown summaries.
+
+## Streamlit Community Cloud
+
+For hosted deployment, use:
+
+- Repository: `tuannm3812/aipa-text-to-sql-agent`
+- Branch: `tuannm3812/main-refinement`
+- Main file path: `app.py`
+- Secrets: add `GEMINI_API_KEY`
+
+See `docs/deployment.md` for the full checklist. Ollama is best treated as a local/offline demo option because Streamlit Community Cloud will not have access to your local Ollama server.
 
 ## Notes
 

@@ -30,9 +30,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from langchain_community.chat_models import ChatOllama
-from langchain_core.messages import HumanMessage, SystemMessage
-
 import pandas as pd
 
 try:

@@ -1,0 +1,56 @@
+[
+  {
+    "id": "university_major_counts",
+    "dataset": "university",
+    "db_path": "data/university_agent.db",
+    "question": "How many students are enrolled in each major?",
+    "gold_sql": "SELECT major, COUNT(*) AS student_count FROM students GROUP BY major ORDER BY major;",
+    "expected_tables": ["students"],
+    "difficulty": "easy"
+  },
+  {
+    "id": "university_average_score_by_course",
+    "dataset": "university",
+    "db_path": "data/university_agent.db",
+    "question": "What is the average score for each course?",
+    "gold_sql": "SELECT c.course_code, c.course_name, ROUND(AVG(g.score), 2) AS average_score FROM grades g JOIN courses c ON g.course_id = c.course_id GROUP BY c.course_id, c.course_code, c.course_name ORDER BY c.course_code;",
+    "expected_tables": ["grades", "courses"],
+    "difficulty": "medium"
+  },
+  {
+    "id": "retail_revenue_by_region",
+    "dataset": "retail",
+    "db_path": "data/retail_analytics.db",
+    "question": "Show total completed sales revenue by customer region.",
+    "gold_sql": "SELECT r.region_name, ROUND(SUM(oi.quantity * oi.unit_price * (1 - oi.discount_pct)), 2) AS revenue FROM orders o JOIN order_items oi ON o.order_id = oi.order_id JOIN customers c ON o.customer_id = c.customer_id JOIN regions r ON c.region_id = r.region_id WHERE o.order_status = 'Completed' GROUP BY r.region_name ORDER BY revenue DESC;",
+    "expected_tables": ["orders", "order_items", "customers", "regions"],
+    "difficulty": "hard"
+  },
+  {
+    "id": "retail_return_reason_counts",
+    "dataset": "retail",
+    "db_path": "data/retail_analytics.db",
+    "question": "Which return reasons occur most often?",
+    "gold_sql": "SELECT reason, COUNT(*) AS return_count FROM returns GROUP BY reason ORDER BY return_count DESC, reason;",
+    "expected_tables": ["returns"],
+    "difficulty": "easy"
+  },
+  {
+    "id": "healthcare_appointments_by_status",
+    "dataset": "healthcare",
+    "db_path": "data/healthcare_analytics.db",
+    "question": "How many appointments are there for each status?",
+    "gold_sql": "SELECT status, COUNT(*) AS appointment_count FROM appointments GROUP BY status ORDER BY appointment_count DESC, status;",
+    "expected_tables": ["appointments"],
+    "difficulty": "easy"
+  },
+  {
+    "id": "healthcare_treatment_cost_by_city",
+    "dataset": "healthcare",
+    "db_path": "data/healthcare_analytics.db",
+    "question": "What is the average treatment cost by hospital city?",
+    "gold_sql": "SELECT h.city, ROUND(AVG(t.cost), 2) AS average_treatment_cost FROM treatments t JOIN appointments a ON t.appointment_id = a.appointment_id JOIN doctors d ON a.doctor_id = d.doctor_id JOIN hospitals h ON d.hospital_id = h.hospital_id GROUP BY h.city ORDER BY average_treatment_cost DESC;",
+    "expected_tables": ["treatments", "appointments", "doctors", "hospitals"],
+    "difficulty": "hard"
+  }
+]
