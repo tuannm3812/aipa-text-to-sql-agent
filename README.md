@@ -30,16 +30,19 @@ The project includes an advanced local schema RAG layer. It does not read or emb
 - column names
 - `CREATE TABLE` DDL
 - foreign-key neighbor tables
+- low-cardinality text value hints, such as status or grade categories
 
 At question time, the backend:
 
 1. tokenizes the user question
 2. expands common business synonyms such as `client -> customer` and `revenue -> amount/sales`
 3. scores schema chunks with a BM25-style lexical ranking
-4. adds local character n-gram semantic similarity for fuzzy matching
-5. adds stronger boosts for exact table and column matches
-6. expands through foreign-key neighbors so joinable tables are included
-7. sends only the selected DDL snippets to the LLM
+4. adds local hashed embedding similarity and character n-gram semantic similarity for fuzzy matching
+5. adds privacy-safe categorical value hints for low-cardinality text columns
+6. decomposes the question into entities, aggregations, filters, and comparisons for explainability
+7. adds stronger boosts for exact table and column matches
+8. expands through foreign-key neighbors so joinable tables are included
+9. sends only the selected schema snippets to the LLM
 
 This improves:
 
@@ -47,6 +50,7 @@ This improves:
 - latency and cost
 - table selection accuracy
 - privacy, because only metadata is retrieved
+- explainability, because selected tables, value hints, prompt savings, and schema recall are reported
 
 In the Streamlit sidebar you can toggle schema RAG and adjust how many tables are retrieved. Each answer also includes an optional retrieval report showing selected tables, scores, matched terms, and graph-expansion reasons.
 
@@ -55,10 +59,12 @@ In the Streamlit sidebar you can toggle schema RAG and adjust how many tables ar
 - Generated SQL must start with `SELECT` or `WITH`.
 - Data modification and schema-changing statements are blocked.
 - Internal SQLite tables such as `sqlite_master` are blocked.
+- SQL is parsed with `sqlglot` when available for AST-level read-only validation.
 - SQLite is opened in read-only URI mode.
 - `PRAGMA query_only = ON` is enabled during execution.
 - A SQLite authorizer denies writes, DDL, transactions, attach/detach, pragmas, analyze, and reindex.
 - Results are capped to avoid rendering unexpectedly large outputs.
+- If safe generated SQL fails during execution, the system can make one LLM-based repair attempt using the SQLite error message.
 
 ## Project Structure
 

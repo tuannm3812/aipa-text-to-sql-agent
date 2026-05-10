@@ -3,15 +3,17 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
+from hashlib import blake2b
 
 from .config import (
+    DEFAULT_RAG_EMBEDDING_WEIGHT,
     DEFAULT_RAG_NEIGHBORS,
     DEFAULT_RAG_SEMANTIC_WEIGHT,
     DEFAULT_RAG_TOP_K,
     RAG_SYNONYMS,
     STOPWORDS,
 )
-from .schema import get_schema_chunks
+from .schema import get_schema_chunk_cache_info, get_schema_chunks
 from .types import SchemaChunk, SchemaRetrievalResult
 
 
@@ -54,6 +56,80 @@ def _cosine_counter_similarity(left: Counter[str], right: Counter[str]) -> float
     return dot / (left_norm * right_norm)
 
 
+def _hashed_embedding(text: str, *, dimensions: int = 256) -> list[float]:
+    vector = [0.0] * dimensions
+    tokens = _tokenize_for_rag(text)
+    tokens.extend(_char_ngrams(text).keys())
+    for token in tokens:
+        digest = blake2b(token.encode("utf-8"), digest_size=4).digest()
+        raw = int.from_bytes(digest, "little")
+        index = raw % dimensions
+        sign = 1.0 if raw & 1 else -1.0
+        vector[index] += sign
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm == 0:
+        return vector
+    return [value / norm for value in vector]
+
+
+def _cosine_vector_similarity(left: list[float], right: list[float]) -> float:
+    if not left or not right:
+        return 0.0
+    return sum(l * r for l, r in zip(left, right))
+
+
+def _schema_prompt_chars(chunks: list[SchemaChunk]) -> int:
+    parts: list[str] = []
+    for chunk in chunks:
+        parts.append(chunk.ddl)
+        for column, values in (chunk.value_hints or {}).items():
+            parts.append(f"-- {column}: {', '.join(values)}")
+    return len("\n\n".join(parts))
+
+
+def decompose_question(question: str) -> dict[str, list[str]]:
+    tokens = _tokenize_for_rag(question)
+    aggregations = []
+    if any(token in tokens for token in ("count", "many", "number")):
+        aggregations.append("count")
+    if any(token in tokens for token in ("average", "avg", "mean")):
+        aggregations.append("average")
+    if any(token in tokens for token in ("sum", "total", "revenue", "sales")):
+        aggregations.append("sum")
+    if any(token in tokens for token in ("highest", "top", "most", "best")):
+        aggregations.append("top")
+    if any(token in tokens for token in ("lowest", "least", "bottom")):
+        aggregations.append("bottom")
+
+    filters = [
+        token
+        for token in tokens
+        if token
+        in {
+            "completed",
+            "cancelled",
+            "pending",
+            "region",
+            "city",
+            "status",
+            "grade",
+            "priority",
+            "category",
+        }
+    ]
+    comparison = [
+        token
+        for token in tokens
+        if token in {"than", "versus", "vs", "compare", "difference", "higher", "lower"}
+    ]
+    return {
+        "entities_or_metrics": sorted(set(tokens)),
+        "aggregations": sorted(set(aggregations)),
+        "filters_or_dimensions": sorted(set(filters)),
+        "comparisons": sorted(set(comparison)),
+    }
+
+
 def retrieve_schema_chunks(
     db_path: str,
     question: str,
@@ -76,15 +152,39 @@ def retrieve_schema_context(
     top_k: int = DEFAULT_RAG_TOP_K,
     include_neighbors: int = DEFAULT_RAG_NEIGHBORS,
     semantic_weight: float = DEFAULT_RAG_SEMANTIC_WEIGHT,
+    embedding_weight: float = DEFAULT_RAG_EMBEDDING_WEIGHT,
 ) -> SchemaRetrievalResult:
+    before_cache = get_schema_chunk_cache_info()
     chunks = get_schema_chunks(db_path)
+    after_cache = get_schema_chunk_cache_info()
+    cache_hit = after_cache.hits > before_cache.hits
     query_tokens = _tokenize_for_rag(question)
     expanded_tokens = _expand_query_tokens(query_tokens)
+    decomposed_terms = decompose_question(question)
+    full_schema_chars = _schema_prompt_chars(chunks)
 
     if not chunks:
-        return SchemaRetrievalResult([], query_tokens, expanded_tokens, top_k)
+        return SchemaRetrievalResult(
+            [],
+            query_tokens,
+            expanded_tokens,
+            top_k,
+            decomposed_terms=decomposed_terms,
+            full_schema_chars=full_schema_chars,
+            cache_hit=cache_hit,
+        )
     if top_k <= 0:
-        return SchemaRetrievalResult(chunks, query_tokens, expanded_tokens, top_k)
+        retrieved_schema_chars = _schema_prompt_chars(chunks)
+        return SchemaRetrievalResult(
+            chunks,
+            query_tokens,
+            expanded_tokens,
+            top_k,
+            decomposed_terms=decomposed_terms,
+            full_schema_chars=full_schema_chars,
+            retrieved_schema_chars=retrieved_schema_chars,
+            cache_hit=cache_hit,
+        )
 
     doc_tokens = [_tokenize_for_rag(chunk.search_text) for chunk in chunks]
     doc_lengths = [len(tokens) or 1 for tokens in doc_tokens]
@@ -96,6 +196,7 @@ def retrieve_schema_context(
         doc_freq.update(set(tokens))
 
     query_counter = Counter(expanded_tokens)
+    query_embedding = _hashed_embedding(" ".join(expanded_tokens) or question)
     scored: list[SchemaChunk] = []
     for chunk, tokens, doc_len in zip(chunks, doc_tokens, doc_lengths):
         token_counts = Counter(tokens)
@@ -135,6 +236,11 @@ def retrieve_schema_context(
             score += semantic_weight * semantic_score
             reasons.append(f"semantic similarity: {semantic_score:.2f}")
 
+        embedding_score = _cosine_vector_similarity(query_embedding, _hashed_embedding(chunk.search_text))
+        if embedding_score > 0:
+            score += embedding_weight * embedding_score
+            reasons.append(f"embedding similarity: {embedding_score:.2f}")
+
         scored.append(
             SchemaChunk(
                 table_name=chunk.table_name,
@@ -142,6 +248,7 @@ def retrieve_schema_context(
                 columns=chunk.columns,
                 foreign_tables=chunk.foreign_tables,
                 search_text=chunk.search_text,
+                value_hints=chunk.value_hints,
                 score=score,
                 matched_terms=sorted(matched_terms),
                 match_reasons=reasons,
@@ -170,6 +277,7 @@ def retrieve_schema_context(
                                 columns=neighbor_chunk.columns,
                                 foreign_tables=neighbor_chunk.foreign_tables,
                                 search_text=neighbor_chunk.search_text,
+                                value_hints=neighbor_chunk.value_hints,
                                 score=max(neighbor_chunk.score, chunk.score * (0.35 / (depth + 1))),
                                 matched_terms=neighbor_chunk.matched_terms or [],
                                 match_reasons=[
@@ -182,7 +290,17 @@ def retrieve_schema_context(
             frontier = next_frontier
 
     selected = sorted(selected, key=lambda c: (-c.score, c.table_name))
-    return SchemaRetrievalResult(selected, query_tokens, expanded_tokens, top_k)
+    retrieved_schema_chars = _schema_prompt_chars(selected)
+    return SchemaRetrievalResult(
+        selected,
+        query_tokens,
+        expanded_tokens,
+        top_k,
+        decomposed_terms=decomposed_terms,
+        full_schema_chars=full_schema_chars,
+        retrieved_schema_chars=retrieved_schema_chars,
+        cache_hit=cache_hit,
+    )
 
 
 def retrieve_relevant_schema(

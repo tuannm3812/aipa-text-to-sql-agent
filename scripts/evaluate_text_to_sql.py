@@ -120,15 +120,13 @@ def evaluate_case(
     )
     expected_tables = set(case.get("expected_tables", []))
     retrieved_tables: set[str] = set()
+    rag_context = agent.retrieve_schema_context(
+        case["db_path"],
+        case["question"],
+        top_k=rag_top_k,
+    )
     if expected_tables:
-        retrieved_tables = {
-            chunk.table_name
-            for chunk in agent.retrieve_schema_context(
-                case["db_path"],
-                case["question"],
-                top_k=rag_top_k,
-            ).chunks
-        }
+        retrieved_tables = {chunk.table_name for chunk in rag_context.chunks}
     table_recall = (
         round(len(expected_tables & retrieved_tables) / len(expected_tables), 3)
         if expected_tables
@@ -150,6 +148,8 @@ def evaluate_case(
         "value_match": value_match,
         "exact_result_match": exact_result_match,
         "schema_table_recall": table_recall,
+        "prompt_saved_pct": rag_context.prompt_savings_pct,
+        "cache_hit": rag_context.cache_hit,
         "expected_tables": ", ".join(sorted(expected_tables)),
         "retrieved_tables": ", ".join(sorted(retrieved_tables)),
         "latency_ms": latency_ms,
@@ -169,6 +169,7 @@ def write_markdown(rows: list[dict[str, Any]], output_path: Path) -> None:
     avg_latency = round(sum(float(row["latency_ms"]) for row in rows) / total, 2) if total else 0
     recall_values = [float(row["schema_table_recall"]) for row in rows if row["schema_table_recall"] != ""]
     avg_recall = round(sum(recall_values) / len(recall_values), 3) if recall_values else 0
+    avg_prompt_saved = round(sum(float(row["prompt_saved_pct"]) for row in rows) / total, 1) if total else 0
 
     lines = [
         "# Text-to-SQL Evaluation Results",
@@ -180,15 +181,17 @@ def write_markdown(rows: list[dict[str, Any]], output_path: Path) -> None:
         f"- Row match: {row_match}/{total}",
         f"- Exact result match: {exact}/{total}",
         f"- Average schema table recall: {avg_recall}",
+        f"- Average prompt schema saved: {avg_prompt_saved}%",
         f"- Average latency: {avg_latency} ms",
         "",
-        "| Case | Dataset | Difficulty | Safe | Executed | Value Match | Row Match | Exact Match | Schema Recall | Latency ms |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Case | Dataset | Difficulty | Safe | Executed | Value Match | Row Match | Exact Match | Schema Recall | Prompt Saved | Latency ms |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
             "| {id} | {dataset} | {difficulty} | {safe_sql} | {execution_ok} | "
-            "{value_match} | {row_match} | {exact_result_match} | {schema_table_recall} | {latency_ms} |".format(**row)
+            "{value_match} | {row_match} | {exact_result_match} | {schema_table_recall} | "
+            "{prompt_saved_pct}% | {latency_ms} |".format(**row)
         )
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

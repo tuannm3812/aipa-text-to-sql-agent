@@ -22,6 +22,7 @@ def ask_database(
     provider: str | None = None,
     use_rag: bool = True,
     rag_top_k: int = DEFAULT_RAG_TOP_K,
+    max_repair_attempts: int = 1,
 ) -> QueryResult:
     """Compatibility wrapper that remains patch-friendly for tests."""
     if not os.path.exists(db_path):
@@ -39,7 +40,21 @@ def ask_database(
             return QueryResult(columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA")
         if not is_safe_query(sql):
             return QueryResult(columns=[], rows=[], sql=sql, error="BLOCKED_UNSAFE_SQL")
-        return execute_query(db_path, sql)
+        try:
+            return execute_query(db_path, sql)
+        except Exception as e:
+            repaired_sql = _repair_sql(
+                question,
+                schema_text,
+                sql,
+                f"{type(e).__name__}: {e}",
+                model_name=model_name,
+                provider=provider,
+                max_repair_attempts=max_repair_attempts,
+            )
+            if repaired_sql and is_safe_query(repaired_sql):
+                return execute_query(db_path, repaired_sql)
+            raise
     except Exception as e:
         return QueryResult(columns=[], rows=[], error=f"{type(e).__name__}: {e}")
 
@@ -52,6 +67,7 @@ def ask_database_with_sql(
     provider: str | None = None,
     use_rag: bool = True,
     rag_top_k: int = DEFAULT_RAG_TOP_K,
+    max_repair_attempts: int = 1,
 ) -> tuple[str, QueryResult]:
     """Compatibility wrapper that also returns generated SQL."""
     if not os.path.exists(db_path):
@@ -75,7 +91,22 @@ def ask_database_with_sql(
     try:
         return sql, execute_query(db_path, sql)
     except Exception as e:
-        return sql, QueryResult(columns=[], rows=[], sql=sql, error=f"{type(e).__name__}: {e}")
+        error_text = f"{type(e).__name__}: {e}"
+        repaired_sql = _repair_sql(
+            question,
+            schema_text,
+            sql,
+            error_text,
+            model_name=model_name,
+            provider=provider,
+            max_repair_attempts=max_repair_attempts,
+        )
+        if repaired_sql and is_safe_query(repaired_sql):
+            try:
+                return repaired_sql, execute_query(db_path, repaired_sql)
+            except Exception as repaired_error:
+                error_text = f"{type(repaired_error).__name__}: {repaired_error}"
+        return sql, QueryResult(columns=[], rows=[], sql=sql, error=error_text)
 
 
 def ask_from_files(
@@ -87,6 +118,7 @@ def ask_from_files(
     provider: str | None = None,
     use_rag: bool = True,
     rag_top_k: int = DEFAULT_RAG_TOP_K,
+    max_repair_attempts: int = 1,
 ) -> QueryResult:
     """Compatibility router for DB and CSV workflows."""
     paths = [file_paths] if isinstance(file_paths, str) else list(file_paths)
@@ -104,6 +136,7 @@ def ask_from_files(
             provider=provider,
             use_rag=use_rag,
             rag_top_k=rag_top_k,
+            max_repair_attempts=max_repair_attempts,
         )
 
     if exts == {".csv"}:
@@ -115,6 +148,39 @@ def ask_from_files(
             provider=provider,
             use_rag=use_rag,
             rag_top_k=rag_top_k,
+            max_repair_attempts=max_repair_attempts,
         )
 
     raise ValueError(f"Unsupported or mixed file types: {sorted(exts)}")
+
+
+def _repair_sql(
+    question: str,
+    schema_text: str,
+    failed_sql: str,
+    error_text: str,
+    *,
+    model_name: str,
+    provider: str | None,
+    max_repair_attempts: int,
+) -> str | None:
+    if max_repair_attempts < 1:
+        return None
+    repair_question = f"""\
+Repair the SQL for the original question.
+
+Original question:
+{question}
+
+Failed SQL:
+{failed_sql}
+
+SQLite error:
+{error_text}
+
+Return only one corrected SQLite SELECT query.
+"""
+    try:
+        return generate_sql(repair_question, schema_text, model_name=model_name, provider=provider)
+    except Exception:
+        return None

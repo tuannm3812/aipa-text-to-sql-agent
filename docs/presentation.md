@@ -29,7 +29,7 @@ Speaker note: Emphasise this is decision support, not just a UI.
 ## Slide 3: AI Approach
 
 - Structural knowledge representation: database schema as tables, columns, and relationships.
-- Hybrid Schema RAG: retrieve relevant table definitions using lexical, semantic, and foreign-key graph signals before prompting.
+- Hybrid Schema RAG: retrieve relevant table definitions using lexical ranking, local hashed embeddings, value hints, and foreign-key graph signals before prompting.
 - LLM generation: Gemini or local Ollama creates SQL.
 - Logic-based safety: read-only validation and SQLite authorizer.
 
@@ -52,6 +52,7 @@ Speaker note: Distinguish design decisions from implementation details.
 - Gemini hosted LLM and Ollama local LLM support.
 - Schema RAG toggle and retrieval report.
 - Generated SQL shown for transparency.
+- Schema recall, prompt savings, and selected tables shown for RAG evaluation.
 - Demo datasets: university, retail, healthcare.
 
 Speaker note: Show the live app or screenshots here.

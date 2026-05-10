@@ -33,7 +33,7 @@ The proposed method combines four AI-relevant components.
 
 First, the database schema is treated as a structural knowledge representation. Tables, columns, primary keys, and foreign-key relationships represent entities and relationships in the application domain. This supports logical reasoning because SQL generation depends on mapping a question to the correct entities, attributes, aggregations, and joins.
 
-Second, the project uses schema-level retrieval augmented generation. Instead of sending the full database content to the LLM, the system retrieves relevant table DDL using hybrid retrieval: BM25-style lexical ranking, synonym expansion, local character n-gram semantic similarity, and foreign-key graph expansion. This improves privacy because only metadata is sent to the model, and it improves scalability because the prompt can be smaller for larger databases.
+Second, the project uses schema-level retrieval augmented generation. Instead of sending the full database content to the LLM, the system retrieves relevant table DDL using hybrid retrieval: BM25-style lexical ranking, synonym expansion, local hashed embedding similarity, character n-gram semantic similarity, privacy-safe categorical value hints, and foreign-key graph expansion. This improves privacy because only metadata and low-cardinality examples are sent to the model, and it improves scalability because the prompt can be smaller for larger databases.
 
 Third, an LLM generates candidate SQL. LLMs are suitable because Text-to-SQL requires semantic parsing from natural language to a formal query language. However, LLMs can hallucinate columns, produce invalid SQL, or include unsafe statements. The system therefore does not trust the model output directly.
 
@@ -64,6 +64,8 @@ The model workflow is:
 7. SQLite executes the query in read-only mode.
 8. Streamlit displays result rows, generated SQL, schema context, and retrieval diagnostics.
 
+The upgraded RAG layer also decomposes the user question into entities/metrics, aggregations, filters/dimensions, and comparison terms. This does not replace the LLM; it provides explainable retrieval signals that help justify why particular tables were selected. Schema chunks are cached by database path, modification time, and file size to improve repeated-query performance.
+
 Design decisions are separated from implementation details. The design choice is to use schema-only RAG for privacy and scalability. The implementation detail is a local BM25-style scorer rather than a vector database. The design choice is to support both hosted and local LLMs. The implementation detail is Gemini API for hosted generation and Ollama through LangChain for local generation.
 
 ## 4. Empirical Analysis and Results
@@ -75,6 +77,8 @@ Metrics:
 - Safe SQL rate: proportion of generated SQL queries passing deterministic safety checks.
 - Execution success rate: proportion of generated queries that execute without error.
 - Exact result match: proportion where generated query results match the gold query results exactly.
+- Schema table recall: proportion of expected relevant tables retrieved by RAG.
+- Prompt schema saved: percentage reduction between full schema context and retrieved schema context.
 - Latency: time from question to result.
 
 Run the reproducible evaluation:

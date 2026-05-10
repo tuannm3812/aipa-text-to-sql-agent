@@ -298,14 +298,12 @@ def _evaluate_cases(
             and _normalise_rows(result.rows) == _normalise_rows(gold_result.rows)
         )
         expected_tables = set(case.get("expected_tables", []))
-        retrieved_tables = {
-            chunk.table_name
-            for chunk in backend.retrieve_schema_context(
-                case["db_path"],
-                case["question"],
-                top_k=rag_top_k,
-            ).chunks
-        }
+        rag_context = backend.retrieve_schema_context(
+            case["db_path"],
+            case["question"],
+            top_k=rag_top_k,
+        )
+        retrieved_tables = {chunk.table_name for chunk in rag_context.chunks}
         schema_recall = (
             round(len(expected_tables & retrieved_tables) / len(expected_tables), 3)
             if expected_tables
@@ -322,6 +320,8 @@ def _evaluate_cases(
                 "value_match": _value_rows_match(result.rows, gold_result.rows),
                 "exact_match": exact_match,
                 "schema_recall": schema_recall,
+                "prompt_saved_pct": rag_context.prompt_savings_pct,
+                "cache_hit": rag_context.cache_hit,
                 "expected_tables": ", ".join(sorted(expected_tables)),
                 "retrieved_tables": ", ".join(sorted(retrieved_tables)),
                 "latency_ms": latency_ms,
@@ -599,15 +599,18 @@ def main() -> None:
             exact = int(eval_df["exact_match"].sum())
             avg_latency = float(eval_df["latency_ms"].mean())
             avg_recall = float(eval_df["schema_recall"].mean())
+            avg_saved = float(eval_df["prompt_saved_pct"].mean())
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Safe SQL", f"{safe}/{total}")
             c2.metric("Executed", f"{executed}/{total}")
             c3.metric("Value match", f"{value}/{total}")
             c4.metric("Schema recall", f"{avg_recall:.2f}")
-            c5.metric("Exact", f"{exact}/{total}")
+            c5.metric("Prompt saved", f"{avg_saved:.1f}%")
             st.caption(f"Average latency: {avg_latency:.0f} ms")
             st.dataframe(eval_df, use_container_width=True, hide_index=True)
-            recall_df = eval_df[["case", "dataset", "schema_recall", "expected_tables", "retrieved_tables"]]
+            recall_df = eval_df[
+                ["case", "dataset", "schema_recall", "prompt_saved_pct", "expected_tables", "retrieved_tables"]
+            ]
             st.bar_chart(recall_df.set_index("case")["schema_recall"])
             with st.expander("Schema recall details", expanded=False):
                 st.dataframe(recall_df, use_container_width=True, hide_index=True)
