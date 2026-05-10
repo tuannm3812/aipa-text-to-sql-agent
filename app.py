@@ -322,6 +322,8 @@ def _evaluate_cases(
                 "value_match": _value_rows_match(result.rows, gold_result.rows),
                 "exact_match": exact_match,
                 "schema_recall": schema_recall,
+                "expected_tables": ", ".join(sorted(expected_tables)),
+                "retrieved_tables": ", ".join(sorted(retrieved_tables)),
                 "latency_ms": latency_ms,
                 "error": result.error or "",
             }
@@ -605,6 +607,10 @@ def main() -> None:
             c5.metric("Exact", f"{exact}/{total}")
             st.caption(f"Average latency: {avg_latency:.0f} ms")
             st.dataframe(eval_df, use_container_width=True, hide_index=True)
+            recall_df = eval_df[["case", "dataset", "schema_recall", "expected_tables", "retrieved_tables"]]
+            st.bar_chart(recall_df.set_index("case")["schema_recall"])
+            with st.expander("Schema recall details", expanded=False):
+                st.dataframe(recall_df, use_container_width=True, hide_index=True)
 
     if not st.session_state.messages:
         st.session_state.messages.append(

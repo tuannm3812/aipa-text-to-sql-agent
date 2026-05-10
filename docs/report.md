@@ -33,7 +33,7 @@ The proposed method combines four AI-relevant components.
 
 First, the database schema is treated as a structural knowledge representation. Tables, columns, primary keys, and foreign-key relationships represent entities and relationships in the application domain. This supports logical reasoning because SQL generation depends on mapping a question to the correct entities, attributes, aggregations, and joins.
 
-Second, the project uses schema-level retrieval augmented generation. Instead of sending the full database content to the LLM, the system retrieves relevant table DDL using a BM25-style lexical ranking strategy with synonym expansion and foreign-key graph expansion. This improves privacy because only metadata is sent to the model, and it improves scalability because the prompt can be smaller for larger databases.
+Second, the project uses schema-level retrieval augmented generation. Instead of sending the full database content to the LLM, the system retrieves relevant table DDL using hybrid retrieval: BM25-style lexical ranking, synonym expansion, local character n-gram semantic similarity, and foreign-key graph expansion. This improves privacy because only metadata is sent to the model, and it improves scalability because the prompt can be smaller for larger databases.
 
 Third, an LLM generates candidate SQL. LLMs are suitable because Text-to-SQL requires semantic parsing from natural language to a formal query language. However, LLMs can hallucinate columns, produce invalid SQL, or include unsafe statements. The system therefore does not trust the model output directly.
 
@@ -91,7 +91,7 @@ Results table to fill after running:
 | Gemini 2.5 Flash | Yes | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
 | Ollama Gemma3 | Yes | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
 
-Note: Gemini free-tier API quotas may interrupt a full benchmark. If this occurs, report the completed cases separately and state that the run was quota-limited. The script supports `--delay-seconds` and `--max-cases` for controlled testing.
+Note: Gemini free-tier API quotas may interrupt a full benchmark. If this occurs, report the completed cases separately and state that the run was quota-limited. The script supports `--delay-seconds`, `--max-cases`, `--max-retries`, and `--resume` for controlled testing.
 
 Interpretation should discuss which question types are easiest, where joins fail, whether Schema RAG improves table selection, and how local LLM performance compares with Gemini.
 

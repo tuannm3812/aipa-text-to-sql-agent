@@ -14,6 +14,13 @@ if str(ROOT_DIR) not in sys.path:
 
 import text_to_sql_agent_mvp as agent
 
+RETRYABLE_ERROR_MARKERS = (
+    "429",
+    "RESOURCE_EXHAUSTED",
+    "quota",
+    "rate",
+)
+
 
 def _normalise_rows(rows: list[tuple[Any, ...]]) -> list[list[str]]:
     return [[str(value) for value in row] for row in rows]
@@ -49,15 +56,27 @@ def _run_llm(
     model_name: str,
     use_rag: bool,
     rag_top_k: int,
+    max_retries: int = 0,
+    retry_base_seconds: float = 20.0,
 ) -> tuple[str, agent.QueryResult]:
-    return agent.ask_database_with_sql(
-        case["question"],
-        db_path=case["db_path"],
-        model_name=model_name,
-        provider=provider,
-        use_rag=use_rag,
-        rag_top_k=rag_top_k,
-    )
+    attempt = 0
+    while True:
+        sql, result = agent.ask_database_with_sql(
+            case["question"],
+            db_path=case["db_path"],
+            model_name=model_name,
+            provider=provider,
+            use_rag=use_rag,
+            rag_top_k=rag_top_k,
+        )
+        error_text = (result.error or "").lower()
+        retryable = any(marker.lower() in error_text for marker in RETRYABLE_ERROR_MARKERS)
+        if not retryable or attempt >= max_retries:
+            return sql, result
+        sleep_for = retry_base_seconds * (2 ** attempt)
+        print(f"Retryable LLM error for {case['id']}; sleeping {sleep_for:.0f}s before retry...")
+        time.sleep(sleep_for)
+        attempt += 1
 
 
 def evaluate_case(
@@ -68,6 +87,8 @@ def evaluate_case(
     model_name: str,
     use_rag: bool,
     rag_top_k: int,
+    max_retries: int = 0,
+    retry_base_seconds: float = 20.0,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     gold_sql, gold_result = _run_gold(case)
@@ -81,6 +102,8 @@ def evaluate_case(
             model_name=model_name,
             use_rag=use_rag,
             rag_top_k=rag_top_k,
+            max_retries=max_retries,
+            retry_base_seconds=retry_base_seconds,
         )
 
     latency_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -127,6 +150,8 @@ def evaluate_case(
         "value_match": value_match,
         "exact_result_match": exact_result_match,
         "schema_table_recall": table_recall,
+        "expected_tables": ", ".join(sorted(expected_tables)),
+        "retrieved_tables": ", ".join(sorted(retrieved_tables)),
         "latency_ms": latency_ms,
         "error": result.error or "",
         "generated_sql": generated_sql,
@@ -178,6 +203,9 @@ def main() -> None:
     parser.add_argument("--rag-top-k", type=int, default=agent.DEFAULT_RAG_TOP_K)
     parser.add_argument("--delay-seconds", type=float, default=0.0)
     parser.add_argument("--max-cases", type=int, default=0)
+    parser.add_argument("--max-retries", type=int, default=0)
+    parser.add_argument("--retry-base-seconds", type=float, default=20.0)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--out-dir", default="evaluation/results")
     args = parser.parse_args()
 
@@ -187,8 +215,26 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = []
+    if args.mode == "llm":
+        safe_model = "".join(ch if ch.isalnum() else "_" for ch in args.model).strip("_")
+        stem = f"evaluation_llm_{args.provider}_{safe_model}"
+    else:
+        stem = "evaluation_gold"
+    csv_path = out_dir / f"{stem}.csv"
+    md_path = out_dir / f"{stem}.md"
+
+    existing_rows: dict[str, dict[str, Any]] = {}
+    if args.resume and csv_path.exists():
+        with csv_path.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("execution_ok") == "True":
+                    existing_rows[row["id"]] = row
+
+    rows: list[dict[str, Any]] = []
     for index, case in enumerate(cases):
+        if case["id"] in existing_rows:
+            rows.append(existing_rows[case["id"]])
+            continue
         rows.append(
             evaluate_case(
                 case,
@@ -197,18 +243,13 @@ def main() -> None:
                 model_name=args.model,
                 use_rag=not args.no_rag,
                 rag_top_k=args.rag_top_k,
+                max_retries=args.max_retries,
+                retry_base_seconds=args.retry_base_seconds,
             )
         )
         if args.mode == "llm" and args.delay_seconds > 0 and index < len(cases) - 1:
             time.sleep(args.delay_seconds)
 
-    if args.mode == "llm":
-        safe_model = "".join(ch if ch.isalnum() else "_" for ch in args.model).strip("_")
-        stem = f"evaluation_llm_{args.provider}_{safe_model}"
-    else:
-        stem = "evaluation_gold"
-    csv_path = out_dir / f"{stem}.csv"
-    md_path = out_dir / f"{stem}.md"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()

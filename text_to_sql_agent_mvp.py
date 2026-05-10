@@ -45,6 +45,7 @@ DEFAULT_MAX_ROWS = 1_000
 DEFAULT_SQLITE_PROGRESS_STEPS = 100_000
 DEFAULT_RAG_TOP_K = 6
 DEFAULT_RAG_NEIGHBORS = 1
+DEFAULT_RAG_SEMANTIC_WEIGHT = 3.0
 
 RAG_SYNONYMS = {
     "client": ["customer", "customers"],
@@ -399,6 +400,26 @@ def _expand_query_tokens(tokens: list[str]) -> list[str]:
     return expanded
 
 
+def _char_ngrams(text: str, *, n: int = 3) -> Counter[str]:
+    normalized = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    compact = f" {normalized} "
+    if len(compact) <= n:
+        return Counter([compact])
+    return Counter(compact[i : i + n] for i in range(len(compact) - n + 1))
+
+
+def _cosine_counter_similarity(left: Counter[str], right: Counter[str]) -> float:
+    if not left or not right:
+        return 0.0
+    shared = set(left) & set(right)
+    dot = sum(left[token] * right[token] for token in shared)
+    left_norm = math.sqrt(sum(value * value for value in left.values()))
+    right_norm = math.sqrt(sum(value * value for value in right.values()))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
 def get_schema_chunks(db_path: str) -> list[SchemaChunk]:
     """
     Build table-level schema chunks for retrieval.
@@ -474,6 +495,7 @@ def retrieve_schema_context(
     *,
     top_k: int = DEFAULT_RAG_TOP_K,
     include_neighbors: int = DEFAULT_RAG_NEIGHBORS,
+    semantic_weight: float = DEFAULT_RAG_SEMANTIC_WEIGHT,
 ) -> SchemaRetrievalResult:
     chunks = get_schema_chunks(db_path)
     query_tokens = _tokenize_for_rag(question)
@@ -487,6 +509,7 @@ def retrieve_schema_context(
     doc_tokens = [_tokenize_for_rag(chunk.search_text) for chunk in chunks]
     doc_lengths = [len(tokens) or 1 for tokens in doc_tokens]
     avg_doc_len = sum(doc_lengths) / len(doc_lengths)
+    query_ngrams = _char_ngrams(" ".join(expanded_tokens) or question)
 
     doc_freq: Counter[str] = Counter()
     for tokens in doc_tokens:
@@ -526,6 +549,11 @@ def retrieve_schema_context(
             matched_terms.update(column_matches)
         if weak_matches and not (table_matches or column_matches):
             reasons.append(f"schema text match: {', '.join(weak_matches[:6])}")
+
+        semantic_score = _cosine_counter_similarity(query_ngrams, _char_ngrams(chunk.search_text))
+        if semantic_score > 0:
+            score += semantic_weight * semantic_score
+            reasons.append(f"semantic similarity: {semantic_score:.2f}")
 
         scored.append(
             SchemaChunk(
@@ -788,7 +816,7 @@ class SchemaRetrievalResult:
     query_tokens: list[str]
     expanded_tokens: list[str]
     top_k: int
-    strategy: str = "hybrid-bm25-graph"
+    strategy: str = "hybrid-bm25-semantic-graph"
 
     @property
     def schema_text(self) -> str:

@@ -15,7 +15,7 @@ The current branch supports two LLM backends:
 
 1. Python extracts SQLite `CREATE TABLE` statements.
 2. Schema RAG builds table-level chunks from DDL, columns, and foreign-key relationships.
-3. The most relevant schema chunks are retrieved for the user question.
+3. The most relevant schema chunks are retrieved for the user question using hybrid lexical, semantic, and foreign-key graph signals.
 4. The user question and retrieved schema are sent to the selected LLM.
 5. The LLM returns one SQLite `SELECT` query.
 6. Python validates that the SQL is read-only and avoids SQLite internals.
@@ -36,9 +36,10 @@ At question time, the backend:
 1. tokenizes the user question
 2. expands common business synonyms such as `client -> customer` and `revenue -> amount/sales`
 3. scores schema chunks with a BM25-style lexical ranking
-4. adds stronger boosts for exact table and column matches
-5. expands through foreign-key neighbors so joinable tables are included
-6. sends only the selected DDL snippets to the LLM
+4. adds local character n-gram semantic similarity for fuzzy matching
+5. adds stronger boosts for exact table and column matches
+6. expands through foreign-key neighbors so joinable tables are included
+7. sends only the selected DDL snippets to the LLM
 
 This improves:
 
@@ -158,6 +159,7 @@ For Gemini free-tier testing, use a throttle or a smaller smoke test:
 ```bash
 python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemini-2.5-flash --delay-seconds 15
 python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemini-2.5-flash --max-cases 3
+python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemini-2.5-flash --max-cases 3 --max-retries 2 --retry-base-seconds 30 --resume
 ```
 
 ## Streamlit Community Cloud
