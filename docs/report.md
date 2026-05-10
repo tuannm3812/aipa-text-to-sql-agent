@@ -73,16 +73,19 @@ Run the reproducible evaluation:
 
 ```bash
 python scripts/evaluate_text_to_sql.py --mode gold
-python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemini-2.5-flash
+python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemini-2.5-flash --delay-seconds 15
 python scripts/evaluate_text_to_sql.py --mode llm --provider ollama --model gemma3
 ```
 
 Results table to fill after running:
 
-| Model | Schema RAG | Cases | Safe SQL | Execution Success | Exact Match | Average Latency |
-|---|---:|---:|---:|---:|---:|---:|
-| Gemini | Yes | TODO | TODO | TODO | TODO | TODO |
-| Ollama Gemma3 | Yes | TODO | TODO | TODO | TODO | TODO |
+| Model | Schema RAG | Cases | Safe SQL | Execution Success | Value Match | Exact Match | Schema Recall | Average Latency |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Gold SQL baseline | Yes | 12 | 12/12 | 12/12 | 12/12 | 12/12 | 1.00 | See `evaluation/results` |
+| Gemini 2.5 Flash | Yes | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| Ollama Gemma3 | Yes | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+
+Note: Gemini free-tier API quotas may interrupt a full benchmark. If this occurs, report the completed cases separately and state that the run was quota-limited. The script supports `--delay-seconds` and `--max-cases` for controlled testing.
 
 Interpretation should discuss which question types are easiest, where joins fail, whether Schema RAG improves table selection, and how local LLM performance compares with Gemini.
 

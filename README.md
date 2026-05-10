@@ -153,6 +153,12 @@ python scripts/evaluate_text_to_sql.py --mode llm --provider ollama --model gemm
 ```
 
 Outputs are written to `evaluation/results/` as CSV and Markdown summaries.
+For Gemini free-tier testing, use a throttle or a smaller smoke test:
+
+```bash
+python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemini-2.5-flash --delay-seconds 15
+python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemini-2.5-flash --max-cases 3
+```
 
 ## Streamlit Community Cloud
 

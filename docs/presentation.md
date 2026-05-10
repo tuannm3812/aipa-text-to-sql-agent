@@ -64,6 +64,7 @@ Fill after running:
 
 | Model | Safe SQL | Executed | Exact Match | Avg Latency |
 |---|---:|---:|---:|---:|
+| Gold SQL baseline | 12/12 | 12/12 | 12/12 | TODO |
 | Gemini | TODO | TODO | TODO | TODO |
 | Ollama Gemma3 | TODO | TODO | TODO | TODO |
 

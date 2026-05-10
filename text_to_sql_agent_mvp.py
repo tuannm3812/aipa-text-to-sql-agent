@@ -72,14 +72,19 @@ _STOPWORDS = {
 }
 
 
-def _load_gemini_sdk() -> Any:
+def _load_gemini_sdk() -> tuple[str, Any, Any | None]:
     try:
-        import google.generativeai as genai  # type: ignore
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
+        return "google-genai", genai, types
     except ModuleNotFoundError as e:  # pragma: no cover
-        raise ModuleNotFoundError(
-            "google-generativeai is not installed. Run: pip install google-generativeai"
-        ) from e
-    return genai
+        try:
+            import google.generativeai as legacy_genai  # type: ignore
+        except ModuleNotFoundError:
+            raise ModuleNotFoundError(
+                "Gemini support requires google-genai. Run: pip install google-genai"
+            ) from e
+        return "google-generativeai", legacy_genai, None
 
 
 def _load_ollama_sdk() -> tuple[Any, Any, Any]:
@@ -658,23 +663,35 @@ def generate_sql(
 """
 
     if selected_provider == "gemini":
-        genai = _load_gemini_sdk()
+        sdk_name, genai, genai_types = _load_gemini_sdk()
         api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
         if not api_key:
             raise ValueError("GEMINI_API_KEY is missing. Set it in `.env` or environment variables.")
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name or DEFAULT_MODEL_NAME,
-            system_instruction=SQL_TRANSLATION_SYSTEM_PROMPT,
-        )
-        response = model.generate_content(
-            contents=prompt,
-            generation_config={
-                "temperature": 0.0,
-                "max_output_tokens": 512,
-            },
-        )
+        if sdk_name == "google-genai":
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=model_name or DEFAULT_MODEL_NAME,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.0,
+                    max_output_tokens=512,
+                    system_instruction=SQL_TRANSLATION_SYSTEM_PROMPT,
+                ),
+            )
+        else:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(
+                model_name or DEFAULT_MODEL_NAME,
+                system_instruction=SQL_TRANSLATION_SYSTEM_PROMPT,
+            )
+            response = model.generate_content(
+                contents=prompt,
+                generation_config={
+                    "temperature": 0.0,
+                    "max_output_tokens": 512,
+                },
+            )
         return _extract_sql_from_text(str(response.text or ""))
 
     if selected_provider == "ollama":
@@ -948,7 +965,10 @@ def ask_database_with_sql(
         if use_rag
         else get_schema(db_path)
     )
-    sql = generate_sql(question, schema_text, model_name=model_name, provider=provider)
+    try:
+        sql = generate_sql(question, schema_text, model_name=model_name, provider=provider)
+    except Exception as e:
+        return "", QueryResult(columns=[], rows=[], error=f"{type(e).__name__}: {e}")
 
     if "UNANSWERABLE_WITH_GIVEN_SCHEMA" in sql:
         return sql, QueryResult(columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA")
