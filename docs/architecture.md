@@ -13,6 +13,8 @@ The file has two pages:
 - `Presentation Architecture`: use this page in the report and PowerPoint. It shows the end-to-end flow, layer boundaries, numbered user journey, safety branch, and evaluation/report evidence.
 - `Implementation Modules`: use this page if the teacher asks how the code is organized after the refactor.
 
+Several dashed boxes are logo placeholders. In diagrams.net, select each placeholder and replace it with the official or preferred icon for Streamlit, Gemini, Ollama, SQLite, Python, sqlglot, or Streamlit Cloud.
+
 The presentation page uses a layered layout:
 
 - User and interface layer

@@ -34,6 +34,34 @@
           <mxGeometry x="70" y="620" width="1660" height="125" as="geometry" />
         </mxCell>
 
+        <mxCell id="legend" value="Replaceable tool/logo placeholders" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#cbd5e1;fontSize=12;fontStyle=1;fontColor=#475569;spacing=6;" vertex="1" parent="1">
+          <mxGeometry x="70" y="95" width="220" height="32" as="geometry" />
+        </mxCell>
+        <mxCell id="logoStreamlit" value="Streamlit&#xa;logo" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#ef4444;dashed=1;fontSize=11;fontStyle=1;fontColor=#991b1b;spacing=4;" vertex="1" parent="1">
+          <mxGeometry x="365" y="154" width="78" height="42" as="geometry" />
+        </mxCell>
+        <mxCell id="logoPython" value="Python&#xa;pipeline" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#64748b;dashed=1;fontSize=11;fontStyle=1;fontColor=#334155;spacing=4;" vertex="1" parent="1">
+          <mxGeometry x="505" y="315" width="82" height="42" as="geometry" />
+        </mxCell>
+        <mxCell id="logoSQLite" value="SQLite&#xa;logo" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#22c55e;dashed=1;fontSize=11;fontStyle=1;fontColor=#166534;spacing=4;" vertex="1" parent="1">
+          <mxGeometry x="620" y="154" width="76" height="42" as="geometry" />
+        </mxCell>
+        <mxCell id="logoRag" value="RAG&#xa;retriever" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#22c55e;dashed=1;fontSize=11;fontStyle=1;fontColor=#166534;spacing=4;" vertex="1" parent="1">
+          <mxGeometry x="931" y="154" width="76" height="42" as="geometry" />
+        </mxCell>
+        <mxCell id="logoGemini" value="Gemini&#xa;logo" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9333ea;dashed=1;fontSize=11;fontStyle=1;fontColor=#6b21a8;spacing=4;" vertex="1" parent="1">
+          <mxGeometry x="1162" y="154" width="82" height="42" as="geometry" />
+        </mxCell>
+        <mxCell id="logoOllama" value="Ollama&#xa;logo" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9333ea;dashed=1;fontSize=11;fontStyle=1;fontColor=#6b21a8;spacing=4;" vertex="1" parent="1">
+          <mxGeometry x="1252" y="154" width="82" height="42" as="geometry" />
+        </mxCell>
+        <mxCell id="logoSqlglot" value="sqlglot&#xa;AST" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#f97316;dashed=1;fontSize=11;fontStyle=1;fontColor=#9a3412;spacing=4;" vertex="1" parent="1">
+          <mxGeometry x="1514" y="286" width="72" height="38" as="geometry" />
+        </mxCell>
+        <mxCell id="logoCloud" value="Streamlit&#xa;Cloud" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#64748b;dashed=1;fontSize=11;fontStyle=1;fontColor=#334155;spacing=4;" vertex="1" parent="1">
+          <mxGeometry x="1496" y="635" width="92" height="38" as="geometry" />
+        </mxCell>
+
         <mxCell id="n1" value="1" style="ellipse;whiteSpace=wrap;html=1;aspect=fixed;fillColor=#2563eb;strokeColor=#1d4ed8;fontColor=#ffffff;fontStyle=1;fontSize=14;" vertex="1" parent="1">
           <mxGeometry x="112" y="221" width="28" height="28" as="geometry" />
         </mxCell>
@@ -92,6 +120,9 @@
         <mxCell id="result" value="Results to User&#xa;Table, SQL, schema DDL, RAG report" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#3b82f6;fontSize=14;fontStyle=1;fontColor=#111827;spacing=10;" vertex="1" parent="1">
           <mxGeometry x="145" y="300" width="326" height="70" as="geometry" />
         </mxCell>
+        <mxCell id="backend" value="Backend Orchestrator&#xa;text_to_sql_agent.pipeline" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fefce8;strokeColor=#eab308;fontSize=13;fontStyle=1;fontColor=#111827;spacing=8;" vertex="1" parent="1">
+          <mxGeometry x="505" y="300" width="160" height="70" as="geometry" />
+        </mxCell>
 
         <mxCell id="eval" value="Evaluation Harness&#xa;12 benchmark cases + gold SQL across 3 domains" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#f59e0b;fontSize=14;fontStyle=1;fontColor=#111827;spacing=10;" vertex="1" parent="1">
           <mxGeometry x="560" y="480" width="240" height="70" as="geometry" />
@@ -142,7 +173,8 @@
         </mxCell>
 
         <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeWidth=2;strokeColor=#2563eb;" edge="1" parent="1" source="user" target="ui"><mxGeometry relative="1" as="geometry" /></mxCell>
-        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeWidth=2;strokeColor=#16a34a;" edge="1" parent="1" source="ui" target="data"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeWidth=2;strokeColor=#eab308;" edge="1" parent="1" source="ui" target="backend"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e2b" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeWidth=2;strokeColor=#16a34a;" edge="1" parent="1" source="backend" target="data"><mxGeometry relative="1" as="geometry" /></mxCell>
         <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeWidth=2;strokeColor=#16a34a;" edge="1" parent="1" source="data" target="schema"><mxGeometry relative="1" as="geometry" /></mxCell>
         <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeWidth=2;strokeColor=#16a34a;" edge="1" parent="1" source="schema" target="rag"><mxGeometry relative="1" as="geometry" /></mxCell>
         <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;strokeWidth=2;strokeColor=#9333ea;" edge="1" parent="1" source="rag" target="llm"><mxGeometry relative="1" as="geometry" /></mxCell>
