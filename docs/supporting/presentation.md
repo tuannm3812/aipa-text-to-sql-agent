@@ -90,8 +90,9 @@ Use app screenshots: database selector, generated SQL answer, retrieved schema c
 
 ```bash
 python3 scripts/evaluate_text_to_sql.py --mode gold
-python3 scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemini-2.5-flash
-python3 scripts/evaluate_text_to_sql.py --mode llm --provider ollama --model llama3:latest
+python3 scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemini-2.5-flash --max-cases 12 --max-retries 1 --retry-base-seconds 5
+python3 scripts/evaluate_text_to_sql.py --mode llm --provider ollama --model llama3:latest --resume
+python3 scripts/evaluate_text_to_sql.py --mode llm --provider ollama --model gemma4:latest --resume
 ```
 
 ### Slide 7: Results Overview

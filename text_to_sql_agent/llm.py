@@ -6,7 +6,7 @@ from typing import Any
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_OLLAMA_MODEL, DEFAULT_PROVIDER
 from .env import load_env
-from .gemnini_manager import get_default_gemnini_manager
+from .gemini_manager import get_default_gemini_manager
 
 SQL_TRANSLATION_SYSTEM_PROMPT = """\
 You are an expert data analyst and SQL translator.
@@ -122,7 +122,7 @@ def generate_sql(
 
     if selected_provider == "gemini":
         sdk_name, genai, genai_types = _load_gemini_sdk()
-        key_manager = get_default_gemnini_manager()
+        key_manager = get_default_gemini_manager()
 
         def generate_with_key(api_key: str) -> str:
             if sdk_name == "google-genai":

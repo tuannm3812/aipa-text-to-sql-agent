@@ -187,7 +187,10 @@ The system architecture consists of five major layers: user interface, data and 
 
 The backend is organised as a Python package under `text_to_sql_agent/`. The main modules are `ingestion.py` for CSV ingestion, `schema.py` for schema extraction and schema chunk construction, `rag.py` for hybrid schema retrieval, `llm.py` for Gemini and Ollama generation, `safety.py` for SQL validation, `execution.py` for read-only SQLite execution, and `pipeline.py` for orchestration. The file `text_to_sql_agent_mvp.py` remains as a compatibility wrapper for the notebook, tests, and Streamlit app.
 
-The architectural diagram is stored in `docs/supporting/architecture.drawio`. For the final PDF submission, the `Presentation Architecture` page should be exported as a PNG or PDF and inserted as Figure 1.
+The architectural diagram is stored in `docs/supporting/architecture.drawio`. For the final PDF submission, the `Presentation Architecture` page should be exported as a PNG or PDF and inserted here as Figure 1.
+
+**Figure 1. System architecture and safety-controlled Text-to-SQL workflow.**
+This figure should show the Streamlit interface, SQLite/CSV data sources, Schema RAG layer, Gemini/Ollama generation layer, read-only SQL validation, local SQLite execution, and evaluation evidence.
 
 ### 4.2 Data Collection and Preprocessing
 
@@ -220,6 +223,15 @@ The algorithm follows this sequence:
 9. The interface displays the result table, generated SQL, schema context, and retrieval evidence.
 
 The model design deliberately separates **candidate generation** from **execution authority**. The LLM proposes SQL, but the application decides whether it is safe to execute. This separation is central to the reliability and ethics of the system.
+
+**Figure 2. Streamlit interface and database selection workflow.**
+Insert a screenshot of the deployed app showing provider/model controls, Gemini key status, Schema RAG settings, and the demo database selector.
+
+**Figure 3. Natural-language query result and generated SQL.**
+Insert a screenshot showing a retail or university question, the generated SQL, and the result table. This figure demonstrates transparency because the SQL is visible rather than hidden behind the answer.
+
+**Figure 4. Schema RAG retrieval diagnostics.**
+Insert a screenshot of the retrieval report showing selected tables, matched terms, graph-neighbour expansion, schema recall, and prompt savings.
 
 ### 4.5 Integration of AI Paradigms
 
@@ -281,13 +293,8 @@ The gold SQL baseline confirms that the evaluation harness, datasets, and safety
 
 The Gemini results show the strongest LLM performance in this benchmark, with 11 of 12 cases matching the gold values after canonicalisation. The local-model results show a practical trade-off: `llama3:latest` was safer and faster end-to-end, while `gemma4:latest` matched 8 of the 10 queries it successfully executed but produced two blocked outputs on harder retail revenue questions. Exact match remained **0/12** for all LLM runs because the metric requires values, rows, and column names to match the gold output exactly.
 
-Recommended figures for the final report are:
-
-- Figure 1: system architecture exported from `docs/supporting/architecture.drawio`;
-- Figure 2: Streamlit interface showing provider/model controls and database selection;
-- Figure 3: a generated SQL answer and result table for a retail or university question;
-- Figure 4: Schema RAG retrieval diagnostics showing selected tables, scores, matched terms, and prompt savings;
-- Figure 5: evaluation summary table from `evaluation/results/evaluation_gold.md` and the LLM result table documented in `README.md`.
+**Figure 5. Evaluation result summary.**
+Insert the evaluation summary from `evaluation/results/evaluation_gold.md` together with the LLM comparison results from `evaluation/results/evaluation_llm_gemini_gemini_2_5_flash.md`, `evaluation/results/evaluation_llm_ollama_llama3_latest.md`, and `evaluation/results/evaluation_llm_ollama_gemma4_latest.md`. This figure belongs in the empirical results section because it supports the comparison between gold SQL, Gemini, and local Ollama models.
 
 ### 5.5 Result Interpretation and Discussion
 

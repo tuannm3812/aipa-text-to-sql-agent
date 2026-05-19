@@ -10,7 +10,7 @@ T = TypeVar("T")
 
 NEXT_KEY_STATUS_CODES = {429, 492}
 RESET_KEY_STATUS_CODES = {503}
-_DEFAULT_MANAGER: GemniniManager | None = None
+_DEFAULT_MANAGER: GeminiManager | None = None
 _DEFAULT_MANAGER_KEYS: tuple[str, ...] = ()
 
 
@@ -75,7 +75,7 @@ def error_status_code(exc: BaseException) -> int | None:
 
 
 @dataclass
-class GemniniManager:
+class GeminiManager:
     """Small key-rotation helper for Gemini calls.
 
     492/429 advances to the next key. 503 rebuilds and retries the current key
@@ -96,7 +96,7 @@ class GemniniManager:
         self.index %= len(self.keys)
 
     @classmethod
-    def from_env(cls) -> "GemniniManager":
+    def from_env(cls) -> "GeminiManager":
         return cls(load_google_api_keys())
 
     @property
@@ -146,12 +146,12 @@ class GemniniManager:
         raise RuntimeError("Gemini manager exhausted attempts without running a call.")
 
 
-def get_default_gemnini_manager() -> GemniniManager:
+def get_default_gemini_manager() -> GeminiManager:
     """Return a process-level manager so key rotation persists across calls."""
     global _DEFAULT_MANAGER, _DEFAULT_MANAGER_KEYS
 
     keys = tuple(load_google_api_keys())
     if _DEFAULT_MANAGER is None or keys != _DEFAULT_MANAGER_KEYS:
-        _DEFAULT_MANAGER = GemniniManager(keys)
+        _DEFAULT_MANAGER = GeminiManager(keys)
         _DEFAULT_MANAGER_KEYS = keys
     return _DEFAULT_MANAGER

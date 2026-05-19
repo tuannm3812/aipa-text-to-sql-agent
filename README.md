@@ -105,7 +105,7 @@ In the Streamlit sidebar you can toggle schema RAG and adjust how many tables ar
 |   |-- execution.py                # Read-only SQLite execution
 |   |-- ingestion.py                # CSV ingestion
 |   |-- llm.py                      # Gemini/Ollama SQL generation
-|   |-- gemnini_manager.py          # Gemini API key loading and quota failover
+|   |-- gemini_manager.py           # Gemini API key loading and quota failover
 |   |-- pipeline.py                 # End-to-end ask_* workflows
 |   |-- rag.py                      # Hybrid schema RAG
 |   |-- safety.py                   # SQL safety checks
