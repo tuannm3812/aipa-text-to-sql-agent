@@ -183,14 +183,14 @@ The responsible AI framing is supported by the NIST AI Risk Management Framework
 
 ### 4.1 System Architecture Overview
 
-The system architecture consists of five major layers: user interface, data and schema processing, schema retrieval, LLM generation, and safety-controlled execution. The Streamlit interface allows users to choose a provider and model, connect a SQLite database or upload CSV files, ask a question, and inspect the generated SQL, result table, and retrieval diagnostics.
+The user-facing system architecture consists of six major layers: user input, data preparation, schema retrieval, SQL generation, safety-controlled execution, and answer display. The Streamlit interface allows users to choose a provider and model, connect a SQLite database or upload CSV files, ask a question, and inspect the generated SQL, result table, and retrieval diagnostics.
 
 The backend is organised as a Python package under `text_to_sql_agent/`. The main modules are `ingestion.py` for CSV ingestion, `schema.py` for schema extraction and schema chunk construction, `rag.py` for hybrid schema retrieval, `llm.py` for Gemini and Ollama generation, `safety.py` for SQL validation, `execution.py` for read-only SQLite execution, and `pipeline.py` for orchestration. The file `text_to_sql_agent_mvp.py` remains as a compatibility wrapper for the notebook, tests, and Streamlit app.
 
-The architectural diagram is stored in `docs/supporting/architecture.drawio`. For the final PDF submission, the `Presentation Architecture` page should be exported as a PNG or PDF and inserted here as Figure 1.
+The architectural diagrams are stored in `docs/supporting/architecture.drawio`. For the final PDF submission, the `User Tool Workflow` page should be exported as a PNG or PDF and inserted here as Figure 1. This figure should focus only on normal tool usage and should not include the offline evaluation or report-preparation process.
 
-**Figure 1. System architecture and safety-controlled Text-to-SQL workflow.**
-This figure should show the Streamlit interface, SQLite/CSV data sources, Schema RAG layer, Gemini/Ollama generation layer, read-only SQL validation, local SQLite execution, and evaluation evidence.
+**Figure 1. User Tool Workflow for Natural-Language Database Question Answering.**
+This figure should show the live app path: Streamlit question input, sample database or uploaded data selection, schema extraction, Schema RAG, Gemini/Ollama SQL candidate generation, safety validation, read-only SQLite execution, and the answer panel returned to the user.
 
 ### 4.2 Data Collection and Preprocessing
 
@@ -202,11 +202,14 @@ This preprocessing strategy supports **reproducibility** and **privacy**. Reprod
 
 ### 4.3 Feature Engineering
 
-Feature engineering occurs primarily in the Schema RAG layer. Each table is converted into a schema chunk containing its table name, columns, DDL, searchable text, foreign-key neighbours, and selected low-cardinality value hints. The user question is tokenised and expanded using domain synonyms such as mappings from "client" to "customer" and "revenue" to amount or sales-related terms.
+Feature engineering occurs primarily in the Schema RAG layer. Each table is converted into a schema chunk containing its table name, columns, DDL, searchable text, foreign-key neighbours, and selected low-cardinality value hints. The user question is tokenised and expanded using domain synonyms such as mappings from "client" to "customer" and "revenue" to amount or sales-related terms. The `Hybrid Schema RAG Detail` page in `docs/supporting/architecture.drawio` should be exported as Figure 2 to show this retrieval process as its own method flow rather than hiding it inside the full system diagram.
 
 The retrieval layer also decomposes questions into interpretable categories: **entities or metrics**, **aggregations**, **filters or dimensions**, and **comparisons**. For example, a question containing "average" is marked as an average aggregation, while a question containing "completed" or "status" may activate filter and dimension signals. These features do not replace the LLM; they improve retrieval and make the retrieval process more explainable.
 
 Additional engineered signals include BM25-style lexical scores, exact table and column match boosts, character n-gram similarity, local hashed embedding similarity, and foreign-key neighbour expansion. These signals are combined to rank schema chunks before constructing the LLM prompt.
+
+**Figure 2. Hybrid Schema RAG Retrieval Flow for Table Selection and Prompt Construction.**
+This figure should show question normalisation, synonym expansion, query-intent decomposition, schema chunk caching, lexical and semantic scoring signals, value-hint matching, foreign-key graph expansion, selected prompt context, and retrieval diagnostics.
 
 ### 4.4 Model Design and Algorithmic Approach
 
@@ -224,13 +227,13 @@ The algorithm follows this sequence:
 
 The model design deliberately separates **candidate generation** from **execution authority**. The LLM proposes SQL, but the application decides whether it is safe to execute. This separation is central to the reliability and ethics of the system.
 
-**Figure 2. Streamlit interface and database selection workflow.**
+**Figure 3. Streamlit Database Selection and Question Input Flow.**
 Insert a screenshot of the deployed app showing provider/model controls, Gemini key status, Schema RAG settings, and the demo database selector.
 
-**Figure 3. Natural-language query result and generated SQL.**
+**Figure 4. SQL Candidate, Safety Gate, and Answer Display Flow.**
 Insert a screenshot showing a retail or university question, the generated SQL, and the result table. This figure demonstrates transparency because the SQL is visible rather than hidden behind the answer.
 
-**Figure 4. Schema RAG retrieval diagnostics.**
+**Figure 5. Schema RAG Retrieval Diagnostics in the User Interface.**
 Insert a screenshot of the retrieval report showing selected tables, matched terms, graph-neighbour expansion, schema recall, and prompt savings.
 
 ### 4.5 Integration of AI Paradigms
@@ -255,7 +258,7 @@ The fourth design decision was to keep the system reproducible. The implementati
 
 The evaluation uses 12 benchmark questions across university, retail, and healthcare databases. Each case contains a natural-language question, database path, gold SQL query, expected relevant tables, and difficulty label. The evaluator executes both the gold SQL and the generated SQL, compares their outputs, measures latency, and records whether the generated query is safe and executable.
 
-The evaluation can be run in gold mode or LLM mode. Gold mode verifies that the benchmark and execution environment are correct. LLM mode evaluates generated SQL from Gemini or Ollama. The current evidence includes a complete gold-baseline run, a complete Gemini 2.5 Flash run using multi-key quota failover, and complete local Ollama runs for `llama3:latest` and `gemma4:latest`.
+The evaluation can be run in gold mode or LLM mode. Gold mode verifies that the benchmark and execution environment are correct. LLM mode evaluates generated SQL from Gemini or Ollama. The current evidence includes a complete gold-baseline run, a complete Gemini 2.5 Flash run using multi-key quota failover, and complete local Ollama runs for `llama3:latest` and `gemma4:latest`. This process is represented separately in the `Offline Evaluation Workflow` page of `docs/supporting/architecture.drawio` because evaluation is a local validation workflow, not part of the normal user-facing tool flow.
 
 ### 5.2 Dataset Description
 
@@ -293,8 +296,8 @@ The gold SQL baseline confirms that the evaluation harness, datasets, and safety
 
 The Gemini results show the strongest LLM performance in this benchmark, with 11 of 12 cases matching the gold values after canonicalisation. The local-model results show a practical trade-off: `llama3:latest` was safer and faster end-to-end, while `gemma4:latest` matched 8 of the 10 queries it successfully executed but produced two blocked outputs on harder retail revenue questions. Exact match remained **0/12** for all LLM runs because the metric requires values, rows, and column names to match the gold output exactly.
 
-**Figure 5. Evaluation result summary.**
-Insert the evaluation summary from `evaluation/results/evaluation_gold.md` together with the LLM comparison results from `evaluation/results/evaluation_llm_gemini_gemini_2_5_flash.md`, `evaluation/results/evaluation_llm_ollama_llama3_latest.md`, and `evaluation/results/evaluation_llm_ollama_gemma4_latest.md`. This figure belongs in the empirical results section because it supports the comparison between gold SQL, Gemini, and local Ollama models.
+**Figure 6. Offline Evaluation Workflow and Result Summary.**
+Insert the `Offline Evaluation Workflow` export from `docs/supporting/architecture.drawio` together with the evaluation summary from `evaluation/results/evaluation_gold.md` and the LLM comparison results from `evaluation/results/evaluation_llm_gemini_gemini_2_5_flash.md`, `evaluation/results/evaluation_llm_ollama_llama3_latest.md`, and `evaluation/results/evaluation_llm_ollama_gemma4_latest.md`. This figure belongs in the empirical results section because it supports the comparison between gold SQL, Gemini, and local Ollama models without mixing evaluation into the live user workflow.
 
 ### 5.5 Result Interpretation and Discussion
 
