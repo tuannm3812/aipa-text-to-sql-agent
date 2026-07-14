@@ -2,6 +2,17 @@
 
 Use screenshots from the deployed Streamlit app and local evaluation output as evidence in the report and presentation. The screenshots should show the current workflow: database selection, Schema RAG, generated SQL, local execution results, and evaluation evidence.
 
+## Current README Screenshots
+
+`docs/supporting/screenshots/` holds the screenshots embedded in the top-level `README.md`, captured from a local run of `app.py` (Ollama provider, Retail Analytics demo database):
+
+- `01-chat-ui.png` - initial chat UI with a demo database selected in the sidebar.
+- `02-query-result.png` - a result table for "Show the number of returns for each return reason, ranked from most to least common."
+- `03-generated-sql.png` - the same turn with the "Generated SQL" expander open.
+- `04-schema-rag-report.png` - the same turn with the "Schema RAG retrieval report" expander open, scrolled to the top of the report.
+
+Regenerate these whenever the chat UI, RAG report format, or demo databases change materially, so the README doesn't go stale.
+
 ## Recommended Captions
 
 1. **Application UI and demo database workflow**

@@ -554,14 +554,15 @@ def main() -> None:
         )
         if sample_prompt and st.button("Use sample question", type="secondary", disabled=not key_ok):
             st.session_state.messages.append({"role": "user", "content": sample_prompt})
-            sql_text, result = backend.ask_database_with_sql(
-                sample_prompt,
-                db_path=str(Path(demo["path"]).resolve()),
-                model_name=model_name,
-                provider=provider,
-                use_rag=use_rag,
-                rag_top_k=rag_top_k,
-            )
+            with st.spinner("Generating SQL and running query..."):
+                sql_text, result = backend.ask_database_with_sql(
+                    sample_prompt,
+                    db_path=str(Path(demo["path"]).resolve()),
+                    model_name=model_name,
+                    provider=provider,
+                    use_rag=use_rag,
+                    rag_top_k=rag_top_k,
+                )
             df_out = _result_to_dataframe(result) if result.columns else None
             rag_report = None
             schema_text = None
@@ -653,16 +654,17 @@ def main() -> None:
     if prompt and db_path_to_query and key_ok:
         st.session_state.messages.append({"role": "user", "content": prompt.strip()})
 
-        sql_text, result = backend.ask_database_with_sql(
-            prompt.strip(),
-            db_path=db_path_to_query,
-            model_name=(model_name or "").strip() or (
-                backend.DEFAULT_MODEL_NAME if provider == "gemini" else backend.DEFAULT_OLLAMA_MODEL
-            ),
-            provider=provider,
-            use_rag=use_rag,
-            rag_top_k=rag_top_k,
-        )
+        with st.spinner("Generating SQL and running query..."):
+            sql_text, result = backend.ask_database_with_sql(
+                prompt.strip(),
+                db_path=db_path_to_query,
+                model_name=(model_name or "").strip() or (
+                    backend.DEFAULT_MODEL_NAME if provider == "gemini" else backend.DEFAULT_OLLAMA_MODEL
+                ),
+                provider=provider,
+                use_rag=use_rag,
+                rag_top_k=rag_top_k,
+            )
 
         error_text = None
         blocked_sql = None

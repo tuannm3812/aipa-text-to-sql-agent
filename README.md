@@ -2,18 +2,31 @@
 
 An AI-assisted decision support prototype that translates natural-language questions into safe, locally executed SQLite queries.
 
+[![Tests](https://github.com/tuannm3812/aipa-text-to-sql-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/tuannm3812/aipa-text-to-sql-agent/actions/workflows/tests.yml)
 [![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://aipa-text-to-sql-agent.streamlit.app/)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
 [![Gemini](https://img.shields.io/badge/LLM-Gemini-4285F4)](https://ai.google.dev/)
 [![Ollama](https://img.shields.io/badge/Local%20LLM-Ollama-111111)](https://ollama.com/)
 [![SQLite](https://img.shields.io/badge/Database-SQLite-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Live demo:** https://aipa-text-to-sql-agent.streamlit.app/
 
-![Text-to-SQL semantic-layer concept](https://substackcdn.com/image/fetch/$s_!tTOS!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F16cb83ea-b843-4f1d-bf5b-7fa57ce034c5_484x462.png)
+| Ask a question | Get a ranked, grounded answer |
+|---|---|
+| ![Chat UI with a demo database selected](docs/supporting/screenshots/01-chat-ui.png) | ![Query result table](docs/supporting/screenshots/02-query-result.png) |
 
-Image credit: Vu Trinh / Holistics article, ["Why is Text-to-SQL so hard?"](https://www.holistics.io/blog/text-to-sql/).
+<details>
+<summary>See the generated SQL and the schema RAG retrieval report behind that answer</summary>
+
+The SQL is never hidden from the user, and every answer can show which tables were retrieved and why:
+
+![Generated SQL for the query above](docs/supporting/screenshots/03-generated-sql.png)
+
+![Schema RAG retrieval report showing retrieval strategy, scores, and prompt savings](docs/supporting/screenshots/04-schema-rag-report.png)
+
+</details>
 
 ## What It Does
 
