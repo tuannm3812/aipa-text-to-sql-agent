@@ -188,6 +188,20 @@ def _result_to_dataframe(result: backend.QueryResult) -> pd.DataFrame | None:
     return pd.DataFrame(result.rows, columns=result.columns)
 
 
+def _chartable_columns(df: pd.DataFrame) -> tuple[str, str] | None:
+    """Return (category_col, value_col) if `df` is a two-column GROUP BY-shaped result."""
+    if len(df.columns) != 2 or len(df) < 2:
+        return None
+    first, second = df.columns[0], df.columns[1]
+    first_numeric = pd.api.types.is_numeric_dtype(df[first])
+    second_numeric = pd.api.types.is_numeric_dtype(df[second])
+    if first_numeric and not second_numeric:
+        return second, first
+    if second_numeric and not first_numeric:
+        return first, second
+    return None
+
+
 def _active_db_path() -> str | None:
     """Resolve DB path from sidebar widgets (with caching for uploads)."""
     source = st.session_state.get("sb_source", "Demo database")
@@ -348,6 +362,16 @@ def _render_assistant_turn(msg: dict) -> None:
                 df = msg["df"]
                 if not df.empty:
                     st.dataframe(df, use_container_width=True, hide_index=True)
+                    chart_cols = _chartable_columns(df)
+                    if chart_cols:
+                        category_col, value_col = chart_cols
+                        # Preserve the query's row order (e.g. ORDER BY ... DESC) instead of
+                        # letting the chart library re-sort categories alphabetically.
+                        labels = df[category_col].astype(str)
+                        unique_order = list(dict.fromkeys(labels))
+                        ordered = pd.Categorical(labels, categories=unique_order, ordered=True)
+                        chart_df = df.assign(**{category_col: ordered}).set_index(category_col)
+                        st.bar_chart(chart_df[value_col])
                 else:
                     st.caption("No rows returned.")
             if msg.get("sql_text"):

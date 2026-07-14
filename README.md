@@ -46,7 +46,28 @@ The current branch supports two LLM backends:
 5. The LLM returns one SQLite `SELECT` query.
 6. Python validates that the SQL is read-only and avoids SQLite internals.
 7. SQLite executes the query locally in read-only mode.
-8. Streamlit renders the result table.
+8. Streamlit renders the result table, with an automatic bar chart when the result is a two-column `GROUP BY`-shaped answer (one category column, one numeric column).
+
+```mermaid
+flowchart TD
+    Q[User question] --> RAG
+    SRC{{"Database source\n(demo / path / upload / CSV)"}} --> SCHEMA["Extract schema metadata\ntables, columns, DDL, foreign keys"]
+    SCHEMA --> RAG["Hybrid Schema RAG\nBM25 + synonyms + embeddings + FK graph"]
+    RAG --> LLM["LLM SQL generation\nGemini or Ollama"]
+    LLM --> SAFE{"Safety check\nregex + sqlglot AST"}
+    SAFE -- unsafe --> BLOCK["Blocked\nSQL shown, not executed"]
+    SAFE -- safe --> EXEC["Read-only SQLite execution\nquery_only + authorizer"]
+    EXEC -- error --> REPAIR["One-shot LLM repair\nusing the SQLite error"]
+    REPAIR --> EXEC
+    EXEC -- success --> RESULT["Result table"]
+    RESULT --> CHART{"Two-column\nGROUP BY shape?"}
+    CHART -- yes --> BAR["Auto bar chart"]
+    CHART -- no --> UI
+    BAR --> UI["Streamlit: table + chart + generated SQL\n+ schema + RAG retrieval report"]
+    BLOCK --> UI
+```
+
+For a deeper, multi-page diagram (hybrid RAG internals, the offline evaluation workflow, and a module map), see `docs/supporting/architecture.drawio` and `docs/supporting/architecture.md`.
 
 ## Inspiration From Text-to-SQL Research and BI Practice
 
@@ -110,8 +131,8 @@ In the Streamlit sidebar you can toggle schema RAG and adjust how many tables ar
 ```text
 .
 |-- app.py                         # Streamlit frontend
-|-- text_to_sql_agent_mvp.py        # Backward-compatible backend wrapper
-|-- text_to_sql_agent/              # Refactored backend package
+|-- text_to_sql_agent_mvp.py        # Compatibility import path (used by app.py, tests, the notebook)
+|-- text_to_sql_agent/              # Backend package
 |   |-- config.py                   # Defaults, model names, RAG constants
 |   |-- data_setup.py               # Demo university database generation
 |   |-- env.py                      # Environment loading
@@ -130,21 +151,23 @@ In the Streamlit sidebar you can toggle schema RAG and adjust how many tables ar
 |-- scripts/
 |   `-- evaluate_text_to_sql.py     # Automatic model evaluation
 |-- docs/
-|   |-- report.md                   # Assignment report draft
-|   `-- supporting/                 # Presentation, deployment, architecture, screenshots
-|       |-- presentation.md          # Presentation transcript and slide content
-|       |-- deployment.md            # Streamlit Community checklist
+|   |-- academic/                   # Course-assignment deliverables (report, slides)
+|   |   |-- report.md                # Assignment report draft
+|   |   |-- presentation.md          # Presentation transcript and slide content
+|   |   `-- enterprise-text-to-sql-agent-presentation.pptx
+|   `-- supporting/                 # Living reference docs for anyone using the repo
 |       |-- architecture.md          # Architecture notes
 |       |-- architecture.drawio      # Diagram source
+|       |-- deployment.md            # Streamlit Community checklist
 |       |-- screenshots.md           # Screenshot guidance
-|       `-- enterprise-text-to-sql-agent-presentation.pptx
+|       `-- screenshots/             # README screenshots
 |-- data/
 |   |-- customers.csv               # Small CSV sample
 |   |-- sales.csv                   # Small CSV sample
 |   |-- university_agent.db         # Demo university DB
 |   |-- healthcare_analytics.db     # Healthcare sample DB
 |   `-- retail_analytics.db         # Retail sample DB
-`-- text_to_sql_agent_mvp.ipynb     # Notebook exploration
+`-- text_to_sql_agent_mvp.ipynb     # Reproducible notebook walkthrough
 ```
 
 ## Setup
@@ -318,4 +341,4 @@ See `docs/supporting/deployment.md` for the full checklist. Ollama is best treat
 
 ## Notes
 
-This is still an MVP. The most important next improvements are persistent embedding-based schema retrieval, SQL parser-based validation, stronger query repair, and richer charting.
+This is still an MVP. The most important next improvements are persistent (model-based, not hashed) embedding retrieval for schema RAG, multi-attempt query repair instead of a single retry, and chart types beyond a bar chart (e.g. time series line charts) for result shapes the auto-chart heuristic doesn't cover yet.
