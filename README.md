@@ -48,39 +48,9 @@ The current branch supports two LLM backends:
 7. SQLite executes the query locally in read-only mode.
 8. Streamlit renders the result table, with an automatic bar chart when the result is a two-column `GROUP BY`-shaped answer (one category column, one numeric column).
 
-```mermaid
-flowchart TD
-    Q[User question] --> RAG
-    SRC{{"Database source\n(demo / path / upload / CSV)"}} --> SCHEMA["Extract schema metadata\ntables, columns, DDL, foreign keys"]
-    SCHEMA --> RAG["Hybrid Schema RAG\nBM25 + synonyms + embeddings + FK graph"]
-    RAG --> LLM["LLM SQL generation\nGemini or Ollama"]
-    LLM --> SAFE{"Safety check\nregex + sqlglot AST"}
-    SAFE -- unsafe --> BLOCK["Blocked\nSQL shown, not executed"]
-    SAFE -- safe --> EXEC["Read-only SQLite execution\nquery_only + authorizer"]
-    EXEC -- error --> REPAIR["One-shot LLM repair\nusing the SQLite error"]
-    REPAIR --> EXEC
-    EXEC -- success --> RESULT["Result table"]
-    RESULT --> CHART{"Two-column\nGROUP BY shape?"}
-    CHART -- yes --> BAR["Auto bar chart"]
-    CHART -- no --> UI
-    BAR --> UI["Streamlit: table + chart + generated SQL\n+ schema + RAG retrieval report"]
-    BLOCK --> UI
-```
+![Runtime architecture schematic: request trace builds context left to right, response trace validates, executes, and answers right to left, with optional key-failover, repair, and auto-chart branches](docs/supporting/screenshots/00-architecture-workflow.png)
 
 For a deeper, multi-page diagram (hybrid RAG internals, the offline evaluation workflow, and a module map), see `docs/supporting/architecture.drawio` and `docs/supporting/architecture.md`.
-
-## Inspiration From Text-to-SQL Research and BI Practice
-
-The Holistics article ["Why is Text-to-SQL so hard?"](https://www.holistics.io/blog/text-to-sql/) argues that reliable Text-to-SQL is difficult because natural language is ambiguous, enterprise schemas are complex, and SQL is a strict execution language. It highlights semantic layers as a way to ground AI systems in governed business concepts, relationships, and metric definitions instead of asking a model to guess from raw table names.
-
-Our prototype applies the same idea at assignment scale:
-
-- The schema/RAG layer acts as a lightweight semantic layer over SQLite.
-- Hybrid retrieval selects relevant tables, columns, foreign-key relationships, and safe categorical hints.
-- The generated SQL is shown to users for verification.
-- SQL execution is governed through read-only validation and local execution.
-
-Unlike a full BI semantic layer such as Holistics AQL, our tool still generates SQL directly. The trade-off is that our prototype is simpler and flexible for arbitrary SQLite databases, but less governed than a production semantic-layer system with centrally defined metrics.
 
 ## Schema RAG
 
@@ -126,49 +96,18 @@ In the Streamlit sidebar you can toggle schema RAG and adjust how many tables ar
 - Results are capped to avoid rendering unexpectedly large outputs.
 - If safe generated SQL fails during execution, the system can make one LLM-based repair attempt using the SQLite error message.
 
-## Project Structure
+## Inspiration From Text-to-SQL Research and BI Practice
 
-```text
-.
-|-- app.py                         # Streamlit frontend
-|-- text_to_sql_agent_mvp.py        # Compatibility import path (used by app.py, tests, the notebook)
-|-- text_to_sql_agent/              # Backend package
-|   |-- config.py                   # Defaults, model names, RAG constants
-|   |-- data_setup.py               # Demo university database generation
-|   |-- env.py                      # Environment loading
-|   |-- execution.py                # Read-only SQLite execution
-|   |-- ingestion.py                # CSV ingestion
-|   |-- llm.py                      # Gemini/Ollama SQL generation
-|   |-- gemini_manager.py           # Gemini API key loading and quota failover
-|   |-- pipeline.py                 # End-to-end ask_* workflows
-|   |-- rag.py                      # Hybrid schema RAG
-|   |-- safety.py                   # SQL safety checks
-|   |-- schema.py                   # Schema extraction/chunking
-|   `-- types.py                    # Shared dataclasses
-|-- requirements.txt                # Dependencies
-|-- evaluation/
-|   `-- cases.json                  # Text-to-SQL benchmark cases
-|-- scripts/
-|   `-- evaluate_text_to_sql.py     # Automatic model evaluation
-|-- docs/
-|   |-- academic/                   # Course-assignment deliverables (report, slides)
-|   |   |-- report.md                # Assignment report draft
-|   |   |-- presentation.md          # Presentation transcript and slide content
-|   |   `-- enterprise-text-to-sql-agent-presentation.pptx
-|   `-- supporting/                 # Living reference docs for anyone using the repo
-|       |-- architecture.md          # Architecture notes
-|       |-- architecture.drawio      # Diagram source
-|       |-- deployment.md            # Streamlit Community checklist
-|       |-- screenshots.md           # Screenshot guidance
-|       `-- screenshots/             # README screenshots
-|-- data/
-|   |-- customers.csv               # Small CSV sample
-|   |-- sales.csv                   # Small CSV sample
-|   |-- university_agent.db         # Demo university DB
-|   |-- healthcare_analytics.db     # Healthcare sample DB
-|   `-- retail_analytics.db         # Retail sample DB
-`-- text_to_sql_agent_mvp.ipynb     # Reproducible notebook walkthrough
-```
+The Holistics article ["Why is Text-to-SQL so hard?"](https://www.holistics.io/blog/text-to-sql/) argues that reliable Text-to-SQL is difficult because natural language is ambiguous, enterprise schemas are complex, and SQL is a strict execution language. It highlights semantic layers as a way to ground AI systems in governed business concepts, relationships, and metric definitions instead of asking a model to guess from raw table names.
+
+Our prototype applies the same idea at assignment scale:
+
+- The schema/RAG layer acts as a lightweight semantic layer over SQLite.
+- Hybrid retrieval selects relevant tables, columns, foreign-key relationships, and safe categorical hints.
+- The generated SQL is shown to users for verification.
+- SQL execution is governed through read-only validation and local execution.
+
+Unlike a full BI semantic layer such as Holistics AQL, our tool still generates SQL directly. The trade-off is that our prototype is simpler and flexible for arbitrary SQLite databases, but less governed than a production semantic-layer system with centrally defined metrics.
 
 ## Setup
 
@@ -264,6 +203,51 @@ For Gemini free-tier testing, use a throttle or a smaller smoke test:
 python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemini-2.5-flash --delay-seconds 15
 python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemini-2.5-flash --max-cases 3
 python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemini-2.5-flash --max-cases 3 --max-retries 2 --retry-base-seconds 30 --resume
+```
+
+## Project Structure
+
+```text
+.
+|-- app.py                         # Streamlit frontend
+|-- text_to_sql_agent_mvp.py        # Compatibility import path (used by app.py, tests, the notebook)
+|-- text_to_sql_agent/              # Backend package
+|   |-- config.py                   # Defaults, model names, RAG constants
+|   |-- data_setup.py               # Demo university database generation
+|   |-- env.py                      # Environment loading
+|   |-- execution.py                # Read-only SQLite execution
+|   |-- ingestion.py                # CSV ingestion
+|   |-- llm.py                      # Gemini/Ollama SQL generation
+|   |-- gemini_manager.py           # Gemini API key loading and quota failover
+|   |-- pipeline.py                 # End-to-end ask_* workflows
+|   |-- rag.py                      # Hybrid schema RAG
+|   |-- safety.py                   # SQL safety checks
+|   |-- schema.py                   # Schema extraction/chunking
+|   `-- types.py                    # Shared dataclasses
+|-- requirements.txt                # Dependencies
+|-- evaluation/
+|   `-- cases.json                  # Text-to-SQL benchmark cases
+|-- scripts/
+|   `-- evaluate_text_to_sql.py     # Automatic model evaluation
+|-- docs/
+|   |-- academic/                   # Course-assignment deliverables (report, slides)
+|   |   |-- report.md                # Assignment report draft
+|   |   |-- presentation.md          # Presentation transcript and slide content
+|   |   `-- enterprise-text-to-sql-agent-presentation.pptx
+|   `-- supporting/                 # Living reference docs for anyone using the repo
+|       |-- architecture.md          # Architecture notes
+|       |-- architecture.drawio      # Multi-page diagram source (draw.io)
+|       |-- architecture-workflow.html # Designed runtime-architecture schematic (open in a browser)
+|       |-- deployment.md            # Streamlit Community checklist
+|       |-- screenshots.md           # Screenshot guidance
+|       `-- screenshots/             # README screenshots
+|-- data/
+|   |-- customers.csv               # Small CSV sample
+|   |-- sales.csv                   # Small CSV sample
+|   |-- university_agent.db         # Demo university DB
+|   |-- healthcare_analytics.db     # Healthcare sample DB
+|   `-- retail_analytics.db         # Retail sample DB
+`-- text_to_sql_agent_mvp.ipynb     # Reproducible notebook walkthrough
 ```
 
 ## Evaluation Results

@@ -20,7 +20,7 @@ The implemented backend flow is:
 4. Generate one SQLite query with Gemini or a local Ollama model.
 5. Validate that the query is read-only with deterministic checks and optional `sqlglot` AST parsing.
 6. Execute through a read-only SQLite connection with `PRAGMA query_only` and an authorizer.
-7. Display generated SQL, result rows, selected schema context, and retrieval diagnostics in Streamlit.
+7. Display generated SQL, result rows, selected schema context, and retrieval diagnostics in Streamlit, with an automatic bar chart when the result is a two-column category + number shape.
 
 The local verification status as of this documentation pass is:
 
@@ -33,23 +33,18 @@ The local verification status as of this documentation pass is:
 
 The file has four pages:
 
-- `User Tool Workflow`: use this page as the main architecture figure. It shows only the live user path: question input, database selection, schema retrieval, SQL generation, safety validation, read-only execution, and answer display.
+- `User Tool Workflow`: use this page as the main architecture figure. It shows only the live user path: question input, database connection, schema retrieval, SQL generation, safety validation, read-only execution, and answer display (including the optional auto bar chart). It carries small tech-stack marks (Streamlit, SQLite, Python, Gemini, Ollama) next to the box each technology belongs to, colored to match the badges already used in `README.md`.
 - `Hybrid Schema RAG Detail`: use this page when explaining the retrieval method. It expands the Schema RAG internals into tokenisation, synonym expansion, query decomposition, schema chunking, retrieval signals, graph expansion, ranking, prompt context, and diagnostics.
 - `Offline Evaluation Workflow`: use this page only in the empirical results section. It is deliberately separated from the user tool workflow because benchmark evaluation is a local validation process, not part of normal app usage.
 - `Implementation Modules`: use this page if the teacher asks how the code is organised after the refactor.
 
 Dashed boxes represent supporting or optional runtime behaviour, such as Gemini key failover or the one-attempt SQL repair path. They are not separate user actions.
 
-The diagram is styled with Google Sans. If the font is not available on the export machine, diagrams.net will fall back to the closest installed sans-serif font; the layout should still remain readable.
+The diagram is styled with Google Sans throughout (every cell across all four pages sets `fontFamily=Google Sans`). If the font is not available on the export machine, diagrams.net will fall back to the closest installed sans-serif font; the layout should still remain readable.
 
-The `User Tool Workflow` page uses a layered layout:
+The tech-stack logos on the `User Tool Workflow` page are loaded from `cdn.simpleicons.org` by URL, not embedded in the file. diagrams.net needs internet access to fetch and render them when you open or export the diagram; if you need a fully offline copy, re-export the PNG once online and the raster copy will no longer need network access.
 
-- User and interface layer
-- Data and context layer
-- Schema retrieval layer
-- AI generation layer
-- Safety and execution layer
-- Answer display layer
+The `User Tool Workflow` page uses a two-row layout: a top row that flows left to right (ask the question, connect data, retrieve schema, generate SQL), and a bottom row that flows right to left (validate, execute, answer), joined by a single vertical connector where SQL generation hands off to the safety gate. Branch-only outcomes (blocked/unsafe, one-shot repair, auto chart) drop straight down from their trigger box instead of looping back across the diagram, which is what keeps the connector lines from crossing each other.
 
 The `Hybrid Schema RAG Detail` page uses a method layout:
 

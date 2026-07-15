@@ -1,0 +1,397 @@
+<title>Text-to-SQL Agent — Runtime Architecture</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --ink: #070b13;
+    --canvas: #0c1220;
+    --card: #131c33;
+    --card-border: #2a3a58;
+    --text: #e8edf7;
+    --text-dim: #8a96b3;
+    --text-faint: #566080;
+    --accent: #f2b134;
+    --danger: #fb7185;
+    --optional: #7dd3fc;
+    --font-display: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    --font-body: ui-sans-serif, "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--ink);
+    background-image:
+      radial-gradient(1200px 600px at 15% -10%, rgba(242, 177, 52, 0.06), transparent 60%),
+      radial-gradient(900px 500px at 100% 110%, rgba(125, 211, 252, 0.05), transparent 60%);
+    color: var(--text);
+    font-family: var(--font-body);
+    display: flex;
+    justify-content: center;
+    padding: 48px 24px 64px;
+  }
+
+  .page {
+    width: 100%;
+    max-width: 1240px;
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+  }
+
+  .page-head {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .eyebrow {
+    font-family: var(--font-display);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+
+  h1 {
+    margin: 0;
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: clamp(22px, 3vw, 30px);
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+    color: var(--text);
+  }
+
+  .page-head p {
+    margin: 0;
+    max-width: 62ch;
+    color: var(--text-dim);
+    font-size: 15px;
+    line-height: 1.55;
+  }
+
+  .diagram-frame {
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-radius: 18px;
+    background: var(--canvas);
+    border: 1px solid var(--card-border);
+    box-shadow:
+      0 1px 0 rgba(255, 255, 255, 0.04) inset,
+      0 30px 60px -30px rgba(0, 0, 0, 0.6);
+  }
+
+  .diagram-frame svg {
+    display: block;
+    min-width: 980px;
+    width: 100%;
+    height: auto;
+  }
+
+  .stage-title {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 14.5px;
+    letter-spacing: 0.01em;
+  }
+
+  .stage-body {
+    font-family: var(--font-body);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  .stage-tag {
+    font-family: var(--font-display);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+  }
+
+  .lane-label {
+    font-family: var(--font-display);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+  }
+
+  .annot {
+    font-family: var(--font-display);
+    font-size: 11px;
+  }
+
+  .footnote {
+    font-family: var(--font-body);
+    font-size: 13px;
+    color: var(--text-faint);
+    line-height: 1.6;
+  }
+
+  .footnote code {
+    font-family: var(--font-display);
+    color: var(--text-dim);
+    background: rgba(255, 255, 255, 0.05);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 12px;
+  }
+</style>
+
+<div class="page">
+  <div class="page-head">
+    <span class="eyebrow">Text-to-SQL Agent — System Schematic</span>
+    <h1>Runtime Architecture: Natural Language to Safe SQL Result</h1>
+    <p>
+      Row data never leaves the local database &mdash; only schema metadata and the user's question
+      reach the LLM. Two traces run in opposite directions: the request trace builds context,
+      the response trace validates and executes it.
+    </p>
+  </div>
+
+  <div class="diagram-frame">
+    <svg viewBox="0 0 1760 820" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Runtime architecture diagram for the text-to-SQL agent">
+      <defs>
+        <pattern id="dotgrid" width="28" height="28" patternUnits="userSpaceOnUse">
+          <circle cx="1.4" cy="1.4" r="1.4" fill="#1b2740" />
+        </pattern>
+        <marker id="chevronAccent" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M1,1 L8,5 L1,9" fill="none" stroke="var(--accent)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+        </marker>
+        <marker id="chevronDanger" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M1,1 L8,5 L1,9" fill="none" stroke="var(--danger)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+        </marker>
+        <marker id="chevronOptional" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M1,1 L8,5 L1,9" fill="none" stroke="var(--optional)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+        </marker>
+      </defs>
+
+      <rect x="0" y="0" width="1760" height="820" fill="var(--canvas)" />
+      <rect x="16" y="16" width="1728" height="788" fill="url(#dotgrid)" opacity="0.55" />
+
+      <!-- lane labels -->
+      <text x="40" y="150" class="lane-label" fill="var(--text-faint)">01 &#183; ASK &amp; RETRIEVE CONTEXT</text>
+      <text x="280" y="440" class="lane-label" fill="var(--text-faint)">02 &#183; VALIDATE, EXECUTE &amp; ANSWER</text>
+
+      <!-- ============ TRUNK CONNECTORS: ROW 1 (left to right) ============ -->
+      <g stroke="var(--accent)" stroke-width="2" fill="none">
+        <line x1="220" y1="230" x2="248" y2="230" marker-end="url(#chevronAccent)" />
+        <line x1="430" y1="230" x2="458" y2="230" marker-end="url(#chevronAccent)" />
+        <line x1="660" y1="230" x2="688" y2="230" marker-end="url(#chevronAccent)" />
+        <line x1="870" y1="230" x2="898" y2="230" marker-end="url(#chevronAccent)" />
+        <line x1="1080" y1="230" x2="1108" y2="230" marker-end="url(#chevronAccent)" />
+        <line x1="1290" y1="230" x2="1318" y2="230" marker-end="url(#chevronAccent)" />
+        <line x1="1480" y1="230" x2="1508" y2="230" marker-end="url(#chevronAccent)" />
+      </g>
+
+      <!-- vertical hand-off: request trace -> response trace -->
+      <path d="M1600,290 L1600,458" stroke="var(--accent)" stroke-width="2.5" fill="none" marker-end="url(#chevronAccent)" />
+      <text x="1611" y="378" class="annot" fill="var(--accent)">SELECT candidate</text>
+
+      <!-- key manager dashed link -->
+      <path d="M1650,170 L1650,156" stroke="var(--optional)" stroke-width="1.75" stroke-dasharray="4 4" fill="none" marker-end="url(#chevronOptional)" />
+
+      <!-- ============ TRUNK CONNECTORS: ROW 2 (right to left) ============ -->
+      <g stroke="var(--accent)" stroke-width="2" fill="none">
+        <line x1="1510" y1="505" x2="1482" y2="505" marker-end="url(#chevronAccent)" />
+        <line x1="1280" y1="505" x2="1252" y2="505" marker-end="url(#chevronAccent)" />
+        <line x1="1040" y1="505" x2="1012" y2="505" marker-end="url(#chevronAccent)" />
+        <line x1="800" y1="505" x2="772" y2="505" marker-end="url(#chevronAccent)" />
+        <line x1="550" y1="505" x2="522" y2="505" marker-end="url(#chevronAccent)" />
+      </g>
+
+      <!-- branch connectors -->
+      <path d="M1380,570 L1380,618" stroke="var(--danger)" stroke-width="2" fill="none" marker-end="url(#chevronDanger)" />
+      <text x="1391" y="600" class="annot" fill="var(--danger)">unsafe</text>
+
+      <path d="M1145,550 L1145,618" stroke="var(--optional)" stroke-width="1.75" stroke-dasharray="4 4" fill="none" marker-end="url(#chevronOptional)" />
+      <text x="1156" y="600" class="annot" fill="var(--optional)">on error</text>
+
+      <path d="M905,550 L905,618" stroke="var(--optional)" stroke-width="1.75" stroke-dasharray="4 4" fill="none" marker-end="url(#chevronOptional)" />
+      <text x="916" y="600" class="annot" fill="var(--optional)">if shape fits</text>
+
+      <!-- ============ ROW 1 BOXES ============ -->
+      <!-- user -->
+      <g>
+        <rect x="40" y="185" width="180" height="90" rx="10" fill="var(--card)" stroke="var(--card-border)" stroke-width="1.5" />
+        <text x="62" y="222" class="stage-title" fill="var(--text)">USER</text>
+        <text x="62" y="246" class="stage-body" fill="var(--text-dim)">Asks a natural-language</text>
+        <text x="62" y="264" class="stage-body" fill="var(--text-dim)">business question</text>
+      </g>
+
+      <!-- streamlit ui -->
+      <g>
+        <rect x="250" y="185" width="180" height="90" rx="10" fill="var(--card)" stroke="var(--card-border)" stroke-width="1.5" />
+        <text x="272" y="212" class="stage-title" fill="var(--text)">STREAMLIT UI</text>
+        <text x="272" y="236" class="stage-body" fill="var(--text-dim)">Question box, model</text>
+        <text x="272" y="252" class="stage-body" fill="var(--text-dim)">and database picker</text>
+        <text x="272" y="266" class="stage-tag" fill="var(--text-faint)">STREAMLIT</text>
+      </g>
+
+      <!-- connect data -->
+      <g>
+        <rect x="460" y="165" width="200" height="130" rx="10" fill="var(--card)" stroke="var(--card-border)" stroke-width="1.5" />
+        <text x="482" y="198" class="stage-title" fill="var(--text)">CONNECT DATA</text>
+        <text x="482" y="224" class="stage-body" fill="var(--text-dim)">Local .db path, uploaded</text>
+        <text x="482" y="242" class="stage-body" fill="var(--text-dim)">.db file, or CSV files</text>
+        <text x="482" y="260" class="stage-body" fill="var(--text-dim)">(auto-converted to SQLite)</text>
+      </g>
+
+      <!-- sqlite database -->
+      <g>
+        <rect x="690" y="185" width="180" height="90" rx="10" fill="var(--card)" stroke="var(--card-border)" stroke-width="1.5" />
+        <text x="712" y="212" class="stage-title" fill="var(--text)">SQLITE DATABASE</text>
+        <text x="712" y="236" class="stage-body" fill="var(--text-dim)">Read-only working store</text>
+        <text x="712" y="252" class="stage-body" fill="var(--text-dim)">for this session</text>
+        <text x="712" y="266" class="stage-tag" fill="var(--text-faint)">SQLITE</text>
+      </g>
+
+      <!-- schema extraction -->
+      <g>
+        <rect x="900" y="170" width="180" height="120" rx="10" fill="var(--card)" stroke="var(--card-border)" stroke-width="1.5" />
+        <text x="922" y="200" class="stage-title" fill="var(--text)">SCHEMA</text>
+        <text x="922" y="216" class="stage-title" fill="var(--text)">EXTRACTION</text>
+        <text x="922" y="240" class="stage-body" fill="var(--text-dim)">DDL, columns, primary</text>
+        <text x="922" y="256" class="stage-body" fill="var(--text-dim)">keys, foreign-key graph,</text>
+        <text x="922" y="272" class="stage-body" fill="var(--text-dim)">value hints</text>
+      </g>
+
+      <!-- hybrid schema rag -->
+      <g>
+        <rect x="1110" y="170" width="180" height="120" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="1.5" />
+        <text x="1132" y="200" class="stage-title" fill="var(--text)">HYBRID SCHEMA</text>
+        <text x="1132" y="216" class="stage-title" fill="var(--text)">RAG</text>
+        <text x="1132" y="240" class="stage-body" fill="var(--text-dim)">BM25 + synonyms +</text>
+        <text x="1132" y="256" class="stage-body" fill="var(--text-dim)">embeddings + FK graph</text>
+        <text x="1132" y="272" class="stage-body" fill="var(--text-dim)">select the relevant tables</text>
+        <text x="1132" y="285" class="stage-tag" fill="var(--text-faint)">PYTHON</text>
+      </g>
+
+      <!-- prompt builder -->
+      <g>
+        <rect x="1320" y="170" width="160" height="120" rx="10" fill="var(--card)" stroke="var(--card-border)" stroke-width="1.5" />
+        <text x="1342" y="200" class="stage-title" fill="var(--text)">PROMPT</text>
+        <text x="1342" y="216" class="stage-title" fill="var(--text)">BUILDER</text>
+        <text x="1342" y="240" class="stage-body" fill="var(--text-dim)">Question + compact</text>
+        <text x="1342" y="256" class="stage-body" fill="var(--text-dim)">schema context +</text>
+        <text x="1342" y="272" class="stage-body" fill="var(--text-dim)">SQL-only instruction</text>
+      </g>
+
+      <!-- llm -->
+      <g>
+        <rect x="1510" y="170" width="180" height="120" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="1.5" />
+        <text x="1532" y="200" class="stage-title" fill="var(--text)">GEMINI 2.5 /</text>
+        <text x="1532" y="216" class="stage-title" fill="var(--text)">OLLAMA</text>
+        <text x="1532" y="240" class="stage-body" fill="var(--text-dim)">Generates one SQLite</text>
+        <text x="1532" y="256" class="stage-body" fill="var(--text-dim)">SELECT candidate</text>
+        <text x="1532" y="277" class="stage-tag" fill="var(--text-faint)">GEMINI</text>
+        <text x="1590" y="277" class="stage-tag" fill="var(--text-faint)">OLLAMA</text>
+      </g>
+
+      <!-- key manager (optional) -->
+      <g>
+        <rect x="1510" y="90" width="220" height="66" rx="9" fill="none" stroke="var(--optional)" stroke-width="1.5" stroke-dasharray="5 4" />
+        <text x="1530" y="114" class="stage-title" fill="var(--optional)" font-size="12.5">KEY MANAGER</text>
+        <text x="1530" y="132" class="stage-body" fill="var(--text-dim)" font-size="12">Optional: multi-key quota</text>
+        <text x="1530" y="146" class="stage-body" fill="var(--text-dim)" font-size="12">failover for Gemini calls</text>
+      </g>
+
+      <!-- ============ ROW 2 BOXES ============ -->
+      <!-- sql candidate -->
+      <g>
+        <rect x="1510" y="460" width="180" height="90" rx="10" fill="var(--card)" stroke="var(--card-border)" stroke-width="1.5" />
+        <text x="1532" y="492" class="stage-title" fill="var(--text)">SQL CANDIDATE</text>
+        <text x="1532" y="514" class="stage-body" fill="var(--text-dim)">Visible to the user,</text>
+        <text x="1532" y="530" class="stage-body" fill="var(--text-dim)">but not trusted yet</text>
+      </g>
+
+      <!-- safety gate (notched gate shape) -->
+      <g>
+        <polygon points="1300,440 1460,440 1480,470 1480,540 1460,570 1300,570 1280,540 1280,470"
+                 fill="var(--card)" stroke="var(--accent)" stroke-width="1.75" />
+        <text x="1320" y="480" class="stage-title" fill="var(--text)">SAFETY</text>
+        <text x="1320" y="497" class="stage-title" fill="var(--text)">GATE</text>
+        <text x="1320" y="519" class="stage-body" fill="var(--text-dim)">sqlglot AST parse +</text>
+        <text x="1320" y="535" class="stage-body" fill="var(--text-dim)">deny-list + read-only</text>
+        <text x="1320" y="551" class="stage-body" fill="var(--text-dim)">SELECT policy</text>
+      </g>
+
+      <!-- execution -->
+      <g>
+        <rect x="1040" y="460" width="210" height="90" rx="10" fill="var(--card)" stroke="var(--card-border)" stroke-width="1.5" />
+        <text x="1062" y="492" class="stage-title" fill="var(--text)">READ-ONLY EXECUTION</text>
+        <text x="1062" y="514" class="stage-body" fill="var(--text-dim)">URI read-only, PRAGMA</text>
+        <text x="1062" y="530" class="stage-body" fill="var(--text-dim)">query_only, row cap</text>
+      </g>
+
+      <!-- answer panel -->
+      <g>
+        <rect x="800" y="460" width="210" height="90" rx="10" fill="var(--card)" stroke="var(--accent)" stroke-width="1.5" />
+        <text x="822" y="492" class="stage-title" fill="var(--text)">ANSWER PANEL</text>
+        <text x="822" y="514" class="stage-body" fill="var(--text-dim)">Result table, SQL,</text>
+        <text x="822" y="530" class="stage-body" fill="var(--text-dim)">schema, RAG diagnostics</text>
+      </g>
+
+      <!-- transparency outputs -->
+      <g>
+        <rect x="550" y="460" width="220" height="90" rx="10" fill="var(--card)" stroke="var(--card-border)" stroke-width="1.5" />
+        <text x="572" y="492" class="stage-title" fill="var(--text)">TRANSPARENCY</text>
+        <text x="572" y="514" class="stage-body" fill="var(--text-dim)">Selected tables, matched</text>
+        <text x="572" y="530" class="stage-body" fill="var(--text-dim)">terms, prompt savings</text>
+      </g>
+
+      <!-- user review -->
+      <g>
+        <rect x="280" y="460" width="240" height="90" rx="10" fill="var(--card)" stroke="var(--card-border)" stroke-width="1.5" />
+        <text x="302" y="492" class="stage-title" fill="var(--text)">USER REVIEW</text>
+        <text x="302" y="514" class="stage-body" fill="var(--text-dim)">Inspects SQL &amp; diagnostics</text>
+        <text x="302" y="530" class="stage-body" fill="var(--text-dim)">before trusting the answer</text>
+      </g>
+
+      <!-- ============ BRANCH BOXES ============ -->
+      <!-- blocked -->
+      <g>
+        <rect x="1280" y="618" width="200" height="80" rx="10" fill="rgba(251, 113, 133, 0.08)" stroke="var(--danger)" stroke-width="1.5" />
+        <text x="1300" y="648" class="stage-title" fill="var(--danger)" font-size="13.5">BLOCKED</text>
+        <text x="1300" y="668" class="stage-body" fill="var(--text-dim)" font-size="12.5">Unsafe or unanswerable &mdash;</text>
+        <text x="1300" y="684" class="stage-body" fill="var(--text-dim)" font-size="12.5">no write, no execution</text>
+      </g>
+
+      <!-- repair -->
+      <g>
+        <rect x="1040" y="618" width="210" height="80" rx="10" fill="none" stroke="var(--optional)" stroke-width="1.5" stroke-dasharray="5 4" />
+        <text x="1060" y="648" class="stage-title" fill="var(--optional)" font-size="13.5">REPAIR ATTEMPT</text>
+        <text x="1060" y="668" class="stage-body" fill="var(--text-dim)" font-size="12.5">One repair prompt on error,</text>
+        <text x="1060" y="684" class="stage-body" fill="var(--text-dim)" font-size="12.5">then re-executes</text>
+      </g>
+
+      <!-- chart -->
+      <g>
+        <rect x="800" y="618" width="210" height="80" rx="10" fill="none" stroke="var(--optional)" stroke-width="1.5" stroke-dasharray="5 4" />
+        <text x="820" y="648" class="stage-title" fill="var(--optional)" font-size="13.5">AUTO BAR CHART</text>
+        <text x="820" y="668" class="stage-body" fill="var(--text-dim)" font-size="12.5">Shown for two-column</text>
+        <text x="820" y="684" class="stage-body" fill="var(--text-dim)" font-size="12.5">category + number results</text>
+      </g>
+
+      <!-- ============ TITLE BLOCK / LEGEND ============ -->
+      <g>
+        <line x1="1300" y1="726" x2="1720" y2="726" stroke="var(--card-border)" stroke-width="1" />
+        <circle cx="1310" cy="748" r="5" fill="none" stroke="var(--accent)" stroke-width="2" />
+        <text x="1324" y="753" class="annot" fill="var(--text-dim)">primary flow</text>
+        <circle cx="1440" cy="748" r="5" fill="none" stroke="var(--optional)" stroke-width="2" stroke-dasharray="2 2" />
+        <text x="1454" y="753" class="annot" fill="var(--text-dim)">optional / async</text>
+        <circle cx="1610" cy="748" r="5" fill="none" stroke="var(--danger)" stroke-width="2" />
+        <text x="1624" y="753" class="annot" fill="var(--text-dim)">blocked</text>
+        <text x="1300" y="780" class="annot" fill="var(--text-faint)">docs/supporting/architecture &#8226; user tool workflow</text>
+      </g>
+    </svg>
+  </div>
+
+  <p class="footnote">
+    Source data for this schematic lives in <code>docs/supporting/architecture.drawio</code> (the editable
+    draw.io version) and this page (<code>docs/supporting/screenshots/</code> once exported). Regenerate
+    both if the runtime flow changes.
+  </p>
+</div>

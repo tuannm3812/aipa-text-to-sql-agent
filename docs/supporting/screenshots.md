@@ -6,12 +6,13 @@ Use screenshots from the deployed Streamlit app and local evaluation output as e
 
 `docs/supporting/screenshots/` holds the screenshots embedded in the top-level `README.md`, captured from a local run of `app.py` (Ollama provider, Retail Analytics demo database):
 
+- `00-architecture-workflow.png` - the "Runtime Architecture" schematic (request trace / response trace, safety gate, optional branches), exported from `docs/supporting/architecture-workflow.html`, a self-contained HTML/SVG page (open it directly in a browser) rather than from `architecture.drawio`. Edit the SVG in that file and re-screenshot to regenerate.
 - `01-chat-ui.png` - initial chat UI with a demo database selected in the sidebar.
 - `02-query-result.png` - a result table for "Show the number of returns for each return reason, ranked from most to least common."
 - `03-generated-sql.png` - the same turn with the "Generated SQL" expander open.
 - `04-schema-rag-report.png` - the same turn with the "Schema RAG retrieval report" expander open, scrolled to the top of the report.
 
-Regenerate these whenever the chat UI, RAG report format, or demo databases change materially, so the README doesn't go stale.
+Regenerate `01`-`04` whenever the chat UI, RAG report format, or demo databases change materially, so the README doesn't go stale.
 
 ## Recommended Captions
 
