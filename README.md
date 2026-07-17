@@ -238,6 +238,7 @@ python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemi
 |       |-- architecture.md          # Architecture notes
 |       |-- architecture.drawio      # Multi-page diagram source (draw.io)
 |       |-- architecture-workflow.html # Designed runtime-architecture schematic (open in a browser)
+|       |-- architecture-workflow.excalidraw # Same diagram in Excalidraw's hand-drawn style
 |       |-- deployment.md            # Streamlit Community checklist
 |       |-- screenshots.md           # Screenshot guidance
 |       `-- screenshots/             # README screenshots

@@ -8,6 +8,13 @@ docs/supporting/architecture.drawio
 
 Open it with [diagrams.net](https://app.diagrams.net/) and export it as PNG or PDF for the final report and slide deck.
 
+Two other renderings of the same "User Tool Workflow" diagram exist for different purposes:
+
+- `docs/supporting/architecture-workflow.html` - a hand-built HTML/SVG page (open it in any browser) styled as a dark circuit schematic. `docs/supporting/screenshots/00-architecture-workflow.png` is its export, and is what `README.md` actually embeds.
+- `docs/supporting/architecture-workflow.excalidraw` - the same diagram in [Excalidraw](https://excalidraw.com)'s hand-drawn sketch style. Open it at excalidraw.com (`File -> Open`) or in the Excalidraw VS Code extension to view or restyle it further.
+
+All three describe the identical flow (same boxes, same non-crossing two-row layout); keep them in sync if the runtime flow changes.
+
 ## Current Implementation
 
 The current project is an end-to-end Text-to-SQL decision support prototype. A user selects a SQLite database or uploads CSV files in Streamlit, asks a natural-language question, and receives generated SQL plus a local query result table.
