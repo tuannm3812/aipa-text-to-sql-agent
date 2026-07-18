@@ -67,12 +67,14 @@ The `Hybrid Schema RAG Detail` page uses a method layout:
 
 In diagrams.net, open `docs/supporting/architecture.drawio`, choose the page tab at the bottom, then use `File -> Export as -> PNG` or `PDF`. For slides, export the `User Tool Workflow` page as a PNG with a transparent background disabled so it remains readable on a white slide.
 
-Before final submission, export the pages that match the report figures:
+Exports already exist for the report figures:
 
-- `User Tool Workflow` for the main workflow figure.
-- `Hybrid Schema RAG Detail` for the retrieval-method figure.
-- `Offline Evaluation Workflow` for the empirical-results figure.
-- `Implementation Modules` as backup evidence if asked how the refactored code maps to the system design.
+- `User Tool Workflow`: use `docs/supporting/screenshots/00-architecture-workflow.png` (the designed HTML/SVG version, not a draw.io export - see above) for the main workflow figure.
+- `Hybrid Schema RAG Detail`: [`docs/supporting/architecture-rag-detail.png`](architecture-rag-detail.png) for the retrieval-method figure.
+- `Offline Evaluation Workflow`: [`docs/supporting/architecture-evaluation-workflow.jpeg`](architecture-evaluation-workflow.jpeg) for the empirical-results figure.
+- `Implementation Modules`: [`docs/supporting/architecture-implementation-modules.jpeg`](architecture-implementation-modules.jpeg) as backup evidence if asked how the refactored code maps to the system design.
+
+Re-export a page only if its content in `architecture.drawio` changes; otherwise these four files stay current.
 
 ## Diagram Caption
 
