@@ -19,7 +19,7 @@ prioritised working view.
 3. **Deduplicate the evaluation harness.** Row-normalisation and matching are
    duplicated between `app.py` and `scripts/evaluate_text_to_sql.py`. Extract one
    module both import.
-4. **Split `app.py`.** 736 lines, with a ~345-line `main()`. Extract to `ui/`
+4. **Split `app.py`.** 759 lines, with a ~369-line `main()`. Extract to `ui/`
    modules behind a thin entrypoint.
 
 ## Phase 3 — Engine abstraction

@@ -26,9 +26,10 @@ whole burden of a reviewable history, since no merge commit summarises a phase.
 `text_to_sql_agent.pipeline.generate_sql` directly.
 **Ruled out:** Keeping it as an import alias for the academic history.
 **Why:** It was not an alias. Its body was byte-identical to `pipeline.py` apart
-from three docstrings — about 170 duplicated lines — and the tests exercised
-*its* copy, leaving `pipeline.py` with no coverage. A fix applied to
-`pipeline.py` would not have reached the code under test.
+from its module docstring and the three function docstrings — about 170
+duplicated lines — and the tests exercised *its* copy, leaving `pipeline.py`
+with no coverage. A fix applied to `pipeline.py` would not have reached the code
+under test.
 
 ## 2026-09-11 — `uv` with a generated `requirements.txt`
 
