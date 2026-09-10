@@ -9,16 +9,49 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.11"
+          enable-cache: true
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: uv sync --python ${{ matrix.python-version }}
 
       - name: Run tests
-        run: python -m unittest discover -s tests
+        run: uv run --python ${{ matrix.python-version }} pytest
+
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy text_to_sql_agent
+
+      - name: requirements.txt is not stale
+        run: |
+          uv export --no-hashes --no-dev --no-emit-project -o /tmp/requirements.check
+          strip() { grep -vE '^[[:space:]]*#' "$1" | grep -vE '^[[:space:]]*$'; }
+          diff -u <(strip requirements.txt) <(strip /tmp/requirements.check)
+        shell: bash
