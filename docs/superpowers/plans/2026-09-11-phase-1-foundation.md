@@ -1882,15 +1882,25 @@ jobs:
       - name: requirements.txt is not stale
         run: |
           uv export --no-hashes --no-dev --no-emit-project -o /tmp/requirements.check
-          tail -n +4 requirements.txt > /tmp/requirements.current
-          diff -u /tmp/requirements.current /tmp/requirements.check
+          strip() { grep -vE '^[[:space:]]*#' "$1" | grep -vE '^[[:space:]]*$'; }
+          diff -u <(strip requirements.txt) <(strip /tmp/requirements.check)
+        shell: bash
 ```
 
 `fail-fast: false` so one version's failure does not hide the others. Lint, types
 and the drift check live in a separate single-run `quality` job rather than
-repeating three times across the matrix. The `tail -n +4` strips the three-line
-generated-file header added in Task 1 Step 4 before diffing — if you changed the
-header's line count, change this number to match.
+repeating three times across the matrix.
+
+**The drift check compares only requirement lines, stripping every comment.**
+That is not cosmetic. `uv export` writes its own invocation into the generated
+file's header, including the `-o` path it was given, so a copy exported to
+`/tmp/requirements.check` always differs from the committed `requirements.txt`
+on that line no matter how many header lines you skip. Verified 2026-09-11: no
+`tail -n +N` offset makes a raw diff pass. Stripping comments compares the 73
+pinned requirement lines that actually matter, and was confirmed to still catch
+real drift (removing `sqlglot` fails the check). `shell: bash` is required
+because process substitution is a bash feature and GitHub's default shell for
+`run` is `bash -e` only on some runners.
 
 - [ ] **Step 2: Verify the drift check locally before pushing**
 
@@ -1898,12 +1908,21 @@ CI failures on a workflow's first run are slow to debug. Run the exact commands:
 
 ```bash
 uv export --no-hashes --no-dev --no-emit-project -o /tmp/requirements.check
-tail -n +4 requirements.txt > /tmp/requirements.current
-diff -u /tmp/requirements.current /tmp/requirements.check && echo "DRIFT CHECK OK"
+strip() { grep -vE '^[[:space:]]*#' "$1" | grep -vE '^[[:space:]]*$'; }
+diff -u <(strip requirements.txt) <(strip /tmp/requirements.check) && echo "DRIFT CHECK OK"
 ```
 
-Expected: `DRIFT CHECK OK` with no diff output. If the diff shows the header, the
-`tail -n +4` offset is wrong — count the header lines and adjust.
+Expected: `DRIFT CHECK OK` with no diff output.
+
+Then prove the check is not vacuous, the same way Task 5 did:
+
+```bash
+grep -v '^sqlglot' /tmp/requirements.check > /tmp/requirements.broken
+diff -q <(strip requirements.txt) <(strip /tmp/requirements.broken) \
+  && echo "BAD: drift not detected" || echo "GOOD: drift detected"
+```
+
+Expected: `GOOD: drift detected`.
 
 - [ ] **Step 3: Point the devcontainer at uv**
 
