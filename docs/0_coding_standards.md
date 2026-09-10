@@ -19,10 +19,14 @@ reworked anyway" — see `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`
 
 ## 2. Deltas from the master
 
-- **`line-length = 100`, not 79.** Master §3 asks for 79 "where practical". Here
-  164 lines exceed 79 but only 43 exceed 100, and most of those in between are
-  typed signatures and f-string report lines that read worse wrapped. Enforced by
-  `ruff format`, so it is a ceiling and not a target.
+- **`line-length = 100`, not 79.** Master §3 asks for 79 "where practical". When
+  this was decided, 164 lines exceeded 79 but only 43 exceeded 100, and most of
+  the ones in between were typed signatures and f-string report lines that read
+  worse wrapped. After `ruff format` ran at width 100, 179 lines exceed 79 and
+  only 10 exceed 100 — all of them inside `SQL_TRANSLATION_SYSTEM_PROMPT` in
+  `text_to_sql_agent/llm.py`, which is `E501`-excluded because those lines are
+  prompt content rather than code. Enforced by `ruff format`, so 100 is a ceiling
+  and not a target. Same delta `ai-meal-planner` took, for the same reason.
 
 - **`mypy --strict` over `text_to_sql_agent/`.** Neither the master standard nor
   any sibling project uses a type checker; master §3 asks for type hints without
