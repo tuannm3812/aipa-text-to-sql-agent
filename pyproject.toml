@@ -31,6 +31,10 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Ruff's exclude/format.exclude is ignored when a path is passed explicitly
+# on the command line (e.g. an editor format-on-save or a pre-commit hook).
+# force-exclude makes the notebook exclude apply even then.
+force-exclude = true
 
 [tool.ruff.format]
 # The MVP notebook keeps saved outputs as evidence for the academic
