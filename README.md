@@ -177,7 +177,7 @@ python -c "import text_to_sql_agent as a; a.write_university_db('data/university
 ## Run Tests
 
 ```bash
-python -m unittest discover -s tests
+uv run pytest
 ```
 
 ## Run Evaluation
