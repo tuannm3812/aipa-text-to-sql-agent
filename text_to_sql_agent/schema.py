@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import closing
-from functools import _CacheInfo, lru_cache
+from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .config import DEFAULT_VALUE_HINT_LIMIT, DEFAULT_VALUE_HINT_MAX_CARDINALITY
 from .types import SchemaChunk
+
+if TYPE_CHECKING:
+    from functools import _CacheInfo
 
 
 def get_schema(db_path: str) -> str:
