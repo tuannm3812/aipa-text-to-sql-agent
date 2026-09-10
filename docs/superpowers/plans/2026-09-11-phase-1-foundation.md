@@ -663,7 +663,7 @@ uv run pytest
 Expected: `18 passed`, matching the Step 1 baseline exactly. A lower count means
 a test was dropped in the move. Do not proceed until it reads 18.
 
-- [ ] **Step 11: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
 git status --short
@@ -1119,7 +1119,7 @@ If mypy reports errors in `pipeline.py` that were previously hidden, fix only
 annotations. If a fix would change behaviour, add
 `# type: ignore[<code>]  # Phase 2` and record it in `docs/4_next_steps.md`.
 
-- [ ] **Step 11: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
 git status --short
@@ -1725,7 +1725,24 @@ all left untouched by design; this phase changed no behaviour.
 has confirmed it; do not "fix" it in Phase 2 without deciding that first.
 ```
 
-- [ ] **Step 10: Verify no dead links remain**
+- [ ] **Step 10: Verify AGENTS.md's references now resolve**
+
+Task 6 wrote `AGENTS.md` pointing at `docs/3_decisions.md`,
+`docs/4_next_steps.md` and `docs/6_agent_log.md` before any of them existed —
+its "Evidence locations" section tells a future session that architectural
+claims trace to files that were not yet written. This task creates all three,
+which closes that gap, so confirm it actually did:
+
+```bash
+grep -oE 'docs/[0-9A-Za-z_/.-]+\.md' AGENTS.md | sort -u | while read -r f; do
+  test -f "$f" && echo "OK   $f" || echo "DEAD $f"
+done
+```
+
+Every line must read `OK`. A `DEAD` line means either the file was not created
+or `AGENTS.md` names it differently — fix whichever is wrong.
+
+- [ ] **Step 11: Verify no dead links remain**
 
 ```bash
 uv run python - <<'PY'
@@ -1745,7 +1762,7 @@ PY
 
 Expected: `ALL LINKS RESOLVE`. Fix every listed path before committing.
 
-- [ ] **Step 11: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
 git status --short
