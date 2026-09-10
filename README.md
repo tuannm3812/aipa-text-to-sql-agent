@@ -4,7 +4,7 @@ An AI-assisted decision support prototype that translates natural-language quest
 
 [![Tests](https://github.com/tuannm3812/aipa-text-to-sql-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/tuannm3812/aipa-text-to-sql-agent/actions/workflows/tests.yml)
 [![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://aipa-text-to-sql-agent.streamlit.app/)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
 [![Gemini](https://img.shields.io/badge/LLM-Gemini-4285F4)](https://ai.google.dev/)
 [![Ollama](https://img.shields.io/badge/Local%20LLM-Ollama-111111)](https://ollama.com/)
@@ -15,16 +15,16 @@ An AI-assisted decision support prototype that translates natural-language quest
 
 | Ask a question | Get a ranked, grounded answer |
 |---|---|
-| ![Chat UI with a demo database selected](docs/supporting/screenshots/01-chat-ui.png) | ![Query result table](docs/supporting/screenshots/02-query-result.png) |
+| ![Chat UI with a demo database selected](docs/screenshots/01-chat-ui.png) | ![Query result table](docs/screenshots/02-query-result.png) |
 
 <details>
 <summary>See the generated SQL and the schema RAG retrieval report behind that answer</summary>
 
 The SQL is never hidden from the user, and every answer can show which tables were retrieved and why:
 
-![Generated SQL for the query above](docs/supporting/screenshots/03-generated-sql.png)
+![Generated SQL for the query above](docs/screenshots/03-generated-sql.png)
 
-![Schema RAG retrieval report showing retrieval strategy, scores, and prompt savings](docs/supporting/screenshots/04-schema-rag-report.png)
+![Schema RAG retrieval report showing retrieval strategy, scores, and prompt savings](docs/screenshots/04-schema-rag-report.png)
 
 </details>
 
@@ -48,9 +48,9 @@ The current branch supports two LLM backends:
 7. SQLite executes the query locally in read-only mode.
 8. Streamlit renders the result table, with an automatic bar chart when the result is a two-column `GROUP BY`-shaped answer (one category column, one numeric column).
 
-![Runtime architecture schematic: request trace builds context left to right, response trace validates, executes, and answers right to left, with optional key-failover, repair, and auto-chart branches](docs/supporting/screenshots/00-architecture-workflow.png)
+![Runtime architecture schematic: request trace builds context left to right, response trace validates, executes, and answers right to left, with optional key-failover, repair, and auto-chart branches](docs/screenshots/00-architecture-workflow.png)
 
-For a deeper, multi-page diagram (hybrid RAG internals, the offline evaluation workflow, and a module map), see `docs/supporting/architecture.drawio` and `docs/supporting/architecture.md`.
+For a deeper, multi-page diagram (hybrid RAG internals, the offline evaluation workflow, and a module map), see `docs/diagrams/architecture.drawio` and `docs/2_architecture.md`.
 
 ## Schema RAG
 
@@ -171,7 +171,7 @@ In the sidebar you can:
 ## Create Demo Data
 
 ```bash
-python -c "import text_to_sql_agent_mvp as a; a.write_university_db('data/university_agent.db')"
+python -c "import text_to_sql_agent as a; a.write_university_db('data/university_agent.db')"
 ```
 
 ## Run Tests
@@ -209,8 +209,43 @@ python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemi
 
 ```text
 .
-|-- app.py                         # Streamlit frontend
-|-- text_to_sql_agent_mvp.py        # Compatibility import path (used by app.py, tests, the notebook)
+|-- AGENTS.md                       # Agent operating rules and coding-standard pointers
+|-- app.py                          # Streamlit frontend
+|-- CLAUDE.md                       # Claude Code entrypoint (points to AGENTS.md)
+|-- data/
+|   |-- customers.csv               # Small CSV sample
+|   |-- dynamic_agent.db            # Default CSV-ingestion output DB
+|   |-- healthcare_analytics.db     # Healthcare sample DB
+|   |-- retail_analytics.db         # Retail sample DB
+|   |-- sales.csv                   # Small CSV sample
+|   `-- university_agent.db         # Demo university DB
+|-- docs/
+|   |-- 0_coding_standards.md       # Project-specific rules and deliberate overrides
+|   |-- 1_brief.md                  # What/for whom/done-looks-like/constraints
+|   |-- 2_architecture.md           # Architecture notes and screenshots
+|   |-- 3_decisions.md              # Dated decision log
+|   |-- 4_next_steps.md             # Prioritised working view of the roadmap
+|   |-- 5_deployment.md             # Streamlit Community checklist
+|   |-- 6_agent_log.md              # Append-only record of agent work
+|   |-- academic/                   # Course-assignment deliverables (report, slides)
+|   |   |-- report.md                # Assignment report draft
+|   |   |-- presentation.md          # Presentation transcript and slide content
+|   |   `-- enterprise-text-to-sql-agent-presentation.pptx
+|   |-- diagrams/                   # Diagram sources and exported figures
+|   |   |-- architecture.drawio      # Multi-page diagram source (draw.io)
+|   |   |-- architecture-workflow.html # Designed runtime-architecture schematic (open in a browser)
+|   |   |-- architecture-workflow.excalidraw # Same diagram in Excalidraw's hand-drawn style
+|   |   |-- architecture-rag-detail.png # Hybrid Schema RAG Detail export
+|   |   |-- architecture-evaluation-workflow.jpeg # Offline Evaluation Workflow export
+|   |   `-- architecture-implementation-modules.jpeg # Implementation Modules export
+|   `-- screenshots/                # README screenshots
+|-- evaluation/
+|   `-- cases.json                  # Text-to-SQL benchmark cases
+|-- pyproject.toml                  # Project metadata, dependencies, tool config
+|-- requirements.txt                # Dependencies (generated with `uv export`)
+|-- scripts/
+|   `-- evaluate_text_to_sql.py     # Automatic model evaluation
+|-- tests/                          # pytest suite (per-module files plus conftest.py)
 |-- text_to_sql_agent/              # Backend package
 |   |-- config.py                   # Defaults, model names, RAG constants
 |   |-- data_setup.py               # Demo university database generation
@@ -224,31 +259,8 @@ python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemi
 |   |-- safety.py                   # SQL safety checks
 |   |-- schema.py                   # Schema extraction/chunking
 |   `-- types.py                    # Shared dataclasses
-|-- requirements.txt                # Dependencies
-|-- evaluation/
-|   `-- cases.json                  # Text-to-SQL benchmark cases
-|-- scripts/
-|   `-- evaluate_text_to_sql.py     # Automatic model evaluation
-|-- docs/
-|   |-- academic/                   # Course-assignment deliverables (report, slides)
-|   |   |-- report.md                # Assignment report draft
-|   |   |-- presentation.md          # Presentation transcript and slide content
-|   |   `-- enterprise-text-to-sql-agent-presentation.pptx
-|   `-- supporting/                 # Living reference docs for anyone using the repo
-|       |-- architecture.md          # Architecture notes
-|       |-- architecture.drawio      # Multi-page diagram source (draw.io)
-|       |-- architecture-workflow.html # Designed runtime-architecture schematic (open in a browser)
-|       |-- architecture-workflow.excalidraw # Same diagram in Excalidraw's hand-drawn style
-|       |-- deployment.md            # Streamlit Community checklist
-|       |-- screenshots.md           # Screenshot guidance
-|       `-- screenshots/             # README screenshots
-|-- data/
-|   |-- customers.csv               # Small CSV sample
-|   |-- sales.csv                   # Small CSV sample
-|   |-- university_agent.db         # Demo university DB
-|   |-- healthcare_analytics.db     # Healthcare sample DB
-|   `-- retail_analytics.db         # Retail sample DB
-`-- text_to_sql_agent_mvp.ipynb     # Reproducible notebook walkthrough
+|-- text_to_sql_agent_mvp.ipynb     # Reproducible notebook walkthrough
+`-- uv.lock                         # Locked dependency versions (uv)
 ```
 
 ## Evaluation Results
@@ -322,7 +334,7 @@ For hosted deployment, use:
 - Main file path: `app.py`
 - Secrets: add `GEMINI_API_KEY`
 
-See `docs/supporting/deployment.md` for the full checklist. Ollama is best treated as a local/offline demo option because Streamlit Community Cloud will not have access to your local Ollama server.
+See `docs/5_deployment.md` for the full checklist. Ollama is best treated as a local/offline demo option because Streamlit Community Cloud will not have access to your local Ollama server.
 
 ## Notes
 

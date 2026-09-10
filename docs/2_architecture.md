@@ -3,15 +3,15 @@
 The draw.io source file is available at:
 
 ```text
-docs/supporting/architecture.drawio
+docs/diagrams/architecture.drawio
 ```
 
 Open it with [diagrams.net](https://app.diagrams.net/) and export it as PNG or PDF for the final report and slide deck.
 
 Two other renderings of the same "User Tool Workflow" diagram exist for different purposes:
 
-- `docs/supporting/architecture-workflow.html` - a hand-built HTML/SVG page (open it in any browser) styled as a dark circuit schematic. `docs/supporting/screenshots/00-architecture-workflow.png` is its export, and is what `README.md` actually embeds.
-- `docs/supporting/architecture-workflow.excalidraw` - the same diagram in [Excalidraw](https://excalidraw.com)'s hand-drawn sketch style. Open it at excalidraw.com (`File -> Open`) or in the Excalidraw VS Code extension to view or restyle it further.
+- `docs/diagrams/architecture-workflow.html` - a hand-built HTML/SVG page (open it in any browser) styled as a dark circuit schematic. `docs/screenshots/00-architecture-workflow.png` is its export, and is what `README.md` actually embeds.
+- `docs/diagrams/architecture-workflow.excalidraw` - the same diagram in [Excalidraw](https://excalidraw.com)'s hand-drawn sketch style. Open it at excalidraw.com (`File -> Open`) or in the Excalidraw VS Code extension to view or restyle it further.
 
 All three describe the identical flow (same boxes, same non-crossing two-row layout); keep them in sync if the runtime flow changes.
 
@@ -65,14 +65,14 @@ The `Hybrid Schema RAG Detail` page uses a method layout:
 
 ## Export Guidance
 
-In diagrams.net, open `docs/supporting/architecture.drawio`, choose the page tab at the bottom, then use `File -> Export as -> PNG` or `PDF`. For slides, export the `User Tool Workflow` page as a PNG with a transparent background disabled so it remains readable on a white slide.
+In diagrams.net, open `docs/diagrams/architecture.drawio`, choose the page tab at the bottom, then use `File -> Export as -> PNG` or `PDF`. For slides, export the `User Tool Workflow` page as a PNG with a transparent background disabled so it remains readable on a white slide.
 
 Exports already exist for the report figures:
 
-- `User Tool Workflow`: use `docs/supporting/screenshots/00-architecture-workflow.png` (the designed HTML/SVG version, not a draw.io export - see above) for the main workflow figure.
-- `Hybrid Schema RAG Detail`: [`docs/supporting/architecture-rag-detail.png`](architecture-rag-detail.png) for the retrieval-method figure.
-- `Offline Evaluation Workflow`: [`docs/supporting/architecture-evaluation-workflow.jpeg`](architecture-evaluation-workflow.jpeg) for the empirical-results figure.
-- `Implementation Modules`: [`docs/supporting/architecture-implementation-modules.jpeg`](architecture-implementation-modules.jpeg) as backup evidence if asked how the refactored code maps to the system design.
+- `User Tool Workflow`: use `docs/screenshots/00-architecture-workflow.png` (the designed HTML/SVG version, not a draw.io export - see above) for the main workflow figure.
+- `Hybrid Schema RAG Detail`: [`docs/diagrams/architecture-rag-detail.png`](diagrams/architecture-rag-detail.png) for the retrieval-method figure.
+- `Offline Evaluation Workflow`: [`docs/diagrams/architecture-evaluation-workflow.jpeg`](diagrams/architecture-evaluation-workflow.jpeg) for the empirical-results figure.
+- `Implementation Modules`: [`docs/diagrams/architecture-implementation-modules.jpeg`](diagrams/architecture-implementation-modules.jpeg) as backup evidence if asked how the refactored code maps to the system design.
 
 Re-export a page only if its content in `architecture.drawio` changes; otherwise these four files stay current.
 
@@ -85,3 +85,65 @@ The Enterprise Text-to-SQL Agent lets a user ask a natural-language question ove
 - `User Tool Workflow`: report Section 4.1 and the system workflow slide.
 - `Hybrid Schema RAG Detail`: report Section 4.3 or 4.4 when explaining retrieval.
 - `Offline Evaluation Workflow`: report Section 5.1 or 5.4 when explaining benchmark evidence.
+
+## Screenshots
+
+Use screenshots from the deployed Streamlit app and local evaluation output as evidence in the report and presentation. The screenshots should show the current workflow: database selection, Schema RAG, generated SQL, local execution results, and evaluation evidence.
+
+### Current README Screenshots
+
+`docs/screenshots/` holds the screenshots embedded in the top-level `README.md`, captured from a local run of `app.py` (Ollama provider, Retail Analytics demo database):
+
+- `00-architecture-workflow.png` - the "Runtime Architecture" schematic (request trace / response trace, safety gate, optional branches), exported from `docs/diagrams/architecture-workflow.html`, a self-contained HTML/SVG page (open it directly in a browser) rather than from `architecture.drawio`. Edit the SVG in that file and re-screenshot to regenerate.
+- `01-chat-ui.png` - initial chat UI with a demo database selected in the sidebar.
+- `02-query-result.png` - a result table for "Show the number of returns for each return reason, ranked from most to least common."
+- `03-generated-sql.png` - the same turn with the "Generated SQL" expander open.
+- `04-schema-rag-report.png` - the same turn with the "Schema RAG retrieval report" expander open, scrolled to the top of the report.
+
+Regenerate `01`-`04` whenever the chat UI, RAG report format, or demo databases change materially, so the README doesn't go stale.
+
+### Recommended Captions
+
+1. **Application UI and demo database workflow**
+   - Shows the deployed Streamlit interface, Gemini model selection, API key status, Schema RAG toggle, demo database selector, and sample question workflow.
+   - Use in the presentation when introducing the prototype.
+
+2. **Natural-language query result and generated SQL**
+   - Shows the Retail Analytics demo answering: "Which return reasons occur most often?"
+   - Result table: Changed Mind, Other, Late Delivery, Damaged, Wrong Size.
+   - Generated SQL demonstrates transparent LLM output before/after execution.
+   - Use in the report methodology/results section.
+
+3. **Retrieved schema context**
+   - Shows only selected relevant schema snippets, such as `returns`, `customer_support_tickets`, and `customers`.
+   - This demonstrates schema grounding and RAG-based context reduction.
+   - Use when explaining the difference between static schema injection and RAG.
+
+4. **Evaluation dashboard**
+   - Shows Gold SQL baseline metrics:
+     - Safe SQL: 12/12
+     - Executed: 12/12
+     - Value match: 12/12
+     - Row match: 12/12
+     - Exact match: 12/12
+     - Schema recall: 1.00
+   - Use in the empirical evaluation section.
+
+5. **LLM evaluation comparison**
+   - Shows or reproduces the model comparison from the project README:
+     - Gemini 2.5 Flash multi-key: 11/12 value match.
+     - Ollama `llama3:latest`: 8/12 value match, 12/12 safe and executed.
+     - Ollama `gemma4:latest`: 8/12 value match overall, 8/10 among executed queries.
+   - Use to explain hosted vs local model trade-offs.
+
+6. **Safety or error handling example**
+   - Optional but useful if time allows.
+   - Show an unsafe or invalid generated query being blocked, or a quota/API error being displayed without executing SQL.
+   - Use in the limitations or ethics section to show that the project handles failure visibly.
+
+### Notes
+
+- The current local verification command is `python3 scripts/evaluate_text_to_sql.py --mode gold`, which writes `evaluation/results/evaluation_gold.md` and `evaluation/results/evaluation_gold.csv`.
+- If the RAG report appears stale after deployment, refresh/redeploy and ask a new question so Streamlit loads the latest code.
+- The screenshots should be inserted into the final PDF and slide deck rather than referenced only as external files.
+- Avoid showing real API keys, local filesystem paths that are not relevant, or private uploaded data in screenshots.
