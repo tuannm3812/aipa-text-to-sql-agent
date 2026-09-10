@@ -11,64 +11,19 @@ from __future__ import annotations
 
 import html
 import os
-import tempfile
 import time
-import uuid
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 import text_to_sql_agent as backend
+from ui.constants import DEMO_DATABASES, GEMINI_MODELS, OLLAMA_MODELS
+from ui.results import render_assistant_turn, result_to_dataframe
+from ui.secrets import active_gemini_key, model_name_for_provider
+from ui.uploads import active_db_path
 
 backend.load_env()
-
-GEMINI_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "Custom",
-]
-
-OLLAMA_MODELS = [
-    "gemma3",
-    "llama3.1",
-    "llama3",
-    "mistral",
-    "qwen2.5",
-    "Custom",
-]
-
-DEMO_DATABASES = {
-    "University": {
-        "path": "data/university_agent.db",
-        "description": "Students, courses, grades, majors",
-        "questions": [
-            "How many students are enrolled in each major?",
-            "What is the average score for each course?",
-            "Which students have the highest average score?",
-        ],
-    },
-    "Retail Analytics": {
-        "path": "data/retail_analytics.db",
-        "description": "Customers, orders, products, returns, stores",
-        "questions": [
-            "Show total completed sales revenue by customer region.",
-            "Which return reasons occur most often?",
-            "Which product categories generate the most revenue?",
-        ],
-    },
-    "Healthcare Analytics": {
-        "path": "data/healthcare_analytics.db",
-        "description": "Patients, doctors, hospitals, appointments, treatments",
-        "questions": [
-            "How many appointments are there for each status?",
-            "What is the average treatment cost by hospital city?",
-            "Which specialties have the most completed appointments?",
-        ],
-    },
-}
 
 _CHAT_CSS = """
 <style>
@@ -142,115 +97,6 @@ _CHAT_CSS = """
 """
 
 
-def _streamlit_secret(name: str) -> str:
-    try:
-        return str(st.secrets.get(name, "") or "")
-    except Exception:
-        return ""
-
-
-def _active_gemini_key(typed_key: str) -> str:
-    return (
-        (typed_key or "").strip()
-        or (os.environ.get("GEMINI_API_KEY") or "").strip()
-        or _streamlit_secret("GEMINI_API_KEY").strip()
-    )
-
-
-def _model_name_for_provider(provider: str) -> str:
-    selected = st.session_state.get("sb_model_choice", "")
-    if selected == "Custom":
-        return (st.session_state.get("sb_custom_model") or "").strip()
-    return str(
-        selected
-        or (backend.DEFAULT_MODEL_NAME if provider == "gemini" else backend.DEFAULT_OLLAMA_MODEL)
-    )
-
-
-def _write_uploaded_db(uploaded) -> str:
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    Path(path).write_bytes(uploaded.getbuffer())
-    return path
-
-
-def _write_uploaded_csvs(uploaded_list: list) -> list[str]:
-    d = Path(tempfile.mkdtemp(prefix="streamlit_csv_"))
-    paths: list[str] = []
-    for uf in uploaded_list:
-        p = d / uf.name
-        p.write_bytes(uf.getbuffer())
-        paths.append(str(p))
-    return paths
-
-
-def _result_to_dataframe(result: backend.QueryResult) -> pd.DataFrame | None:
-    if not result.columns:
-        return None
-    return pd.DataFrame(result.rows, columns=result.columns)
-
-
-def _chartable_columns(df: pd.DataFrame) -> tuple[str, str] | None:
-    """Return (category_col, value_col) if `df` is a two-column GROUP BY-shaped result."""
-    if len(df.columns) != 2 or len(df) < 2:
-        return None
-    first, second = df.columns[0], df.columns[1]
-    first_numeric = pd.api.types.is_numeric_dtype(df[first])
-    second_numeric = pd.api.types.is_numeric_dtype(df[second])
-    if first_numeric and not second_numeric:
-        return second, first
-    if second_numeric and not first_numeric:
-        return first, second
-    return None
-
-
-def _active_db_path() -> str | None:
-    """Resolve DB path from sidebar widgets (with caching for uploads)."""
-    source = st.session_state.get("sb_source", "Demo database")
-
-    if source == "Demo database":
-        demo_name = st.session_state.get("sb_demo_db", "University")
-        demo = DEMO_DATABASES.get(demo_name)
-        if not demo:
-            return None
-        p = Path(demo["path"])
-        return str(p.resolve()) if p.is_file() else None
-
-    if source == "Path on disk":
-        raw = (st.session_state.get("sb_path_db") or "").strip()
-        if not raw:
-            return None
-        p = Path(raw).expanduser()
-        return str(p.resolve()) if p.is_file() else None
-
-    if source == "Upload `.db`":
-        uf = st.session_state.get("sb_upload_db")
-        if uf is None:
-            return None
-        sig = ("db", uf.name, getattr(uf, "size", 0))
-        key = f"_db_upload_{hash(sig)}"
-        if key not in st.session_state:
-            st.session_state[key] = _write_uploaded_db(uf)
-        return st.session_state[key]
-
-    # CSV(s)
-    files = st.session_state.get("sb_upload_csv")
-    if not files:
-        return None
-    sig = tuple(sorted((f.name, getattr(f, "size", 0)) for f in files))
-    if st.session_state.get("_csv_sig") != sig:
-        try:
-            csv_paths = _write_uploaded_csvs(list(files))
-            out_db = Path(tempfile.gettempdir()) / f"ingested_{uuid.uuid4().hex}.db"
-            st.session_state["_csv_db_path"] = backend.ingest_csvs_to_db(csv_paths, str(out_db))
-            st.session_state["_csv_sig"] = sig
-        except Exception:
-            st.session_state["_csv_db_path"] = None
-            st.session_state["_csv_sig"] = None
-            raise
-    return st.session_state.get("_csv_db_path")
-
-
 def _evaluate_cases(
     *,
     mode: str,
@@ -319,46 +165,6 @@ def _evaluate_cases(
     return pd.DataFrame(rows)
 
 
-def _render_assistant_turn(msg: dict) -> None:
-    with st.chat_message("assistant"):
-        if msg.get("kind") == "text":
-            st.markdown(msg.get("content", ""))
-            return
-        if msg.get("kind") == "result":
-            if msg.get("error_text"):
-                if msg.get("df") is not None:
-                    st.warning(msg["error_text"])
-                else:
-                    st.error(msg["error_text"])
-                if msg.get("blocked_sql"):
-                    st.code(msg["blocked_sql"], language="sql")
-            if msg.get("df") is not None:
-                df = msg["df"]
-                if not df.empty:
-                    st.dataframe(df, use_container_width=True, hide_index=True)
-                    chart_cols = _chartable_columns(df)
-                    if chart_cols:
-                        category_col, value_col = chart_cols
-                        # Preserve the query's row order (e.g. ORDER BY ... DESC) instead of
-                        # letting the chart library re-sort categories alphabetically.
-                        labels = df[category_col].astype(str)
-                        unique_order = list(dict.fromkeys(labels))
-                        ordered = pd.Categorical(labels, categories=unique_order, ordered=True)
-                        chart_df = df.assign(**{category_col: ordered}).set_index(category_col)
-                        st.bar_chart(chart_df[value_col])
-                else:
-                    st.caption("No rows returned.")
-            if msg.get("sql_text"):
-                with st.expander("Generated SQL", expanded=False):
-                    st.code(msg["sql_text"], language="sql")
-            if msg.get("schema_text"):
-                with st.expander("Schema (DDL)", expanded=False):
-                    st.code(msg["schema_text"], language="sql")
-            if msg.get("rag_report"):
-                with st.expander("Schema RAG retrieval report", expanded=False):
-                    st.text(msg["rag_report"])
-
-
 def main() -> None:
     st.set_page_config(
         page_title="Text-to-SQL",
@@ -401,7 +207,7 @@ def main() -> None:
                 key="sb_custom_model",
                 help="Use the exact provider model identifier.",
             )
-        model_name = _model_name_for_provider(provider)
+        model_name = model_name_for_provider(provider)
 
         gemini_key = ""
         if provider == "gemini":
@@ -413,7 +219,7 @@ def main() -> None:
                     placeholder="Leave blank to use Streamlit secrets or local .env",
                     help="Session-only input. Do not commit API keys to GitHub.",
                 )
-                gemini_key = _active_gemini_key(typed_key)
+                gemini_key = active_gemini_key(typed_key)
                 if gemini_key:
                     os.environ["GEMINI_API_KEY"] = gemini_key
 
@@ -536,7 +342,7 @@ def main() -> None:
 
     db_path_to_query: str | None = None
     try:
-        db_path_to_query = _active_db_path()
+        db_path_to_query = active_db_path()
     except Exception as e:
         st.sidebar.error(f"Ingestion failed: {e}")
 
@@ -571,7 +377,7 @@ def main() -> None:
                     use_rag=use_rag,
                     rag_top_k=rag_top_k,
                 )
-            df_out = _result_to_dataframe(result) if result.columns else None
+            df_out = result_to_dataframe(result) if result.columns else None
             rag_report = None
             schema_text = None
             try:
@@ -658,7 +464,7 @@ def main() -> None:
                 unsafe_allow_html=True,
             )
         else:
-            _render_assistant_turn(msg)
+            render_assistant_turn(msg)
 
     chat_disabled = db_path_to_query is None or not key_ok
     placeholder = (
@@ -695,7 +501,7 @@ def main() -> None:
             blocked_sql = result.sql
 
         if result.columns:
-            df_out = _result_to_dataframe(result)
+            df_out = result_to_dataframe(result)
 
         schema_text: str | None = None
         rag_report: str | None = None
