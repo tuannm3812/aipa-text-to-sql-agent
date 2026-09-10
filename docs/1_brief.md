@@ -17,9 +17,11 @@ No hiding the SQL from the user.
 **Constraints:**
 - SQLite only through Phase 2; the engine abstraction arrives in Phase 3.
 - Two LLM backends: the Gemini API with multi-key failover, and local Ollama.
-- The hosted Streamlit demo must stay within Community Cloud's free resources,
-  which is why heavyweight embedding models are an optional dependency group
-  rather than a runtime requirement.
+- The hosted Streamlit demo must stay within Community Cloud's free resources.
+  Heavyweight embedding models are planned to ship behind an optional
+  dependency group rather than as a runtime requirement, once Phase 4 replaces
+  the current hashed pseudo-embedding — see `docs/4_next_steps.md`. No such
+  group exists yet.
 
 Timestamped 2026-09-11. See `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`
 for the phased plan and `docs/4_next_steps.md` for what remains.

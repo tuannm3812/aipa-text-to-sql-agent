@@ -28,8 +28,8 @@ reworked anyway" — see `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`
   prompt content rather than code. Enforced by `ruff format`, so 100 is a ceiling
   and not a target. Same delta `ai-meal-planner` took, for the same reason.
 
-- **`mypy --strict` over `text_to_sql_agent/`.** Neither the master standard nor
-  any sibling project uses a type checker; master §3 asks for type hints without
+- **`mypy --strict` over `text_to_sql_agent/`.** No sibling project *following
+  this standard* uses a type checker; master §3 asks for type hints without
   enforcing them. Adopted here because Phases 3 and 4 of the refactor rewrite
   that package heavily and strict typing pays for itself across a rewrite.
   `app.py`, `scripts/` and `tests/` are deliberately excluded.
@@ -41,17 +41,38 @@ reworked anyway" — see `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`
   history.
 
 - **`data/` exists deliberately.** Master §1 says to avoid it absent a real
-  local-execution need. Six demo fixtures are tracked because `app.py` offers
-  them as the built-in demo databases and `evaluation/cases.json` runs against
-  them; the hosted demo is non-functional without them. `.gitignore` uses the
+  local-execution need. Six demo fixtures are tracked, but they are not all
+  load-bearing for the same reason. Three are: `university_agent.db`,
+  `retail_analytics.db`, and `healthcare_analytics.db` are exactly the three
+  databases `app.py`'s `DEMO_DATABASES` offers, and the same three back all
+  twelve cases in `evaluation/cases.json`; the hosted demo is non-functional
+  without them. The other three are illustrative rather than referenced by
+  code: `customers.csv` and `sales.csv` are small sample files for the
+  CSV-upload path, and `dynamic_agent.db` is not itself read anywhere — it
+  matches the *filename* `ingestion.ingest_csvs_to_db` writes to by default,
+  showing a contributor what that output looks like. `.gitignore` uses the
   master §8 ignore-then-negate pattern so the exception is visible rather than
-  accidental. **Do not "tidy" this.**
+  accidental. **Do not "tidy" this** — keep all six tracked and keep the
+  negations, even though only three are load-bearing.
 
 - **The MVP notebook keeps its saved outputs.** Master §4 asks for outputs to be
   cleared or re-run when notebook code changes. `text_to_sql_agent_mvp.ipynb`
   keeps its 11 cells of output as point-in-time evidence for the academic
   deliverable in `docs/academic/`. A dated cell at the top says so. Any *code*
-  change to the notebook still requires a re-run.
+  change to the notebook still requires a re-run. `[tool.ruff.format] exclude`
+  only stops reformatting; `ruff check --fix` is a separate path and can still
+  rewrite the notebook's cells (and would if fix-on-save is enabled in an
+  editor), silently invalidating the saved outputs. The notebook is only safe
+  today because it happens to be lint-clean; this is not configured away,
+  only documented.
+
+- **`[tool.ruff] force-exclude = true`, plus `[tool.ruff.format] exclude` for
+  the notebook.** Ruff ignores its own `exclude`/`format.exclude` when a path
+  is passed explicitly on the command line, which an editor's format-on-save
+  or a pre-commit hook does. `force-exclude` makes the notebook's format
+  exclusion hold even then, so an editor cannot silently reformat
+  `text_to_sql_agent_mvp.ipynb` and invalidate its saved outputs. It does not
+  cover `ruff check --fix`; see the notebook bullet above.
 
 - **`E501` is off for `text_to_sql_agent/llm.py`.** Its long lines are all inside
   `SQL_TRANSLATION_SYSTEM_PROMPT`, where a line break is content the model reads.
@@ -61,7 +82,11 @@ reworked anyway" — see `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`
   `uv export --no-hashes --no-dev --no-emit-project -o requirements.txt`. Edit
   `pyproject.toml` and re-export; never edit it directly. `tests/test_packaging.py`
   and CI both fail on drift. It cannot be deleted in favour of `pyproject.toml`
-  alone because Streamlit Community Cloud and `.devcontainer/` read it.
+  alone because Streamlit Community Cloud reads it. `.devcontainer/` no
+  longer does — commit `bdb1eca`, later in this same phase, rewrote its
+  `updateContentCommand` to `pip3 install --user uv && uv sync`, so
+  `requirements.txt` is kept for the Streamlit Cloud half of this reason
+  alone.
 
 ## 3. Naming
 

@@ -96,3 +96,16 @@ past-tense mentions in docs, not live code references.
 to run `python -m unittest discover -s tests`, stale since Task 2 moved
 the suite to pytest and split it across fixtures unittest's discovery
 cannot use. Replaced with `uv run pytest`.
+
+## 2026-09-11 — Final whole-branch review: citation fix
+
+A final review of this phase found that lines 47 and 74 above cite
+`docs/superpowers/sdd/progress.md`. That path is wrong and cannot be opened
+by a reader: the real file is `.superpowers/sdd/progress.md`, and
+`.gitignore` deliberately excludes the `.superpowers/` directory as
+subagent-driven-development controller scratch. Per the append-only rule
+this note is added rather than editing lines 47 and 74 above. The durable
+evidence for the claims those lines make is the commit history on
+`tuannm3812/main-refinement` and the task reports from that phase, not the
+`.superpowers/` path, which is intentionally not part of the committed
+record.

@@ -16,8 +16,10 @@ Project-specific rules and deliberate overrides: @docs/0_coding_standards.md
 ## Deltas from the master
 
 - `line-length = 100`, not 79 — see `docs/0_coding_standards.md` §2 for the count.
-- `mypy --strict` over `text_to_sql_agent/` only. No sibling project uses a type
-  checker; this one does because Phases 3-4 rewrite that package heavily.
+- `mypy --strict` over `text_to_sql_agent/` only. No sibling project following
+  this standard uses a type checker — the master standard asks for type hints
+  without enforcing them; this one does because Phases 3-4 rewrite that
+  package heavily.
 - **No feature branches.** Commit directly to `tuannm3812/main-refinement`, which
   is this repo's default branch — not `main`.
 - `data/` and the notebook's saved outputs are deliberate §8 and §4 exceptions.
@@ -35,8 +37,9 @@ Project-specific rules and deliberate overrides: @docs/0_coding_standards.md
 ## Current state
 
 - 2026-09-11: Phase 1 (foundation and standards alignment) complete. Baseline is
-  20 passing tests; ruff, mypy and the packaging drift guard gate CI across
-  Python 3.11-3.13. Phases 2-5 are specced in `docs/4_next_steps.md`.
+  20 passing tests. CI has two jobs: `test` runs `pytest` on a 3.11-3.13
+  matrix; `quality` runs ruff, mypy, and the packaging drift guard once,
+  unmatrixed. Phases 2-5 are specced in `docs/4_next_steps.md`.
 
 ## Open risks
 

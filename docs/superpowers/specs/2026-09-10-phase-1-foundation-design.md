@@ -36,7 +36,7 @@ still boots.
 | hatchling build backend | Matches `ai-meal-planner`; no reason to diverge. |
 | `requires-python = ">=3.11,<3.14"` | `ai-meal-planner` bounds the same way. Drops the 3.10 claim currently in `README.md`, which nothing verifies today. |
 | ruff pinned exactly | Matches `ai-meal-planner` (`ruff==0.16.4`). An unpinned formatter turns an upstream release into a red CI on an unrelated PR. |
-| Keep `unittest.TestCase` classes, run them under pytest | pytest collects them natively. A file-split plus a runner swap keeps the diff reviewable; a failure points at the split, not at rewritten asserts. |
+| Keep `unittest.TestCase` classes where they don't need a fixture, run them under pytest | pytest collects them natively. Where a moved test's setup became a pytest fixture, it had to become a plain function instead — see §5.6's reconciliation note for what this meant in practice. |
 
 **Resolved 2026-09-11 — mypy is kept.** Neither the master standard nor
 `ai-meal-planner` uses a type checker; master §3 asks for type hints but does not
@@ -271,11 +271,35 @@ is written into `docs/0_coding_standards.md` so it reads as chosen, not missed.
 | `tests/test_schema.py` | `test_get_schema_excludes_internal_tables` |
 | `tests/test_rag.py` | the 3 schema-retrieval tests |
 | `tests/test_execution.py` | the 2 `test_execute_query_*` tests |
-| `tests/test_pipeline.py` | the 4 `test_ask_database_*` tests |
+| `tests/test_pipeline.py` | the 3 `test_ask_database_*` tests |
+
+That table sums to 18 (5+2+2+1+3+2+3), matching the original count, before the
+packaging tests added below.
 
 The temporary-database builders currently inlined per test move to
 `tests/conftest.py` as pytest fixtures. This is the only place test bodies
 change, and only at their setup lines.
+
+**Reconciled 2026-09-11, post-implementation.** That plan undersold what the
+fixture move actually required. `unittest.TestCase` methods cannot receive a
+pytest fixture as a parameter — only plain `test_*` functions can — so any
+moved test whose setup became a fixture had to become a plain pytest
+function, not just get a renamed class. In the built result, only
+`tests/test_gemini_manager.py` and `tests/test_safety.py` stayed
+`TestCase`-based (neither needed a fixture). The other five files —
+`tests/test_schema.py`, `tests/test_rag.py`, `tests/test_execution.py`,
+`tests/test_pipeline.py`, and the new `tests/test_packaging.py` — became
+plain pytest functions. `tests/test_ingestion.py` holds both styles in one
+file: `test_normalize_table_name` stayed a `TestCase` method (no fixture
+needed), while `test_ingest_csvs_to_db_sanitizes_table_names` became a plain
+function so it could take the `tmp_path` fixture. So "a rename, not a
+rewrite" held outright for 2 of the 8 files (`test_gemini_manager.py`,
+`test_safety.py`) plus one test within a third (`test_normalize_table_name`
+in `test_ingestion.py`); the other 5 files, plus the second test in
+`test_ingestion.py`, needed real conversion to plain pytest functions.
+Nothing was weakened by this — assertion counts held at 39 across the split —
+but §5.6 as originally written did not anticipate it, and this note
+reconciles the plan with what was actually built.
 
 One test is added:
 

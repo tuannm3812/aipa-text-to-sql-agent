@@ -209,6 +209,8 @@ python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemi
 
 ```text
 .
+|-- .devcontainer/                  # Codespaces/devcontainer setup (uv sync)
+|-- .github/                        # CI workflow (tests.yml)
 |-- AGENTS.md                       # Agent operating rules and coding-standard pointers
 |-- app.py                          # Streamlit frontend
 |-- CLAUDE.md                       # Claude Code entrypoint (points to AGENTS.md)
@@ -238,9 +240,12 @@ python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemi
 |   |   |-- architecture-rag-detail.png # Hybrid Schema RAG Detail export
 |   |   |-- architecture-evaluation-workflow.jpeg # Offline Evaluation Workflow export
 |   |   `-- architecture-implementation-modules.jpeg # Implementation Modules export
-|   `-- screenshots/                # README screenshots
+|   |-- screenshots/                # README screenshots
+|   `-- superpowers/                # SDD specs, plans, and (git-ignored) controller scratch
 |-- evaluation/
-|   `-- cases.json                  # Text-to-SQL benchmark cases
+|   |-- cases.json                  # Text-to-SQL benchmark cases
+|   `-- results/                    # Measured accuracy per provider and model
+|-- LICENSE                         # MIT license
 |-- pyproject.toml                  # Project metadata, dependencies, tool config
 |-- requirements.txt                # Dependencies (generated with `uv export`)
 |-- scripts/

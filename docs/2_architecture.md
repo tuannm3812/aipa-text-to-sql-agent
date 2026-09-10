@@ -31,7 +31,7 @@ The implemented backend flow is:
 
 The local verification status as of this documentation pass is:
 
-- Unit tests: `18` tests passing with `python3 -m unittest discover -s tests`.
+- Unit tests: `20` tests passing with `uv run pytest`.
 - Gold evaluation: `12/12` safe, executed, value-matched, row-matched, and exact-matched cases with `python3 scripts/evaluate_text_to_sql.py --mode gold`.
 - Gemini evaluation: `gemini-2.5-flash` completed all `12` cases with multi-key quota failover, reaching `11/12` value match.
 - Local LLM evaluation: Ollama `llama3:latest` reached `8/12` value match with `12/12` safe/executed queries; `gemma4:latest` reached `8/12` value match overall and `8/10` among executed queries.

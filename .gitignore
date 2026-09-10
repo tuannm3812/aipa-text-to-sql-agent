@@ -230,9 +230,14 @@ data/audit_log.jsonl
 .DS_Store
 
 # Demo fixtures (master coding standard §8: ignore the class, negate the
-# exceptions). These six files are tracked deliberately - app.py offers them as
-# the built-in demo databases and evaluation/cases.json runs against them, so
-# the hosted demo is non-functional without them.
+# exceptions). These six files are tracked deliberately, but only three are
+# load-bearing: university_agent.db, retail_analytics.db, and
+# healthcare_analytics.db are the three databases app.py's DEMO_DATABASES
+# offers and the three evaluation/cases.json runs its twelve cases against, so
+# the hosted demo is non-functional without them. customers.csv and sales.csv
+# are illustrative CSV-upload samples, and dynamic_agent.db is not read by any
+# code path - it just matches the default output filename of
+# ingestion.ingest_csvs_to_db. Kept anyway; see docs/0_coding_standards.md.
 data/**/*.db
 data/**/*.csv
 !data/customers.csv

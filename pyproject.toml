@@ -40,6 +40,11 @@ force-exclude = true
 # The MVP notebook keeps saved outputs as evidence for the academic
 # deliverable, so its code cells must stay byte-identical to the run that
 # produced them. Linting still applies; only reformatting is excluded.
+# Hazard: this only stops `ruff format`. `ruff check --fix` is a separate
+# path and can still rewrite the notebook's cells (e.g. via fix-on-save in
+# an editor), silently invalidating the saved outputs. The notebook is only
+# safe today because it is lint-clean; this is documented, not configured
+# away.
 exclude = ["text_to_sql_agent_mvp.ipynb"]
 
 [tool.ruff.lint]
