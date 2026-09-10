@@ -3,7 +3,7 @@
 **Date:** 2026-09-10
 **Status:** Approved 2026-09-11
 **Parent:** `2026-09-10-refactor-roadmap.md`
-**Addresses:** Roadmap defects 7, 8, 9, 10
+**Addresses:** Roadmap defects 7, 8, 9, 10, 11
 **Baseline standard:** `~/Documents/GitHub/coding-standards/coding_standards.md`
 
 ## 1. Purpose
@@ -15,7 +15,7 @@ B docs, a test suite split along module lines, and CI that runs all of it across
 supported Python versions.
 
 This phase changes **no runtime behaviour**. The success test is that the
-existing 19 tests pass unmodified in substance and the hosted Streamlit demo
+existing 19 tests pass, with only the patch-target change forced by §5.5 and the hosted Streamlit demo
 still boots.
 
 ## 2. Non-goals
@@ -151,6 +151,8 @@ convention = "google"
 "tests/*" = ["D"]
 "app.py" = ["D"]
 "scripts/*" = ["D"]
+# Long lines here are prompt text, not code — see the note below.
+"text_to_sql_agent/llm.py" = ["E501"]
 ```
 
 `D` with the Google convention is added beyond `ai-meal-planner`'s selection
@@ -167,10 +169,12 @@ Two known frictions, resolved here rather than discovered mid-implementation:
 
 - `text_to_sql_agent/config.py` ends with a hand-aligned `STOPWORDS` set whose
   layout is intentional. Wrap it in `# fmt: off` / `# fmt: on`.
-- `text_to_sql_agent/llm.py` holds a 237-character line — the system prompt
-  string. It cannot be auto-wrapped without changing the prompt text, which would
-  be a behaviour change. Reformat it as an implicitly concatenated multi-line
-  string producing a byte-identical prompt, and assert that in a test.
+- `text_to_sql_agent/llm.py` has eleven lines over 100 characters, the longest
+  237. **All of them sit inside the `SQL_TRANSLATION_SYSTEM_PROMPT` triple-quoted
+  string**, where a line break is content the model reads, not formatting. Rewrapping
+  them would change the prompt and therefore behaviour, which this phase forbids.
+  Add `"text_to_sql_agent/llm.py" = ["E501"]` to `per-file-ignores` with a comment
+  saying why. Revisit only if the prompt is ever extracted to its own file.
 
 `ruff format` runs once across the repo as a single isolated commit, so
 formatting churn never mixes with a logic change in review (master §9).
@@ -219,10 +223,31 @@ Delete `text_to_sql_agent_mvp.py` and repoint its four importers at the package:
 | `text_to_sql_agent_mvp.ipynb:57` | `import text_to_sql_agent as agent` |
 
 The shim re-exports the package with `from text_to_sql_agent import *`, then
-redefines `ask_database` and friends with identical signatures. It adds an
-indirection with no remaining purpose and defeats static analysis. The package
-already exports everything the importers use, via `__init__.py`'s explicit
-`__all__`.
+**reimplements** `ask_database`, `ask_database_with_sql`, `ask_from_files`, and
+`_repair_sql`. Verified 2026-09-11: its body is byte-identical to
+`text_to_sql_agent/pipeline.py` apart from three docstrings — roughly 170
+duplicated lines. This is worse than an indirection. A fix applied to
+`pipeline.py` would silently not apply to the code the tests actually run.
+
+It exists for exactly one reason, stated in its own docstring: "remains
+patch-friendly for tests". Because `pipeline.py` does `from .llm import
+generate_sql`, patching `text_to_sql_agent.generate_sql` does not reach the name
+`pipeline` already bound. The shim sidesteps that by calling its own
+module-global.
+
+Two consequences:
+
+- **`pipeline.py`'s `ask_database` has no test coverage today.** The four
+  `test_ask_database_*` tests exercise the shim's copy. Deleting the shim and
+  repointing the tests increases real coverage rather than reducing it.
+- **The three tests that patch `generate_sql` must change target** from
+  `patch.object(agent, "generate_sql", ...)` to
+  `patch("text_to_sql_agent.pipeline.generate_sql", ...)`. Without this they fail
+  the moment the shim is gone. This is the one place §5.6's "no test bodies
+  change" rule is broken, and it is unavoidable.
+
+Verified 2026-09-11: all twelve `backend.*` attributes `app.py` reaches for are
+present in `__init__.py`'s `__all__`, so the app's import swap is safe.
 
 Three documentation sites reference it and are updated in the same commit:
 `README.md:174`, `README.md:213`, and `docs/academic/report.md:188`.
@@ -252,13 +277,11 @@ The temporary-database builders currently inlined per test move to
 `tests/conftest.py` as pytest fixtures. This is the only place test bodies
 change, and only at their setup lines.
 
-Two tests are added:
+One test is added:
 
 - `tests/test_packaging.py` — asserts the runtime dependencies in
   `pyproject.toml` and the contents of `requirements.txt` agree, so the generated
   manifest cannot drift silently.
-- `tests/test_llm.py` — asserts `SQL_TRANSLATION_SYSTEM_PROMPT` is byte-identical
-  to its pre-reformat value, guarding the §5.2 rewrap.
 
 pytest is configured per `ai-meal-planner`:
 
@@ -275,7 +298,7 @@ Note `python_classes = ["Test*"]` does not match the existing
 `TextToSqlAgentTests` class. The split renames each class to `Test<Module>` as it
 moves, which is required for collection and is a rename, not a rewrite.
 
-**Verification:** `pytest` reports 21 passed, 0 failed.
+**Verification:** `pytest` reports 20 passed, 0 failed (19 existing + `test_packaging.py`).
 
 ### 5.7 CI
 
@@ -378,7 +401,7 @@ uv sync
 ruff check .
 ruff format --check .
 mypy text_to_sql_agent          # if §5.4 kept
-uv run pytest                   # 21 passed
+uv run pytest                   # 20 passed
 uv export --no-hashes --no-dev -o /tmp/req.check && diff -u requirements.txt /tmp/req.check
 uv run streamlit run app.py     # boots, demo DB loads, one query returns rows
 ```

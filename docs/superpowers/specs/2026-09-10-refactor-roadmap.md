@@ -44,6 +44,7 @@ Recorded in `docs/0_coding_standards.md`.
 | 8 | Repository root | No `AGENTS.md` and no `CLAUDE.md`, so no session in this repo loads the master standard (master §13, layer 2 missing entirely). |
 | 9 | `.gitignore` | No rule covers `data/`. Six demo fixtures totalling ~212 kB are tracked with nothing marking them as a deliberate exception, so master §8 cannot be audited here. |
 | 10 | `docs/` | Uses ad hoc `academic/` and `supporting/` folders rather than the Shape B numbering of master §2. |
+| 11 | `text_to_sql_agent_mvp.py` vs `text_to_sql_agent/pipeline.py` | The "compatibility shim" is a byte-identical copy of `pipeline.py` apart from three docstrings — about 170 duplicated lines. The tests patch and exercise the shim's copy, so `pipeline.py`'s `ask_database` has no coverage at all, and a fix applied there would not reach the code under test. Verified 2026-09-11. |
 
 ## Phases
 
@@ -53,7 +54,7 @@ follow Conventional Commits per master §9, and every phase ends with the master
 
 ### Phase 1 — Foundation and standards alignment
 Project tooling, agent instructions, doc reshaping, and test structure. No
-behaviour change. Addresses defects 7, 8, 9, and 10.
+behaviour change. Addresses defects 7, 8, 9, 10, and 11.
 Detailed spec: `2026-09-10-phase-1-foundation-design.md`.
 
 ### Phase 2 — Correctness and seams
