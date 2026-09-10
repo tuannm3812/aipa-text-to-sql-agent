@@ -32,6 +32,12 @@ dev = [
 line-length = 100
 target-version = "py311"
 
+[tool.ruff.format]
+# The MVP notebook keeps saved outputs as evidence for the academic
+# deliverable, so its code cells must stay byte-identical to the run that
+# produced them. Linting still applies; only reformatting is excluded.
+exclude = ["text_to_sql_agent_mvp.ipynb"]
+
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM", "D"]
 
