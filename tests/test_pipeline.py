@@ -154,17 +154,43 @@ def test_repair_is_attempted_once_when_execution_fails(customers_db: str) -> Non
         result = agent.ask_database("list customers", db_path=customers_db)
 
     assert gen.call_count == 2, "one generation plus one repair"
+    # Verify the first call is the original question
+    first_call_question = gen.call_args_list[0][0][0]
+    assert first_call_question == "list customers"
+    # Verify the second call's question starts with "Repair the SQL"
+    second_call_question = gen.call_args_list[1][0][0]
+    assert "Repair the SQL" in second_call_question
     assert result.ok, result.error
     assert result.rows == [("Alice",)]
 
 
 def test_repaired_sql_is_rechecked_for_safety(customers_db: str) -> None:
     """A repair that returns unsafe SQL must not be executed."""
+    from text_to_sql_agent.safety import is_safe_query as real_is_safe_query
+
     responses = ["SELECT nope FROM customers", "DROP TABLE customers"]
-    with patch("text_to_sql_agent.pipeline.generate_sql", side_effect=responses):
+    safety_check_args: list[str] = []
+
+    def spy_is_safe_query(sql: str) -> bool:
+        """Wrap the real is_safe_query to record arguments."""
+        safety_check_args.append(sql)
+        return real_is_safe_query(sql)
+
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", side_effect=responses),
+        patch("text_to_sql_agent.pipeline.is_safe_query", side_effect=spy_is_safe_query),
+    ):
         result = agent.ask_database("list customers", db_path=customers_db)
 
+    # Verify is_safe_query was called twice: once for generated, once for repaired
+    assert len(safety_check_args) == 2
+    assert safety_check_args[0] == "SELECT nope FROM customers"
+    assert safety_check_args[1] == "DROP TABLE customers"
+    # Verify the unsafe repaired SQL was blocked
     assert not result.ok
+    # Verify the error is the original execution error, not "not authorized"
+    assert "OperationalError" in (result.error or "")
+    # Verify the table still exists as a backstop
     with closing(sqlite3.connect(customers_db)) as conn:
         tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     assert ("customers",) in tables, "the table must still exist"
