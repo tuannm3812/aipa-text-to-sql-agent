@@ -22,26 +22,6 @@ RETRYABLE_ERROR_MARKERS = (
 )
 
 
-def _normalise_rows(rows: list[tuple[Any, ...]]) -> list[list[str]]:
-    return [[str(value) for value in row] for row in rows]
-
-
-def _canonical_value(value: Any) -> str:
-    if isinstance(value, (int, float)):
-        return str(round(float(value), 2))
-    text = str(value).strip()
-    try:
-        return str(round(float(text), 2))
-    except ValueError:
-        return text.lower()
-
-
-def _value_rows_match(generated: list[tuple[Any, ...]], gold: list[tuple[Any, ...]]) -> bool:
-    generated_rows = sorted(tuple(_canonical_value(value) for value in row) for row in generated)
-    gold_rows = sorted(tuple(_canonical_value(value) for value in row) for row in gold)
-    return generated_rows == gold_rows
-
-
 def _run_gold(case: dict[str, Any]) -> tuple[str, agent.QueryResult]:
     sql = case["gold_sql"]
     if not agent.is_safe_query(sql):
@@ -107,15 +87,15 @@ def evaluate_case(
         )
 
     latency_ms = round((time.perf_counter() - started) * 1000, 2)
-    generated_rows = _normalise_rows(result.rows)
-    gold_rows = _normalise_rows(gold_result.rows)
-    rows_match = result.error is None and gold_result.error is None and generated_rows == gold_rows
+    generated_rows = agent.normalise_rows(result.rows)
+    gold_rows = agent.normalise_rows(gold_result.rows)
+    row_match = result.error is None and gold_result.error is None and generated_rows == gold_rows
     value_match = (
         result.error is None
         and gold_result.error is None
-        and _value_rows_match(result.rows, gold_result.rows)
+        and agent.rows_match(result.rows, gold_result.rows)
     )
-    exact_result_match = rows_match and result.columns == gold_result.columns
+    exact_result_match = row_match and result.columns == gold_result.columns
     expected_tables = set(case.get("expected_tables", []))
     retrieved_tables: set[str] = set()
     rag_context = agent.retrieve_schema_context(
@@ -142,7 +122,7 @@ def evaluate_case(
         "rag_top_k": rag_top_k if mode == "llm" else "",
         "safe_sql": agent.is_safe_query(generated_sql),
         "execution_ok": result.error is None,
-        "row_match": rows_match,
+        "row_match": row_match,
         "value_match": value_match,
         "exact_result_match": exact_result_match,
         "schema_table_recall": table_recall,

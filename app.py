@@ -10,7 +10,6 @@ Ensure `GEMINI_API_KEY` is set in `.env` in the project root (or in your environ
 from __future__ import annotations
 
 import html
-import json
 import os
 import tempfile
 import time
@@ -252,33 +251,6 @@ def _active_db_path() -> str | None:
     return st.session_state.get("_csv_db_path")
 
 
-def _load_evaluation_cases() -> list[dict]:
-    path = Path("evaluation/cases.json")
-    if not path.is_file():
-        return []
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _normalise_rows(rows: list[tuple]) -> list[list[str]]:
-    return [[str(value) for value in row] for row in rows]
-
-
-def _canonical_value(value: object) -> str:
-    if isinstance(value, (int, float)):
-        return str(round(float(value), 2))
-    text = str(value).strip()
-    try:
-        return str(round(float(text), 2))
-    except ValueError:
-        return text.lower()
-
-
-def _value_rows_match(generated: list[tuple], gold: list[tuple]) -> bool:
-    generated_rows = sorted(tuple(_canonical_value(value) for value in row) for row in generated)
-    gold_rows = sorted(tuple(_canonical_value(value) for value in row) for row in gold)
-    return generated_rows == gold_rows
-
-
 def _evaluate_cases(
     *,
     mode: str,
@@ -288,7 +260,7 @@ def _evaluate_cases(
     rag_top_k: int,
 ) -> pd.DataFrame:
     rows: list[dict] = []
-    for case in _load_evaluation_cases():
+    for case in backend.load_cases():
         started = time.perf_counter()
         gold_sql = case["gold_sql"]
         gold_result = backend.execute_query(case["db_path"], gold_sql)
@@ -310,7 +282,7 @@ def _evaluate_cases(
         exact_match = (
             result.error is None
             and result.columns == gold_result.columns
-            and _normalise_rows(result.rows) == _normalise_rows(gold_result.rows)
+            and backend.normalise_rows(result.rows) == backend.normalise_rows(gold_result.rows)
         )
         expected_tables = set(case.get("expected_tables", []))
         rag_context = backend.retrieve_schema_context(
@@ -331,8 +303,9 @@ def _evaluate_cases(
                 "difficulty": case["difficulty"],
                 "safe_sql": backend.is_safe_query(generated_sql),
                 "executed": result.error is None,
-                "row_match": _normalise_rows(result.rows) == _normalise_rows(gold_result.rows),
-                "value_match": _value_rows_match(result.rows, gold_result.rows),
+                "row_match": backend.normalise_rows(result.rows)
+                == backend.normalise_rows(gold_result.rows),
+                "value_match": backend.rows_match(result.rows, gold_result.rows),
                 "exact_match": exact_match,
                 "schema_recall": schema_recall,
                 "prompt_saved_pct": rag_context.prompt_savings_pct,

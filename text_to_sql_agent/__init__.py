@@ -21,6 +21,7 @@ from .config import (
 )
 from .data_setup import create_dummy_university_data, write_university_db
 from .env import load_env
+from .evaluation import canonical_value, load_cases, normalise_rows, rows_match
 from .execution import execute_query
 from .ingestion import ingest_csvs_to_db, normalize_table_name
 from .llm import SQL_TRANSLATION_SYSTEM_PROMPT, generate_sql
@@ -50,6 +51,7 @@ __all__ = [
     "ask_database",
     "ask_database_with_sql",
     "ask_from_files",
+    "canonical_value",
     "create_dummy_university_data",
     "execute_query",
     "generate_sql",
@@ -57,10 +59,13 @@ __all__ = [
     "get_schema_chunks",
     "ingest_csvs_to_db",
     "is_safe_query",
+    "load_cases",
     "load_env",
+    "normalise_rows",
     "normalize_table_name",
     "retrieve_relevant_schema",
     "retrieve_schema_chunks",
     "retrieve_schema_context",
+    "rows_match",
     "write_university_db",
 ]
