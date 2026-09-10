@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-import text_to_sql_agent_mvp as agent
+import text_to_sql_agent as agent
 
 
 def test_execute_query_caps_rows_and_reports_truncation(tmp_path: Path) -> None:

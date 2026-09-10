@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import text_to_sql_agent_mvp as agent
+import text_to_sql_agent as agent
 
 
 def test_retrieve_schema_chunks_selects_relevant_tables(

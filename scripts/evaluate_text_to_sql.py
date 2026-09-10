@@ -12,7 +12,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-import text_to_sql_agent_mvp as agent  # noqa: E402 - import must follow the sys.path insert above
+import text_to_sql_agent as agent  # noqa: E402 - import must follow the sys.path insert above
 
 RETRYABLE_ERROR_MARKERS = (
     "429",

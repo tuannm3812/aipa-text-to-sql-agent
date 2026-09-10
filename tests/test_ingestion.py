@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-import text_to_sql_agent_mvp as agent
+import text_to_sql_agent as agent
 
 
 class TestIngestion(unittest.TestCase):

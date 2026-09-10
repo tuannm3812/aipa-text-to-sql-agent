@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-import text_to_sql_agent_mvp as agent
+import text_to_sql_agent as agent
 
 
 class TestSafety(unittest.TestCase):

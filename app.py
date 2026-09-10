@@ -1,5 +1,5 @@
 """
-Streamlit UI for the Text-to-SQL agent (`text_to_sql_agent_mvp`).
+Streamlit UI for the Text-to-SQL agent (`text_to_sql_agent`).
 
 Run locally:
     streamlit run app.py
@@ -20,7 +20,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-import text_to_sql_agent_mvp as backend
+import text_to_sql_agent as backend
 
 backend.load_env()
 
