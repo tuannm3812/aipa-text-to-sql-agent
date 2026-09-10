@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any
+from typing import Any, cast
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_OLLAMA_MODEL, DEFAULT_PROVIDER
 from .env import load_env
@@ -60,8 +60,8 @@ ADDITONAL RULES - COMPARATIVE QUESTIONS (must follow):
 
 def _load_gemini_sdk() -> tuple[str, Any, Any | None]:
     try:
-        from google import genai  # type: ignore
-        from google.genai import types  # type: ignore
+        from google import genai
+        from google.genai import types
 
         return "google-genai", genai, types
     except ModuleNotFoundError as e:  # pragma: no cover
@@ -76,8 +76,8 @@ def _load_gemini_sdk() -> tuple[str, Any, Any | None]:
 
 def _load_ollama_sdk() -> tuple[Any, Any, Any]:
     try:
-        from langchain_core.messages import HumanMessage, SystemMessage  # type: ignore
-        from langchain_ollama import ChatOllama  # type: ignore
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from langchain_ollama import ChatOllama
     except ModuleNotFoundError as e:  # pragma: no cover
         raise ModuleNotFoundError(
             "Ollama support requires langchain-ollama and langchain-core. "
@@ -95,9 +95,9 @@ def _extract_sql_from_text(raw_output: str) -> str:
     )
     for block in blocks:
         if re.search(r"(?is)^\s*(SELECT|WITH)\b", block):
-            return block.strip()
+            return cast(str, block.strip())
     if blocks:
-        return blocks[0].strip()
+        return cast(str, blocks[0].strip())
 
     match = re.search(r"(?is)\b(SELECT|WITH)\b.*?;?$", raw_output)
     if match:
@@ -149,6 +149,7 @@ def generate_sql(
 
         def generate_with_key(api_key: str) -> str:
             if sdk_name == "google-genai":
+                assert genai_types is not None
                 client = genai.Client(api_key=api_key)
                 response = client.models.generate_content(
                     model=model_name or DEFAULT_MODEL_NAME,

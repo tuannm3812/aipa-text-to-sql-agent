@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import re
+from types import ModuleType
 
+sqlglot: ModuleType | None
+exp: ModuleType | None
 try:
     import sqlglot
     from sqlglot import exp

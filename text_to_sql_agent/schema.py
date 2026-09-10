@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import closing
-from functools import lru_cache
+from functools import _CacheInfo, lru_cache
 from pathlib import Path
 
 from .config import DEFAULT_VALUE_HINT_LIMIT, DEFAULT_VALUE_HINT_MAX_CARDINALITY
@@ -152,6 +152,6 @@ def get_schema_chunks(db_path: str) -> list[SchemaChunk]:
     return list(_cached_schema_chunks(path, mtime_ns, size))
 
 
-def get_schema_chunk_cache_info():
+def get_schema_chunk_cache_info() -> _CacheInfo:
     """Return `lru_cache` hit/miss statistics for the schema chunk cache."""
     return _cached_schema_chunks.cache_info()

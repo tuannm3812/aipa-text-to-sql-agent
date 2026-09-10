@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
+load_dotenv: Callable[..., bool] | None
 try:
-    from dotenv import load_dotenv  # type: ignore
+    from dotenv import load_dotenv
 except ModuleNotFoundError:  # pragma: no cover
     load_dotenv = None
 
