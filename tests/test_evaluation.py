@@ -38,6 +38,23 @@ def test_rows_match_is_true_for_two_empty_results() -> None:
     assert evaluation.rows_match([], [])
 
 
+def test_rows_match_rejects_a_duplicated_row_against_a_single_row() -> None:
+    assert not evaluation.rows_match([("a", 1), ("a", 1)], [("a", 1)])
+
+
+def test_rows_match_rejects_a_single_row_against_a_duplicated_row() -> None:
+    assert not evaluation.rows_match([("a", 1)], [("a", 1), ("a", 1)])
+
+
+def test_rows_match_accepts_matching_duplicate_rows_on_both_sides() -> None:
+    assert evaluation.rows_match([("a", 1), ("a", 1)], [("a", 1), ("a", 1)])
+
+
+def test_canonical_value_treats_booleans_as_their_integer_value() -> None:
+    assert evaluation.canonical_value(True) == evaluation.canonical_value(1)
+    assert evaluation.canonical_value(False) == evaluation.canonical_value(0)
+
+
 def test_normalise_rows_stringifies_every_cell() -> None:
     assert evaluation.normalise_rows([(1, "a", None)]) == [["1", "a", "None"]]
 
