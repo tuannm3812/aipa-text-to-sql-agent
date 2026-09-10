@@ -1,3 +1,5 @@
+"""Read-only SQLite query execution with row-count caps and a write authorizer."""
+
 from __future__ import annotations
 
 import sqlite3
@@ -58,7 +60,21 @@ def execute_query(
     max_rows: int = DEFAULT_MAX_ROWS,
     progress_steps: int = DEFAULT_SQLITE_PROGRESS_STEPS,
 ) -> QueryResult:
-    """Execute safe SQL against SQLite using read-only protections."""
+    """Execute a validated SELECT against SQLite with read-only protections.
+
+    Args:
+        db_path: Filesystem path to the SQLite database.
+        sql_string: A query already cleared by `is_safe_query`.
+        max_rows: Maximum rows returned before the result is marked truncated.
+        progress_steps: VM steps between progress-handler callbacks.
+
+    Returns:
+        A `QueryResult`. Its `error` is set to `RESULT_TRUNCATED_TO_<n>_ROWS`
+        when more rows were available than `max_rows` allowed.
+
+    Raises:
+        ValueError: If `max_rows` is less than 1.
+    """
     if max_rows < 1:
         raise ValueError("max_rows must be at least 1")
 

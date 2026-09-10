@@ -1,3 +1,5 @@
+"""End-to-end Text-to-SQL orchestration: retrieval, generation, safety, execution."""
+
 from __future__ import annotations
 
 import os
@@ -23,7 +25,32 @@ def ask_database(
     rag_top_k: int = DEFAULT_RAG_TOP_K,
     max_repair_attempts: int = 1,
 ) -> QueryResult:
-    """End-to-end Text-to-SQL wrapper: schema retrieval, generation, safety, execution."""
+    """End-to-end Text-to-SQL wrapper: schema retrieval, generation, safety, execution.
+
+    On failure at any stage (generation, safety check, or execution after a
+    failed repair attempt), the error is captured in the returned
+    `QueryResult.error` rather than raised.
+
+    Args:
+        question: The user's natural-language question.
+        db_path: Filesystem path to the SQLite database to query.
+        model_name: Provider-specific model identifier passed to `generate_sql`.
+        provider: `"gemini"` or `"ollama"`; see `generate_sql` for the default.
+        use_rag: Whether to retrieve a relevant schema subset via
+            `retrieve_relevant_schema` instead of the full schema.
+        rag_top_k: Number of schema chunks to retrieve when `use_rag` is set.
+        max_repair_attempts: Number of times to ask the model to repair SQL
+            that failed execution. `0` disables repair.
+
+    Returns:
+        A `QueryResult`. `error` is set to `UNANSWERABLE_WITH_GIVEN_SCHEMA` if
+        the model could not answer from the schema, `BLOCKED_UNSAFE_SQL` if
+        `is_safe_query` rejected the generated SQL, or the exception text if
+        generation or execution failed.
+
+    Raises:
+        FileNotFoundError: If `db_path` does not exist.
+    """
     if not os.path.exists(db_path):
         raise FileNotFoundError("input database not found")
 
@@ -68,7 +95,28 @@ def ask_database_with_sql(
     rag_top_k: int = DEFAULT_RAG_TOP_K,
     max_repair_attempts: int = 1,
 ) -> tuple[str, QueryResult]:
-    """Same as `ask_database`, but also returns the generated SQL for UI display."""
+    """Same as `ask_database`, but also returns the generated SQL for UI display.
+
+    Args:
+        question: The user's natural-language question.
+        db_path: Filesystem path to the SQLite database to query.
+        model_name: Provider-specific model identifier passed to `generate_sql`.
+        provider: `"gemini"` or `"ollama"`; see `generate_sql` for the default.
+        use_rag: Whether to retrieve a relevant schema subset via
+            `retrieve_relevant_schema` instead of the full schema.
+        rag_top_k: Number of schema chunks to retrieve when `use_rag` is set.
+        max_repair_attempts: Number of times to ask the model to repair SQL
+            that failed execution. `0` disables repair.
+
+    Returns:
+        A `(sql, QueryResult)` tuple. `sql` is `""` if generation itself
+        failed; otherwise it is the SQL that was attempted (repaired SQL
+        replaces the original once a repair succeeds). See `ask_database`
+        for the `QueryResult.error` values used.
+
+    Raises:
+        FileNotFoundError: If `db_path` does not exist.
+    """
     if not os.path.exists(db_path):
         raise FileNotFoundError("input database not found")
 
@@ -121,7 +169,29 @@ def ask_from_files(
     rag_top_k: int = DEFAULT_RAG_TOP_K,
     max_repair_attempts: int = 1,
 ) -> QueryResult:
-    """Route a `.db` file directly or ingest CSV files before querying."""
+    """Route a `.db` file directly or ingest CSV files before querying.
+
+    Args:
+        question: The user's natural-language question.
+        file_paths: One `.db` path, or one or more `.csv` paths (mixing
+            extensions is not supported).
+        output_db_path: Destination path when `file_paths` are CSVs; ignored
+            for a `.db` path.
+        model_name: Provider-specific model identifier passed to `generate_sql`.
+        provider: `"gemini"` or `"ollama"`; see `generate_sql` for the default.
+        use_rag: Whether to retrieve a relevant schema subset via
+            `retrieve_relevant_schema` instead of the full schema.
+        rag_top_k: Number of schema chunks to retrieve when `use_rag` is set.
+        max_repair_attempts: Number of times to ask the model to repair SQL
+            that failed execution. `0` disables repair.
+
+    Returns:
+        The `QueryResult` from `ask_database` against the resolved database.
+
+    Raises:
+        ValueError: If `file_paths` is empty, mixes file extensions, contains
+            more than one `.db` path, or uses an unsupported extension.
+    """
     paths = [file_paths] if isinstance(file_paths, str) else list(file_paths)
     if not paths:
         raise ValueError("file_paths must contain at least one path")

@@ -1,3 +1,10 @@
+"""Text-to-SQL agent package: natural language to safe, read-only SQLite queries.
+
+Re-exports the public surface used by `app.py` and the evaluation scripts -
+configuration defaults, environment loading, schema retrieval, SQL
+generation, safety validation, and query execution.
+"""
+
 from .config import (
     DEFAULT_MAX_ROWS,
     DEFAULT_MODEL_NAME,

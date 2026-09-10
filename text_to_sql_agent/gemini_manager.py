@@ -1,3 +1,5 @@
+"""API key loading and rotation for Gemini calls that hit quota or outage errors."""
+
 from __future__ import annotations
 
 import os
@@ -87,6 +89,11 @@ class GeminiManager:
     _reset_counts: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        """Strip blank keys and validate that at least one usable key remains.
+
+        Raises:
+            ValueError: If no non-empty key was supplied.
+        """
         self.keys = [key.strip() for key in self.keys if key and key.strip()]
         if not self.keys:
             raise ValueError(
@@ -97,22 +104,41 @@ class GeminiManager:
 
     @classmethod
     def from_env(cls) -> GeminiManager:
+        """Build a manager from the keys discovered by `load_google_api_keys`."""
         return cls(load_google_api_keys())
 
     @property
     def current_key(self) -> str:
+        """The API key currently selected for use."""
         return self.keys[self.index]
 
     def next_key(self) -> str:
+        """Advance to the next key, wrapping around, and return it."""
         self.index = (self.index + 1) % len(self.keys)
         return self.current_key
 
     def reset_key(self) -> str:
+        """Record a reset attempt for the current key and return it unchanged."""
         key = self.current_key
         self._reset_counts[key] = self._reset_counts.get(key, 0) + 1
         return key
 
     def run(self, call: Callable[[str], T]) -> T:
+        """Call `call(key)`, rotating or retrying the key on quota/outage errors.
+
+        Args:
+            call: A function that performs a Gemini request using the given key.
+
+        Returns:
+            Whatever `call` returns on its first successful invocation.
+
+        Raises:
+            Exception: The original exception from `call`, re-raised unchanged,
+                if its status code is not one that triggers rotation or reset.
+            RuntimeError: If all keys are exhausted without a successful call
+                and without a captured error to re-raise (should not occur in
+                practice, since `max_attempts` is always at least 1).
+        """
         attempts = 0
         max_attempts = max(1, len(self.keys) * 2)
         last_error: BaseException | None = None

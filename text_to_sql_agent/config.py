@@ -1,3 +1,10 @@
+"""Default settings and lookup tables shared across the agent package.
+
+Holds model/provider defaults, execution and RAG tuning constants, and the
+synonym and stopword tables used by `text_to_sql_agent.rag` when scoring
+schema chunks against a question.
+"""
+
 DEFAULT_MODEL_NAME = "gemini-2.5-flash"
 DEFAULT_OLLAMA_MODEL = "gemma3"
 DEFAULT_PROVIDER = "gemini"

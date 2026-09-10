@@ -1,3 +1,5 @@
+"""Hybrid schema retrieval: BM25, char-ngram, and embedding scoring with a graph boost."""
+
 from __future__ import annotations
 
 import math
@@ -88,6 +90,19 @@ def _schema_prompt_chars(chunks: list[SchemaChunk]) -> int:
 
 
 def decompose_question(question: str) -> dict[str, list[str]]:
+    """Break a question into entities, aggregations, filters, and comparisons.
+
+    A lightweight, keyword-based decomposition used both for schema-retrieval
+    scoring and for the retrieval report shown in the UI.
+
+    Args:
+        question: The user's natural-language question.
+
+    Returns:
+        A dict with keys `"entities_or_metrics"`, `"aggregations"`,
+        `"filters_or_dimensions"`, and `"comparisons"`, each a sorted list of
+        matched tokens (empty if none matched).
+    """
     tokens = _tokenize_for_rag(question)
     aggregations = []
     if any(token in tokens for token in ("count", "many", "number")):
@@ -137,6 +152,20 @@ def retrieve_schema_chunks(
     top_k: int = DEFAULT_RAG_TOP_K,
     include_neighbors: int = DEFAULT_RAG_NEIGHBORS,
 ) -> list[SchemaChunk]:
+    """Return the schema chunks selected by `retrieve_schema_context`.
+
+    Args:
+        db_path: Filesystem path to the SQLite database.
+        question: The user's natural-language question.
+        top_k: Maximum number of top-scored chunks to select before
+            neighbor expansion.
+        include_neighbors: Number of foreign-key hops to expand the
+            selection by.
+
+    Returns:
+        The retrieved `SchemaChunk`s, most relevant first. See
+        `retrieve_schema_context` for the full retrieval result.
+    """
     return retrieve_schema_context(
         db_path,
         question,
@@ -154,6 +183,27 @@ def retrieve_schema_context(
     semantic_weight: float = DEFAULT_RAG_SEMANTIC_WEIGHT,
     embedding_weight: float = DEFAULT_RAG_EMBEDDING_WEIGHT,
 ) -> SchemaRetrievalResult:
+    """Score and select the schema chunks most relevant to a question.
+
+    Combines BM25-style lexical scoring, table/column name matches, a
+    char-ngram cosine similarity, and a hashed-embedding cosine similarity,
+    then expands the top-scored chunks with their foreign-key neighbors.
+
+    Args:
+        db_path: Filesystem path to the SQLite database.
+        question: The user's natural-language question.
+        top_k: Maximum number of top-scored chunks to select before
+            neighbor expansion. `0` or negative returns all chunks unscored.
+        include_neighbors: Number of foreign-key hops to expand the
+            selection by, adding each unselected neighbor at most once.
+        semantic_weight: Weight applied to the char-ngram similarity score.
+        embedding_weight: Weight applied to the hashed-embedding similarity
+            score.
+
+    Returns:
+        A `SchemaRetrievalResult` with the selected chunks, the tokens
+        derived from the question, and retrieval statistics.
+    """
     before_cache = get_schema_chunk_cache_info()
     chunks = get_schema_chunks(db_path)
     after_cache = get_schema_chunk_cache_info()
@@ -311,4 +361,16 @@ def retrieve_relevant_schema(
     *,
     top_k: int = DEFAULT_RAG_TOP_K,
 ) -> str:
+    """Return prompt-ready schema text for the chunks most relevant to a question.
+
+    Args:
+        db_path: Filesystem path to the SQLite database.
+        question: The user's natural-language question.
+        top_k: Maximum number of top-scored chunks to select; see
+            `retrieve_schema_context`.
+
+    Returns:
+        DDL and value hints for the retrieved chunks, formatted for
+        inclusion in an LLM prompt (see `SchemaRetrievalResult.schema_text`).
+    """
     return retrieve_schema_context(db_path, question, top_k=top_k).schema_text

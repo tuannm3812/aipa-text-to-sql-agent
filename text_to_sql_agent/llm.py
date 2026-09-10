@@ -1,3 +1,5 @@
+"""SQL generation via Gemini or Ollama, given a question and a database schema."""
+
 from __future__ import annotations
 
 import os
@@ -110,7 +112,25 @@ def generate_sql(
     model_name: str = DEFAULT_MODEL_NAME,
     provider: str | None = None,
 ) -> str:
-    """Call Gemini or Ollama to generate SQLite SQL from a question and schema."""
+    """Call Gemini or Ollama to generate SQLite SQL from a question and schema.
+
+    Args:
+        user_question: The user's natural-language question.
+        schema_text: DDL and hints describing the tables available to query.
+        model_name: Provider-specific model identifier.
+        provider: `"gemini"` or `"ollama"`. Defaults to the
+            `TEXT_TO_SQL_PROVIDER` environment variable, then
+            `DEFAULT_PROVIDER`.
+
+    Returns:
+        The generated SQL text, extracted from the model's raw response.
+
+    Raises:
+        ValueError: If the resolved provider is neither `"gemini"` nor
+            `"ollama"`.
+        ModuleNotFoundError: If the SDK required by the resolved provider is
+            not installed.
+    """
     load_env()
     selected_provider = (
         (provider or os.environ.get("TEXT_TO_SQL_PROVIDER") or DEFAULT_PROVIDER).strip().lower()

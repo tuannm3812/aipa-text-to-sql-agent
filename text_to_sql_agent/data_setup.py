@@ -1,3 +1,5 @@
+"""Synthetic university dataset used for demos, tests, and the sample database."""
+
 from __future__ import annotations
 
 import os
@@ -9,7 +11,16 @@ import pandas as pd
 
 
 def create_dummy_university_data(seed: int = 7) -> dict[str, pd.DataFrame]:
-    """Create deterministic synthetic university tables for demos and tests."""
+    """Create deterministic synthetic university tables for demos and tests.
+
+    Args:
+        seed: Accepted for interface stability; the generated data is always
+            deterministic and does not currently depend on this value.
+
+    Returns:
+        A dict with `"students"`, `"courses"`, and `"grades"` DataFrames,
+        cross-referenced by `student_id` and `course_id`.
+    """
     _ = seed
     rng = pd.Series(range(1, 21))
     students = pd.DataFrame(
@@ -59,7 +70,19 @@ def create_dummy_university_data(seed: int = 7) -> dict[str, pd.DataFrame]:
 
 
 def write_university_db(db_path: str = "university_agent.db") -> str:
-    """Create or overwrite the synthetic university SQLite database."""
+    """Create or overwrite the synthetic university SQLite database.
+
+    Writes the `students`, `courses`, and `grades` tables from
+    `create_dummy_university_data`, then rebuilds each with explicit primary
+    and foreign keys (pandas' `to_sql` cannot declare these directly).
+
+    Args:
+        db_path: Filesystem path for the SQLite database. An existing file
+            at this path is removed first.
+
+    Returns:
+        `db_path`, unchanged, for convenience chaining.
+    """
     data = create_dummy_university_data()
     if os.path.exists(db_path):
         os.remove(db_path)

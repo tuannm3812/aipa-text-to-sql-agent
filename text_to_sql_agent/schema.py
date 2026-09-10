@@ -1,3 +1,5 @@
+"""SQLite schema extraction: raw DDL and cached, retrieval-ready schema chunks."""
+
 from __future__ import annotations
 
 import sqlite3
@@ -10,7 +12,15 @@ from .types import SchemaChunk
 
 
 def get_schema(db_path: str) -> str:
-    """Extract CREATE TABLE statements for all user tables in SQLite."""
+    """Extract CREATE TABLE statements for all user tables in SQLite.
+
+    Args:
+        db_path: Filesystem path to the SQLite database.
+
+    Returns:
+        The `CREATE TABLE` statements, one per table, semicolon-terminated
+        and separated by blank lines, in table-name order.
+    """
     with closing(sqlite3.connect(db_path)) as conn:
         rows = conn.execute(
             """
@@ -126,10 +136,22 @@ def _build_schema_chunks(db_path: str) -> list[SchemaChunk]:
 
 
 def get_schema_chunks(db_path: str) -> list[SchemaChunk]:
-    """Return cached table-level schema chunks for retrieval."""
+    """Return cached table-level schema chunks for retrieval.
+
+    Results are cached by `(path, mtime_ns, size)` via `lru_cache`, so the
+    cache is invalidated automatically whenever the database file changes.
+
+    Args:
+        db_path: Filesystem path to the SQLite database.
+
+    Returns:
+        One `SchemaChunk` per user table, each carrying its DDL, columns,
+        foreign-table names, and sample value hints.
+    """
     path, mtime_ns, size = _db_cache_key(db_path)
     return list(_cached_schema_chunks(path, mtime_ns, size))
 
 
 def get_schema_chunk_cache_info():
+    """Return `lru_cache` hit/miss statistics for the schema chunk cache."""
     return _cached_schema_chunks.cache_info()

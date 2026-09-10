@@ -1,3 +1,5 @@
+"""Read-only SQL validation: regex pre-filtering plus an AST safety check."""
+
 from __future__ import annotations
 
 import re
@@ -47,7 +49,20 @@ def _is_safe_ast(sql_string: str) -> bool:
 
 
 def is_safe_query(sql_string: str) -> bool:
-    """Conservatively allow only read-only SELECT/CTE queries."""
+    """Conservatively allow only read-only SELECT/CTE queries.
+
+    Rejects anything empty, not starting with `SELECT`/`WITH`, matching a
+    data-modifying or transaction-control keyword, referencing
+    `sqlite_master`/`sqlite_schema`, or failing an AST-level safety check
+    (when `sqlglot` is installed; otherwise the AST check is skipped and this
+    function relies on the regex checks alone).
+
+    Args:
+        sql_string: The SQL text to validate.
+
+    Returns:
+        True if the query is judged safe to execute read-only.
+    """
     if not sql_string or not sql_string.strip():
         return False
     s = sql_string.strip().rstrip(";").strip()
