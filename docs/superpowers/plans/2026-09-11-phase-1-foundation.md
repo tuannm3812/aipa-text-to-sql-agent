@@ -246,7 +246,7 @@ Done before any source change, so later failures point at one module.
 
 **Interfaces:**
 - Consumes: `uv run pytest` from Task 1.
-- Produces: fixtures `customers_sales_courses_db(tmp_path) -> str` and `customers_db(tmp_path) -> str`, both returning a filesystem path string to a temp SQLite file. Task 4 edits `tests/test_pipeline.py` and `tests/test_rag.py`.
+- Produces: three fixtures, each returning a filesystem path string to a temp SQLite database: `customers_db` (one table, one row), `customers_courses_db` (adds an unrelated `courses` table), and `customers_sales_courses_db` (adds `sales` with a foreign key to `customers`). Task 4 edits `tests/test_pipeline.py` and `tests/test_rag.py`.
 
 Classes are renamed to `Test<Module>` because `python_classes = ["Test*"]` from
 Task 1 will not collect `TextToSqlAgentTests`. Bodies are otherwise moved
@@ -280,6 +280,22 @@ def customers_db(tmp_path: Path) -> str:
     db_path = tmp_path / "customers.db"
     with closing(sqlite3.connect(db_path)) as conn:
         conn.execute("CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO customers VALUES (1, 'Alice')")
+        conn.commit()
+    return str(db_path)
+
+
+@pytest.fixture
+def customers_courses_db(tmp_path: Path) -> str:
+    """`customers` (one row) plus an unrelated `courses` table.
+
+    Used where a test needs one clearly relevant table and one clearly
+    irrelevant one, to assert that retrieval excludes the latter.
+    """
+    db_path = tmp_path / "test.db"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("CREATE TABLE courses (course_id INTEGER PRIMARY KEY, course_name TEXT)")
         conn.execute("INSERT INTO customers VALUES (1, 'Alice')")
         conn.commit()
     return str(db_path)
@@ -500,10 +516,6 @@ def test_get_schema_excludes_internal_tables(tmp_path: Path) -> None:
 ```python
 from __future__ import annotations
 
-import sqlite3
-from contextlib import closing
-from pathlib import Path
-
 import text_to_sql_agent_mvp as agent
 
 
@@ -537,14 +549,8 @@ def test_schema_rag_expands_business_synonyms(customers_sales_courses_db: str) -
     assert "Schema RAG strategy" in context.report
 
 
-def test_retrieve_relevant_schema_returns_only_selected_ddl(tmp_path: Path) -> None:
-    db_path = tmp_path / "test.db"
-    with closing(sqlite3.connect(db_path)) as conn:
-        conn.execute("CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, name TEXT)")
-        conn.execute("CREATE TABLE courses (course_id INTEGER PRIMARY KEY, course_name TEXT)")
-        conn.commit()
-
-    schema = agent.retrieve_relevant_schema(str(db_path), "customer names", top_k=1)
+def test_retrieve_relevant_schema_returns_only_selected_ddl(customers_courses_db: str) -> None:
+    schema = agent.retrieve_relevant_schema(customers_courses_db, "customer names", top_k=1)
 
     assert "CREATE TABLE customers" in schema
     assert "CREATE TABLE courses" not in schema
@@ -595,22 +601,12 @@ point of doing this split first.
 ```python
 from __future__ import annotations
 
-import sqlite3
-from contextlib import closing
-from pathlib import Path
 from unittest.mock import patch
 
 import text_to_sql_agent_mvp as agent
 
 
-def test_ask_database_uses_retrieved_schema_by_default(tmp_path: Path) -> None:
-    db_path = tmp_path / "test.db"
-    with closing(sqlite3.connect(db_path)) as conn:
-        conn.execute("CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, name TEXT)")
-        conn.execute("CREATE TABLE courses (course_id INTEGER PRIMARY KEY, course_name TEXT)")
-        conn.execute("INSERT INTO customers VALUES (1, 'Alice')")
-        conn.commit()
-
+def test_ask_database_uses_retrieved_schema_by_default(customers_courses_db: str) -> None:
     captured_schema: dict[str, str] = {}
 
     def fake_generate_sql(_question: str, schema_text: str, **_kwargs: object) -> str:
@@ -618,7 +614,9 @@ def test_ask_database_uses_retrieved_schema_by_default(tmp_path: Path) -> None:
         return "SELECT name FROM customers"
 
     with patch.object(agent, "generate_sql", side_effect=fake_generate_sql):
-        result = agent.ask_database("list customer names", db_path=str(db_path), rag_top_k=1)
+        result = agent.ask_database(
+            "list customer names", db_path=customers_courses_db, rag_top_k=1
+        )
 
     assert result.ok
     assert "CREATE TABLE customers" in captured_schema["text"]
@@ -1905,10 +1903,10 @@ change fails in one named file. Docs (Task 7) follow shim deletion because they
 must describe the final state. CI (Task 8) is last because it asserts everything
 above.
 
-**Type consistency.** The two fixture names — `customers_db` and
-`customers_sales_courses_db` — are defined in Task 2 Step 2 and used unchanged in
-Task 2 Steps 5-9. Both return `str`, matching the `str` parameters the agent
-functions take. The patch target string
+**Type consistency.** The three fixture names — `customers_db`,
+`customers_courses_db` and `customers_sales_courses_db` — are defined in Task 2
+Step 2 and used unchanged in Task 2 Steps 5-9. All return `str`, matching the
+`str` parameters the agent functions take. The patch target string
 `"text_to_sql_agent.pipeline.generate_sql"` is identical across all three uses in
 Task 4 Step 3.
 
