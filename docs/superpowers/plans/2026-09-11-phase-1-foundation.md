@@ -2029,22 +2029,59 @@ Expected: `SHIM GONE`, then `NO REFERENCES`. The notebook is excluded because it
 *filename* legitimately still contains that string; its cell contents were
 checked in Task 4 Step 8.
 
-- [ ] **Step 3: Boot the app and run a real query**
+- [ ] **Step 3: Fix the last stale command in the README**
+
+`README.md` still tells contributors to run the suite with
+`python -m unittest discover -s tests`. The project moved to pytest in Task 2 and
+CI runs `uv run pytest`. On this machine `python` is 3.9.6 and that command fails
+outright. Replace it with `uv run pytest`, and check the surrounding setup
+instructions for any other command that predates `uv`.
+
+- [ ] **Step 4: Boot the app and run a real query**
 
 The one check no automated test covers, and the spec's main risk.
 
+Two checks. First, prove the app's module graph imports cleanly and the backend
+answers a real question end to end without Streamlit in the way — this is the
+part that would break if Task 4 missed an attribute:
+
 ```bash
-uv run streamlit run app.py --server.headless true --server.port 8501
+uv run python - <<'EOF'
+import re, importlib
+import text_to_sql_agent as b
+src = open("app.py").read()
+used = sorted(set(re.findall(r"backend\.([A-Za-z_]+)", src)))
+missing = [n for n in used if not hasattr(b, n)]
+assert not missing, f"app.py needs {missing}, absent from the package"
+print(f"app API OK ({len(used)} attributes)")
+
+importlib.import_module("app")
+print("app.py imports cleanly")
+
+from unittest.mock import patch
+with patch("text_to_sql_agent.pipeline.generate_sql",
+           return_value="SELECT major, COUNT(*) AS n FROM students GROUP BY major"):
+    r = b.ask_database("students per major", db_path="data/university_agent.db")
+assert r.ok, r.error
+print(f"end-to-end OK: {len(r.rows)} rows, columns={r.columns}")
+EOF
 ```
 
-In the browser at `http://localhost:8501`: select the university demo database,
-ask "how many students are enrolled in each course?", and confirm a result table
-renders with the generated SQL visible below it. Stop the server with Ctrl-C.
+All three lines must print. Then boot the server itself and confirm it serves:
 
-If it fails at import, Task 4 Step 6 missed an attribute. If it fails at query
-time with a missing API key, that is expected without `GEMINI_API_KEY` — set one,
-or switch the provider to Ollama, and retry. A key error is not a Phase 1
-regression.
+```bash
+uv run streamlit run app.py --server.headless true --server.port 8501 &
+sleep 8
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8501
+kill %1
+```
+
+Expected: `200`. A non-200, or a traceback in the server output, is a real
+regression — investigate before calling the phase done.
+
+A missing `GEMINI_API_KEY` is **not** a regression: the mocked check above
+deliberately avoids needing one, and the live UI would simply report the missing
+key. Do not treat that as a failure.
 
 - [ ] **Step 4: Reconcile the log against what actually happened**
 
