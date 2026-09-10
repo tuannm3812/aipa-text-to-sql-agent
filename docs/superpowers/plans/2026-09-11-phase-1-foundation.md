@@ -835,8 +835,22 @@ uv run mypy text_to_sql_agent
 uv run pytest
 ```
 
-Expected: both ruff commands silent, mypy `Success: no issues found in 13
-source files`, and `18 passed`. All four must pass before you commit.
+Expected: mypy `Success: no issues found in 13 source files` and `18 passed`.
+
+**The two ruff commands will still fail at this point, and that is correct.**
+`text_to_sql_agent_mvp.py` is not touched by this task — Task 4 deletes it — and
+its star import alone accounts for every remaining finding. Verify that is the
+only cause rather than assuming it:
+
+```bash
+uv run ruff check . --exclude text_to_sql_agent_mvp.py
+uv run ruff format --check . --exclude text_to_sql_agent_mvp.py --exclude text_to_sql_agent_mvp.ipynb
+```
+
+Both must print a clean result. If anything outside those two files is still
+flagged, fix it before committing. Do **not** add a `pyproject.toml` exclude for
+the shim to force green — a temporary exclude outlives the file it excludes.
+Task 4 owns getting the unscoped commands to zero.
 
 - [ ] **Step 8: Commit formatting, docstrings, and types separately**
 
