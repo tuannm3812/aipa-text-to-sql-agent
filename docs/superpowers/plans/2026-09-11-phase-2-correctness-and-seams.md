@@ -330,9 +330,7 @@ def test_execute_query_returns_typed_error_when_aborted(tmp_path: Path) -> None:
         conn.executemany("INSERT INTO n VALUES (?)", [(i,) for i in range(60_000)])
         conn.commit()
 
-    result = agent.execute_query(
-        str(db_path), "SELECT COUNT(*) FROM n a JOIN n b ON a.i = b.i"
-    )
+    result = agent.execute_query(str(db_path), "SELECT COUNT(*) FROM n a JOIN n b ON a.i = b.i")
 
     assert not result.ok
     assert result.error == "QUERY_ABORTED_AFTER_100000_VM_STEPS"
@@ -634,9 +632,7 @@ def test_ask_from_files_ingests_csvs_then_queries(tmp_path: Path) -> None:
     out_db = tmp_path / "ingested.db"
 
     with patch("text_to_sql_agent.pipeline.generate_sql", return_value="SELECT name FROM people"):
-        result = agent.ask_from_files(
-            "list people", [str(csv_path)], output_db_path=str(out_db)
-        )
+        result = agent.ask_from_files("list people", [str(csv_path)], output_db_path=str(out_db))
 
     assert result.ok, result.error
     assert result.rows == [("Alice",), ("Bob",)]
@@ -676,9 +672,7 @@ def test_repaired_sql_is_rechecked_for_safety(customers_db: str) -> None:
 
     assert not result.ok
     with closing(sqlite3.connect(customers_db)) as conn:
-        tables = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()
+        tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     assert ("customers",) in tables, "the table must still exist"
 ```
 
