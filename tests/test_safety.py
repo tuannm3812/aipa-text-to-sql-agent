@@ -60,6 +60,15 @@ DANGEROUS = [
     "SELECT * FROM pragma_table_list",
     "SELECT * FROM pragma_table_info('customers')",
     "SELECT * FROM SQLITE_MASTER",
+    # dbstat is also a table-valued function: calling it with an argument
+    # routes it through the Anonymous branch, which previously checked only
+    # the prefix set and never the name set dbstat belongs to.
+    "SELECT * FROM dbstat('main')",
+    # A quoted table-valued function name parses as an Identifier, not a
+    # str, so `.this` alone raised AttributeError instead of returning False.
+    "SELECT * FROM \"pragma_table_info\"('customers')",
+    "WITH x AS (SELECT * FROM dbstat('main')) SELECT * FROM x",
+    "SELECT * FROM dbstat('main') AS d",
 ]
 
 

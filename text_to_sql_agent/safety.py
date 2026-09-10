@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import re
 from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sqlglot import expressions as sqlglot_exp
 
 sqlglot: ModuleType | None
 exp: ModuleType | None
@@ -21,17 +24,22 @@ _INTERNAL_TABLE_PREFIXES = ("sqlite_", "pragma_")
 _INTERNAL_TABLE_NAMES = frozenset({"dbstat"})
 
 
-def _references_internals(parsed: Any) -> bool:
+def _references_internals(parsed: sqlglot_exp.Expression) -> bool:
     """True if the statement reads SQLite's own schema or statistics tables.
 
     Checked against parsed table nodes rather than the raw text, so a table
     genuinely called `my_sqlite_notes` is fine and the string literal
     `'sqlite_master'` is not mistaken for a table reference.
 
-    `parsed` is a `sqlglot.exp.Expression`, typed `Any` here because `exp` is
-    imported defensively (see the module-level try/except) and so cannot be
-    named as a static type; callers only ever reach this function after
-    `sqlglot`/`exp` have already been confirmed non-`None`.
+    The `sqlglot_exp` type is imported under `TYPE_CHECKING` only, since
+    `exp` itself is imported defensively (see the module-level try/except)
+    and is annotated `ModuleType | None`, so `exp.Expression` cannot be named
+    as a static type; `from __future__ import annotations` means this
+    annotation never evaluates at runtime, so the defensive import stays
+    intact when `sqlglot` is missing. The `if exp is None` guard below is
+    still required regardless: it protects attribute access on the runtime
+    *module* `exp`, not the type of the `parsed` parameter, and mypy cannot
+    see across the caller's own `exp is None` check in `_is_safe_ast`.
     """
     if exp is None:
         return False
@@ -40,9 +48,15 @@ def _references_internals(parsed: Any) -> bool:
         if name in _INTERNAL_TABLE_NAMES or name.startswith(_INTERNAL_TABLE_PREFIXES):
             return True
     # Table-valued functions such as pragma_table_info(...) parse as anonymous
-    # function calls, not as tables.
+    # function calls, not as tables. `.name` (not `.this`) is used here too,
+    # since it normalises both the bare form and a quoted name (an Identifier
+    # node) to a plain string the same way the Table branch above relies on -
+    # `.this` alone breaks on a quoted name and, for the bare form, misses
+    # that "dbstat" is also a table-valued function (dbstat('main')), which
+    # only the name-set check below (not just the prefix check) catches.
     for function in parsed.find_all(exp.Anonymous):
-        if (function.this or "").lower().startswith(_INTERNAL_TABLE_PREFIXES):
+        name = (function.name or "").lower()
+        if name in _INTERNAL_TABLE_NAMES or name.startswith(_INTERNAL_TABLE_PREFIXES):
             return True
     return False
 
