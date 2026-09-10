@@ -3021,11 +3021,11 @@
       "locked": false,
       "fontSize": 11,
       "fontFamily": 1,
-      "text": "docs/supporting/architecture \u2014 user tool workflow",
+      "text": "docs/diagrams/architecture \u2014 user tool workflow",
       "textAlign": "left",
       "verticalAlign": "top",
       "containerId": null,
-      "originalText": "docs/supporting/architecture \u2014 user tool workflow",
+      "originalText": "docs/diagrams/architecture \u2014 user tool workflow",
       "lineHeight": 1.25,
       "baseline": 11
     }

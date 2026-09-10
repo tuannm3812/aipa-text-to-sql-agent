@@ -44,7 +44,7 @@ Target length: 7 minutes presentation plus 1 minute Q&A.
 
 ### Slide 4: System Workflow
 
-Use exported diagram: `docs/supporting/architecture.drawio` -> `Presentation Architecture`.
+Use exported diagram: `docs/diagrams/architecture.drawio` -> `Presentation Architecture`.
 
 ```text
 User question

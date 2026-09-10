@@ -1762,6 +1762,31 @@ PY
 
 Expected: `ALL LINKS RESOLVE`. Fix every listed path before committing.
 
+**That checker is not sufficient on its own.** It only understands markdown
+`](...)` link syntax, so it is blind to paths written in backticks, in HTML
+`<code>` or `<text>` elements, and to strings baked into diagram sources. On the
+first run of this task it reported all links resolving while six stale
+`docs/supporting/` references survived — one in `docs/academic/presentation.md`,
+three in `docs/diagrams/architecture-workflow.html`, and two in the matching
+`text`/`originalText` pair inside `docs/diagrams/architecture-workflow.excalidraw`.
+
+So also grep for the old path as a plain string:
+
+```bash
+grep -rn "supporting/" --include="*.md" --include="*.drawio" --include="*.html" \
+  --include="*.excalidraw" . | grep -v "^./.git" | grep -v superpowers
+```
+
+The only acceptable surviving hit is `docs/3_decisions.md`, which describes the
+old layout in past tense as part of the decision record.
+
+When editing `.excalidraw`, an element's `text` and `originalText` must stay
+identical to each other, and the file must still parse:
+
+```bash
+uv run python -c "import json; json.load(open('docs/diagrams/architecture-workflow.excalidraw')); print('OK')"
+```
+
 - [ ] **Step 12: Commit**
 
 ```bash
