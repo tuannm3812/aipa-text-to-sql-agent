@@ -20,6 +20,14 @@ def test_describe_error_returns_a_human_message(code: str) -> None:
     assert len(message) > 20
 
 
+def test_describe_error_mentions_read_only_for_blocked_sql() -> None:
+    assert "read-only" in results.describe_error("BLOCKED_UNSAFE_SQL")
+
+
+def test_describe_error_mentions_schema_for_unanswerable() -> None:
+    assert "schema" in results.describe_error("UNANSWERABLE_WITH_GIVEN_SCHEMA")
+
+
 def test_describe_error_includes_the_row_cap_in_the_truncation_message() -> None:
     assert "1000" in results.describe_error("RESULT_TRUNCATED_TO_1000_ROWS")
 
