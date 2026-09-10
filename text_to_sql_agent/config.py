@@ -9,7 +9,11 @@ DEFAULT_MODEL_NAME = "gemini-2.5-flash"
 DEFAULT_OLLAMA_MODEL = "gemma3"
 DEFAULT_PROVIDER = "gemini"
 DEFAULT_MAX_ROWS = 1_000
-DEFAULT_SQLITE_PROGRESS_STEPS = 100_000
+# SQLite virtual-machine steps a single query may run before it is aborted.
+# This is a runaway-query guard for the hosted demo, where anyone can submit a
+# query: a cross join over a large table would otherwise run unbounded. All 12
+# gold evaluation cases complete well inside it. 0 disables the guard.
+DEFAULT_MAX_VM_STEPS = 100_000
 DEFAULT_RAG_TOP_K = 6
 DEFAULT_RAG_NEIGHBORS = 1
 DEFAULT_RAG_SEMANTIC_WEIGHT = 3.0

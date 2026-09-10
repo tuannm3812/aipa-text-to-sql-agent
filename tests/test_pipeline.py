@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
+from contextlib import closing
+from pathlib import Path
 from unittest.mock import patch
 
 import text_to_sql_agent as agent
@@ -40,3 +43,19 @@ def test_ask_database_executes_safe_generated_sql(customers_db: str) -> None:
     assert result.ok
     assert result.columns == ["name"]
     assert result.rows == [("Alice",)]
+
+
+def test_ask_database_does_not_repair_an_aborted_query(tmp_path: Path) -> None:
+    """An abort is a resource limit, not bad SQL - repairing it wastes an LLM call."""
+    db_path = tmp_path / "big.db"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("CREATE TABLE n (i INTEGER)")
+        conn.executemany("INSERT INTO n VALUES (?)", [(i,) for i in range(60_000)])
+        conn.commit()
+
+    runaway = "SELECT COUNT(*) FROM n a JOIN n b ON a.i = b.i"
+    with patch("text_to_sql_agent.pipeline.generate_sql", return_value=runaway) as gen:
+        result = agent.ask_database("count pairs", db_path=str(db_path))
+
+    assert gen.call_count == 1, "the repair path must not fire for an aborted query"
+    assert result.error == "QUERY_ABORTED_AFTER_100000_VM_STEPS"

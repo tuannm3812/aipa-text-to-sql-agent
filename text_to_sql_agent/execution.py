@@ -7,7 +7,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from .config import DEFAULT_MAX_ROWS, DEFAULT_SQLITE_PROGRESS_STEPS
+from .config import DEFAULT_MAX_ROWS, DEFAULT_MAX_VM_STEPS
 from .types import QueryResult
 
 
@@ -53,12 +53,21 @@ def _read_only_sqlite_connection(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _abort_query() -> int:
+    """SQLite progress handler: a non-zero return aborts the running query.
+
+    Installed with an interval of `max_vm_steps`, so the first callback ends a
+    query that exceeds the budget.
+    """
+    return 1
+
+
 def execute_query(
     db_path: str,
     sql_string: str,
     *,
     max_rows: int = DEFAULT_MAX_ROWS,
-    progress_steps: int = DEFAULT_SQLITE_PROGRESS_STEPS,
+    max_vm_steps: int = DEFAULT_MAX_VM_STEPS,
 ) -> QueryResult:
     """Execute a validated SELECT against SQLite with read-only protections.
 
@@ -66,24 +75,38 @@ def execute_query(
         db_path: Filesystem path to the SQLite database.
         sql_string: A query already cleared by `is_safe_query`.
         max_rows: Maximum rows returned before the result is marked truncated.
-        progress_steps: VM steps between progress-handler callbacks.
+        max_vm_steps: SQLite VM steps a query may run before it is aborted.
+            `0` disables the guard.
 
     Returns:
-        A `QueryResult`. Its `error` is set to `RESULT_TRUNCATED_TO_<n>_ROWS`
-        when more rows were available than `max_rows` allowed.
+        A `QueryResult`. Its `error` is `RESULT_TRUNCATED_TO_<n>_ROWS` when more
+        rows were available than `max_rows` allowed, or
+        `QUERY_ABORTED_AFTER_<n>_VM_STEPS` when the guard stopped the query.
 
     Raises:
         ValueError: If `max_rows` is less than 1.
+        sqlite3.OperationalError: For genuine SQL errors, such as a missing
+            table. Only the abort interrupt is converted to a returned error.
     """
     if max_rows < 1:
         raise ValueError("max_rows must be at least 1")
 
     with closing(_read_only_sqlite_connection(db_path)) as conn:
-        if progress_steps > 0:
-            conn.set_progress_handler(lambda: 1, progress_steps)
-        cur = conn.execute(sql_string)
-        rows = cur.fetchmany(max_rows + 1)
-        columns = [d[0] for d in cur.description] if cur.description else []
+        if max_vm_steps > 0:
+            conn.set_progress_handler(_abort_query, max_vm_steps)
+        try:
+            cur = conn.execute(sql_string)
+            rows = cur.fetchmany(max_rows + 1)
+            columns = [d[0] for d in cur.description] if cur.description else []
+        except sqlite3.OperationalError as exc:
+            if "interrupted" not in str(exc).lower():
+                raise
+            return QueryResult(
+                columns=[],
+                rows=[],
+                sql=sql_string,
+                error=f"QUERY_ABORTED_AFTER_{max_vm_steps}_VM_STEPS",
+            )
         capped_rows = rows[:max_rows]
         if len(rows) > max_rows:
             return QueryResult(

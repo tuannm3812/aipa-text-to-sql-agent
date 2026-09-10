@@ -7,6 +7,7 @@ generation, safety validation, and query execution.
 
 from .config import (
     DEFAULT_MAX_ROWS,
+    DEFAULT_MAX_VM_STEPS,
     DEFAULT_MODEL_NAME,
     DEFAULT_OLLAMA_MODEL,
     DEFAULT_PROVIDER,
@@ -14,7 +15,6 @@ from .config import (
     DEFAULT_RAG_NEIGHBORS,
     DEFAULT_RAG_SEMANTIC_WEIGHT,
     DEFAULT_RAG_TOP_K,
-    DEFAULT_SQLITE_PROGRESS_STEPS,
     DEFAULT_VALUE_HINT_LIMIT,
     DEFAULT_VALUE_HINT_MAX_CARDINALITY,
     RAG_SYNONYMS,
@@ -32,6 +32,7 @@ from .types import QueryResult, SchemaChunk, SchemaRetrievalResult
 
 __all__ = [
     "DEFAULT_MAX_ROWS",
+    "DEFAULT_MAX_VM_STEPS",
     "DEFAULT_MODEL_NAME",
     "DEFAULT_OLLAMA_MODEL",
     "DEFAULT_PROVIDER",
@@ -39,7 +40,6 @@ __all__ = [
     "DEFAULT_RAG_NEIGHBORS",
     "DEFAULT_RAG_SEMANTIC_WEIGHT",
     "DEFAULT_RAG_TOP_K",
-    "DEFAULT_SQLITE_PROGRESS_STEPS",
     "DEFAULT_VALUE_HINT_LIMIT",
     "DEFAULT_VALUE_HINT_MAX_CARDINALITY",
     "QueryResult",
