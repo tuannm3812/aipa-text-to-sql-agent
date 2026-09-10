@@ -28,8 +28,10 @@ RAG_SYNONYMS = {
     "region": ["location", "area"],
 }
 
+# fmt: off
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "by", "for", "from", "how", "in",
     "is", "it", "me", "of", "on", "or", "per", "show", "the", "to", "total",
     "what", "which", "with",
 }
+# fmt: on

@@ -60,6 +60,7 @@ def _load_gemini_sdk() -> tuple[str, Any, Any | None]:
     try:
         from google import genai  # type: ignore
         from google.genai import types  # type: ignore
+
         return "google-genai", genai, types
     except ModuleNotFoundError as e:  # pragma: no cover
         try:
@@ -73,8 +74,8 @@ def _load_gemini_sdk() -> tuple[str, Any, Any | None]:
 
 def _load_ollama_sdk() -> tuple[Any, Any, Any]:
     try:
-        from langchain_ollama import ChatOllama  # type: ignore
         from langchain_core.messages import HumanMessage, SystemMessage  # type: ignore
+        from langchain_ollama import ChatOllama  # type: ignore
     except ModuleNotFoundError as e:  # pragma: no cover
         raise ModuleNotFoundError(
             "Ollama support requires langchain-ollama and langchain-core. "
@@ -98,7 +99,7 @@ def _extract_sql_from_text(raw_output: str) -> str:
 
     match = re.search(r"(?is)\b(SELECT|WITH)\b.*?;?$", raw_output)
     if match:
-        return raw_output[match.start():].strip()
+        return raw_output[match.start() :].strip()
     return raw_output
 
 
@@ -111,7 +112,9 @@ def generate_sql(
 ) -> str:
     """Call Gemini or Ollama to generate SQLite SQL from a question and schema."""
     load_env()
-    selected_provider = (provider or os.environ.get("TEXT_TO_SQL_PROVIDER") or DEFAULT_PROVIDER).strip().lower()
+    selected_provider = (
+        (provider or os.environ.get("TEXT_TO_SQL_PROVIDER") or DEFAULT_PROVIDER).strip().lower()
+    )
     prompt = f"""\
 ### SQLite schema (DDL)
 {schema_text}

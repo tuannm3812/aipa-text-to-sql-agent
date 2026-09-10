@@ -96,7 +96,7 @@ class GeminiManager:
         self.index %= len(self.keys)
 
     @classmethod
-    def from_env(cls) -> "GeminiManager":
+    def from_env(cls) -> GeminiManager:
         return cls(load_google_api_keys())
 
     @property

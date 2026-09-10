@@ -12,7 +12,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-import text_to_sql_agent_mvp as agent
+import text_to_sql_agent_mvp as agent  # noqa: E402 - import must follow the sys.path insert above
 
 RETRYABLE_ERROR_MARKERS = (
     "429",
@@ -73,7 +73,7 @@ def _run_llm(
         retryable = any(marker.lower() in error_text for marker in RETRYABLE_ERROR_MARKERS)
         if not retryable or attempt >= max_retries:
             return sql, result
-        sleep_for = retry_base_seconds * (2 ** attempt)
+        sleep_for = retry_base_seconds * (2**attempt)
         print(f"Retryable LLM error for {case['id']}; sleeping {sleep_for:.0f}s before retry...")
         time.sleep(sleep_for)
         attempt += 1
@@ -115,9 +115,7 @@ def evaluate_case(
         and gold_result.error is None
         and _value_rows_match(result.rows, gold_result.rows)
     )
-    exact_result_match = (
-        rows_match and result.columns == gold_result.columns
-    )
+    exact_result_match = rows_match and result.columns == gold_result.columns
     expected_tables = set(case.get("expected_tables", []))
     retrieved_tables: set[str] = set()
     rag_context = agent.retrieve_schema_context(
@@ -167,9 +165,13 @@ def write_markdown(rows: list[dict[str, Any]], output_path: Path) -> None:
     safe = sum(1 for row in rows if row["safe_sql"])
     executed = sum(1 for row in rows if row["execution_ok"])
     avg_latency = round(sum(float(row["latency_ms"]) for row in rows) / total, 2) if total else 0
-    recall_values = [float(row["schema_table_recall"]) for row in rows if row["schema_table_recall"] != ""]
+    recall_values = [
+        float(row["schema_table_recall"]) for row in rows if row["schema_table_recall"] != ""
+    ]
     avg_recall = round(sum(recall_values) / len(recall_values), 3) if recall_values else 0
-    avg_prompt_saved = round(sum(float(row["prompt_saved_pct"]) for row in rows) / total, 1) if total else 0
+    avg_prompt_saved = (
+        round(sum(float(row["prompt_saved_pct"]) for row in rows) / total, 1) if total else 0
+    )
 
     lines = [
         "# Text-to-SQL Evaluation Results",
@@ -184,7 +186,8 @@ def write_markdown(rows: list[dict[str, Any]], output_path: Path) -> None:
         f"- Average prompt schema saved: {avg_prompt_saved}%",
         f"- Average latency: {avg_latency} ms",
         "",
-        "| Case | Dataset | Difficulty | Safe | Executed | Value Match | Row Match | Exact Match | Schema Recall | Prompt Saved | Latency ms |",
+        "| Case | Dataset | Difficulty | Safe | Executed | Value Match | Row Match | "
+        "Exact Match | Schema Recall | Prompt Saved | Latency ms |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
@@ -197,7 +200,9 @@ def write_markdown(rows: list[dict[str, Any]], output_path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate Text-to-SQL generation against gold SQL results.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate Text-to-SQL generation against gold SQL results."
+    )
     parser.add_argument("--cases", default="evaluation/cases.json")
     parser.add_argument("--mode", choices=["gold", "llm"], default="gold")
     parser.add_argument("--provider", choices=["gemini", "ollama"], default=agent.DEFAULT_PROVIDER)

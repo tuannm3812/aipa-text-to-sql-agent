@@ -39,7 +39,9 @@ def create_dummy_university_data(seed: int = 7) -> dict[str, pd.DataFrame]:
     grade_scale = ["HD", "D", "C", "P", "F"]
     enroll_rows: list[dict[str, Any]] = []
     for student_id in students["student_id"].tolist():
-        course_choices = [courses.loc[(student_id + k) % len(courses), "course_id"] for k in (0, 2, 4)]
+        course_choices = [
+            courses.loc[(student_id + k) % len(courses), "course_id"] for k in (0, 2, 4)
+        ]
         for course_id in course_choices:
             enroll_rows.append(
                 {
@@ -50,7 +52,9 @@ def create_dummy_university_data(seed: int = 7) -> dict[str, pd.DataFrame]:
                     "score": int(55 + ((student_id * 7 + int(course_id)) % 46)),
                 }
             )
-    grades = pd.DataFrame(enroll_rows).sort_values(["student_id", "course_id"]).reset_index(drop=True)
+    grades = (
+        pd.DataFrame(enroll_rows).sort_values(["student_id", "course_id"]).reset_index(drop=True)
+    )
     return {"students": students, "courses": courses, "grades": grades}
 
 

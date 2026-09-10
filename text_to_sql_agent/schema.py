@@ -40,11 +40,14 @@ def _value_hints_for_table(
     hints: dict[str, list[str]] = {}
     quoted_table = _quote_identifier(table_name)
     for column_name, column_type in columns:
-        if column_type and not any(token in column_type.upper() for token in ("CHAR", "TEXT", "CLOB")):
+        if column_type and not any(
+            token in column_type.upper() for token in ("CHAR", "TEXT", "CLOB")
+        ):
             continue
         quoted_column = _quote_identifier(column_name)
         cardinality = conn.execute(
-            f"SELECT COUNT(DISTINCT {quoted_column}) FROM {quoted_table} WHERE {quoted_column} IS NOT NULL"
+            f"SELECT COUNT(DISTINCT {quoted_column}) FROM {quoted_table} "
+            f"WHERE {quoted_column} IS NOT NULL"
         ).fetchone()[0]
         if cardinality is None or cardinality < 1 or cardinality > max_cardinality:
             continue
@@ -92,13 +95,17 @@ def _build_schema_chunks(db_path: str) -> list[SchemaChunk]:
 
         chunks: list[SchemaChunk] = []
         for table_name, ddl in table_rows:
-            table_info = conn.execute(f"PRAGMA table_info({_quote_identifier(table_name)})").fetchall()
+            table_info = conn.execute(
+                f"PRAGMA table_info({_quote_identifier(table_name)})"
+            ).fetchall()
             columns = [row[1] for row in table_info]
             typed_columns = [(row[1], row[2] or "") for row in table_info]
             foreign_tables = sorted(
                 {
                     row[2]
-                    for row in conn.execute(f"PRAGMA foreign_key_list({_quote_identifier(table_name)})").fetchall()
+                    for row in conn.execute(
+                        f"PRAGMA foreign_key_list({_quote_identifier(table_name)})"
+                    ).fetchall()
                     if row[2]
                 }
             )

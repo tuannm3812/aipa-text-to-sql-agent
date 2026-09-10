@@ -75,7 +75,7 @@ def _hashed_embedding(text: str, *, dimensions: int = 256) -> list[float]:
 def _cosine_vector_similarity(left: list[float], right: list[float]) -> float:
     if not left or not right:
         return 0.0
-    return sum(l * r for l, r in zip(left, right))
+    return sum(a * b for a, b in zip(left, right, strict=False))
 
 
 def _schema_prompt_chars(chunks: list[SchemaChunk]) -> int:
@@ -198,7 +198,7 @@ def retrieve_schema_context(
     query_counter = Counter(expanded_tokens)
     query_embedding = _hashed_embedding(" ".join(expanded_tokens) or question)
     scored: list[SchemaChunk] = []
-    for chunk, tokens, doc_len in zip(chunks, doc_tokens, doc_lengths):
+    for chunk, tokens, doc_len in zip(chunks, doc_tokens, doc_lengths, strict=False):
         token_counts = Counter(tokens)
         table_tokens = set(_tokenize_for_rag(chunk.table_name))
         column_tokens = set(_tokenize_for_rag(" ".join(chunk.columns)))
@@ -236,7 +236,9 @@ def retrieve_schema_context(
             score += semantic_weight * semantic_score
             reasons.append(f"semantic similarity: {semantic_score:.2f}")
 
-        embedding_score = _cosine_vector_similarity(query_embedding, _hashed_embedding(chunk.search_text))
+        embedding_score = _cosine_vector_similarity(
+            query_embedding, _hashed_embedding(chunk.search_text)
+        )
         if embedding_score > 0:
             score += embedding_weight * embedding_score
             reasons.append(f"embedding similarity: {embedding_score:.2f}")

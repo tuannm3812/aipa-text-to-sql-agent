@@ -1,4 +1,4 @@
-﻿"""
+"""
 Streamlit UI for the Text-to-SQL agent (`text_to_sql_agent_mvp`).
 
 Run locally:
@@ -162,7 +162,10 @@ def _model_name_for_provider(provider: str) -> str:
     selected = st.session_state.get("sb_model_choice", "")
     if selected == "Custom":
         return (st.session_state.get("sb_custom_model") or "").strip()
-    return str(selected or (backend.DEFAULT_MODEL_NAME if provider == "gemini" else backend.DEFAULT_OLLAMA_MODEL))
+    return str(
+        selected
+        or (backend.DEFAULT_MODEL_NAME if provider == "gemini" else backend.DEFAULT_OLLAMA_MODEL)
+    )
 
 
 def _write_uploaded_db(uploaded) -> str:
@@ -240,9 +243,7 @@ def _active_db_path() -> str | None:
         try:
             csv_paths = _write_uploaded_csvs(list(files))
             out_db = Path(tempfile.gettempdir()) / f"ingested_{uuid.uuid4().hex}.db"
-            st.session_state["_csv_db_path"] = backend.ingest_csvs_to_db(
-                csv_paths, str(out_db)
-            )
+            st.session_state["_csv_db_path"] = backend.ingest_csvs_to_db(csv_paths, str(out_db))
             st.session_state["_csv_sig"] = sig
         except Exception:
             st.session_state["_csv_db_path"] = None
@@ -409,7 +410,9 @@ def main() -> None:
         )
 
         model_options = GEMINI_MODELS if provider == "gemini" else OLLAMA_MODELS
-        default_model = backend.DEFAULT_MODEL_NAME if provider == "gemini" else backend.DEFAULT_OLLAMA_MODEL
+        default_model = (
+            backend.DEFAULT_MODEL_NAME if provider == "gemini" else backend.DEFAULT_OLLAMA_MODEL
+        )
         default_index = model_options.index(default_model) if default_model in model_options else 0
         st.selectbox(
             "Model",
@@ -445,7 +448,9 @@ def main() -> None:
         if provider == "gemini" and key_ok:
             st.success("Gemini API key loaded", icon=":material/check_circle:")
         elif provider == "gemini":
-            st.warning("Add a key above, in `.env`, or in Streamlit secrets.", icon=":material/warning:")
+            st.warning(
+                "Add a key above, in `.env`, or in Streamlit secrets.", icon=":material/warning:"
+            )
         else:
             st.info("Using local Ollama. Make sure Ollama is running.")
 
@@ -463,7 +468,6 @@ def main() -> None:
             key="sb_rag_top_k",
             disabled=not use_rag,
         )
-
 
         st.divider()
         st.markdown("**Database**")
@@ -533,7 +537,10 @@ def main() -> None:
                 "Mode",
                 ["Gold SQL baseline", "Selected LLM"],
                 key="sb_eval_mode",
-                help="Gold SQL validates the benchmark. Selected LLM compares model output with gold query results.",
+                help=(
+                    "Gold SQL validates the benchmark. Selected LLM compares model "
+                    "output with gold query results."
+                ),
             )
             if st.button("Run benchmark", use_container_width=True):
                 if eval_mode == "Selected LLM" and not key_ok:
@@ -561,8 +568,10 @@ def main() -> None:
         st.sidebar.error(f"Ingestion failed: {e}")
 
     st.markdown(
-        "<p style='font-size:1.65rem;font-weight:600;margin-bottom:0.15rem;color:#141413;'>Text-to-SQL</p>"
-        "<p style='font-size:0.95rem;color:#6b6b6b;margin-top:0;'>Ask questions about your connected database.</p>",
+        "<p style='font-size:1.65rem;font-weight:600;margin-bottom:0.15rem;"
+        "color:#141413;'>Text-to-SQL</p>"
+        "<p style='font-size:0.95rem;color:#6b6b6b;margin-top:0;'>"
+        "Ask questions about your connected database.</p>",
         unsafe_allow_html=True,
     )
 
@@ -576,7 +585,9 @@ def main() -> None:
             key="main_sample_question",
             label_visibility="collapsed",
         )
-        if sample_prompt and st.button("Use sample question", type="secondary", disabled=not key_ok):
+        if sample_prompt and st.button(
+            "Use sample question", type="secondary", disabled=not key_ok
+        ):
             st.session_state.messages.append({"role": "user", "content": sample_prompt})
             with st.spinner("Generating SQL and running query..."):
                 sql_text, result = backend.ask_database_with_sql(
@@ -616,12 +627,14 @@ def main() -> None:
 
     eval_df = st.session_state.get("evaluation_df")
     if isinstance(eval_df, pd.DataFrame) and not eval_df.empty:
-        with st.expander(f"Evaluation summary - {st.session_state.get('evaluation_mode', 'Benchmark')}", expanded=True):
+        with st.expander(
+            f"Evaluation summary - {st.session_state.get('evaluation_mode', 'Benchmark')}",
+            expanded=True,
+        ):
             total = len(eval_df)
             safe = int(eval_df["safe_sql"].sum())
             executed = int(eval_df["executed"].sum())
             value = int(eval_df["value_match"].sum())
-            exact = int(eval_df["exact_match"].sum())
             avg_latency = float(eval_df["latency_ms"].mean())
             avg_recall = float(eval_df["schema_recall"].mean())
             avg_saved = float(eval_df["prompt_saved_pct"].mean())
@@ -634,7 +647,14 @@ def main() -> None:
             st.caption(f"Average latency: {avg_latency:.0f} ms")
             st.dataframe(eval_df, use_container_width=True, hide_index=True)
             recall_df = eval_df[
-                ["case", "dataset", "schema_recall", "prompt_saved_pct", "expected_tables", "retrieved_tables"]
+                [
+                    "case",
+                    "dataset",
+                    "schema_recall",
+                    "prompt_saved_pct",
+                    "expected_tables",
+                    "retrieved_tables",
+                ]
             ]
             st.bar_chart(recall_df.set_index("case")["schema_recall"])
             with st.expander("Schema recall details", expanded=False):
@@ -682,8 +702,11 @@ def main() -> None:
             sql_text, result = backend.ask_database_with_sql(
                 prompt.strip(),
                 db_path=db_path_to_query,
-                model_name=(model_name or "").strip() or (
-                    backend.DEFAULT_MODEL_NAME if provider == "gemini" else backend.DEFAULT_OLLAMA_MODEL
+                model_name=(model_name or "").strip()
+                or (
+                    backend.DEFAULT_MODEL_NAME
+                    if provider == "gemini"
+                    else backend.DEFAULT_OLLAMA_MODEL
                 ),
                 provider=provider,
                 use_rag=use_rag,

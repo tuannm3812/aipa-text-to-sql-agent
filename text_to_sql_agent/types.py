@@ -70,7 +70,8 @@ class SchemaRetrievalResult:
             f"Schema RAG strategy: {self.strategy}",
             f"Query tokens: {', '.join(self.query_tokens) or '(none)'}",
             f"Expanded tokens: {', '.join(self.expanded_tokens) or '(none)'}",
-            f"Prompt schema chars: {self.retrieved_schema_chars}/{self.full_schema_chars} saved={self.prompt_savings_pct}%",
+            f"Prompt schema chars: {self.retrieved_schema_chars}/{self.full_schema_chars} "
+            f"saved={self.prompt_savings_pct}%",
             f"Cache hit: {self.cache_hit}",
             "",
             "Query decomposition:",

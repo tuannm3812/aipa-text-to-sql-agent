@@ -83,7 +83,9 @@ def ask_database_with_sql(
         return "", QueryResult(columns=[], rows=[], error=f"{type(e).__name__}: {e}")
 
     if "UNANSWERABLE_WITH_GIVEN_SCHEMA" in sql:
-        return sql, QueryResult(columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA")
+        return sql, QueryResult(
+            columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA"
+        )
     if not is_safe_query(sql):
         return sql, QueryResult(columns=[], rows=[], sql=sql, error="BLOCKED_UNSAFE_SQL")
 
