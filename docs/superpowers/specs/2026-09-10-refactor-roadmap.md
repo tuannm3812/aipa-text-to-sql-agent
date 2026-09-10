@@ -32,6 +32,11 @@ Recorded in `docs/0_coding_standards.md`.
 
 ## Known defects driving the plan
 
+Line counts and figures below were measured on 2026-09-10, before any phase ran.
+Phase 1's `ruff format` pass changed some of them — `app.py` grew from 736 to 759
+lines when long lines were wrapped at width 100. `docs/4_next_steps.md` carries
+the current figures; this table is the historical record that motivated the plan.
+
 | # | Location | Defect |
 |---|----------|--------|
 | 1 | `text_to_sql_agent/safety.py:12-27` | The dangerous-keyword regex rejects legitimate SQL. `REPLACE(...)` is a standard SQLite string function, and any string literal containing `update`, `delete`, or `create` trips the same check. The sqlglot AST check on the following lines already enforces read-only correctly. |
@@ -44,7 +49,7 @@ Recorded in `docs/0_coding_standards.md`.
 | 8 | Repository root | No `AGENTS.md` and no `CLAUDE.md`, so no session in this repo loads the master standard (master §13, layer 2 missing entirely). |
 | 9 | `.gitignore` | No rule covers `data/`. Six demo fixtures totalling ~212 kB are tracked with nothing marking them as a deliberate exception, so master §8 cannot be audited here. |
 | 10 | `docs/` | Uses ad hoc `academic/` and `supporting/` folders rather than the Shape B numbering of master §2. |
-| 11 | `text_to_sql_agent_mvp.py` vs `text_to_sql_agent/pipeline.py` | The "compatibility shim" is a byte-identical copy of `pipeline.py` apart from three docstrings — about 170 duplicated lines. The tests patch and exercise the shim's copy, so `pipeline.py`'s `ask_database` has no coverage at all, and a fix applied there would not reach the code under test. Verified 2026-09-11. |
+| 11 | `text_to_sql_agent_mvp.py` vs `text_to_sql_agent/pipeline.py` | The "compatibility shim" is a byte-identical copy of `pipeline.py` apart from its module docstring and the three function docstrings — about 170 duplicated lines. The tests patch and exercise the shim's copy, so `pipeline.py`'s `ask_database` has no coverage at all, and a fix applied there would not reach the code under test. Verified 2026-09-11. |
 
 ## Phases
 

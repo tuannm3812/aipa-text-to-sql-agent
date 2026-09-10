@@ -225,8 +225,8 @@ Delete `text_to_sql_agent_mvp.py` and repoint its four importers at the package:
 The shim re-exports the package with `from text_to_sql_agent import *`, then
 **reimplements** `ask_database`, `ask_database_with_sql`, `ask_from_files`, and
 `_repair_sql`. Verified 2026-09-11: its body is byte-identical to
-`text_to_sql_agent/pipeline.py` apart from three docstrings — roughly 170
-duplicated lines. This is worse than an indirection. A fix applied to
+`text_to_sql_agent/pipeline.py` apart from its module docstring and the three
+function docstrings — roughly 170 duplicated lines. This is worse than an indirection. A fix applied to
 `pipeline.py` would silently not apply to the code the tests actually run.
 
 It exists for exactly one reason, stated in its own docstring: "remains
