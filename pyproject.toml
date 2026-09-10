@@ -1,0 +1,73 @@
+[project]
+name = "aipa-text-to-sql-agent"
+version = "0.1.0"
+description = "Enterprise Text-to-SQL agent: natural language to safe, read-only SQLite queries."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "google-genai>=1.0,<2",
+  "langchain-core>=0.3,<0.4",
+  "langchain-ollama>=0.2,<0.3",
+  "pandas>=2.1,<3",
+  "python-dotenv>=1.0,<2",
+  "sqlglot>=25,<28",
+  "streamlit>=1.28,<2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["text_to_sql_agent"]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.11",
+  "pytest>=8",
+  "ruff==0.16.4",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"*.ipynb" = ["E501", "D"]
+"tests/*" = ["D"]
+"app.py" = ["D"]
+"scripts/*" = ["D"]
+# Long lines in llm.py are inside SQL_TRANSLATION_SYSTEM_PROMPT. A line break
+# there is content the model reads, so rewrapping would change behaviour.
+"text_to_sql_agent/llm.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["text_to_sql_agent"]
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["google.genai.*", "langchain_ollama.*", "sqlglot.*"]
+ignore_missing_imports = true
+
+# pandas ships no type stubs. numpy's bundled stubs use PEP 695 `type`
+# statements that only parse under python_version >= 3.12, which is why
+# [tool.mypy] targets 3.12 while requires-python still allows 3.11 - ruff's
+# target-version = "py311" and the CI test matrix are what actually hold the
+# 3.11 floor.
+[[tool.mypy.overrides]]
+module = ["pandas.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-q"

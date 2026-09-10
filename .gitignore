@@ -226,3 +226,18 @@ data/audit_log.jsonl
 
 # Subagent-driven development scratch (controller ledger, task briefs, reviews)
 .superpowers/
+# macOS
+.DS_Store
+
+# Demo fixtures (master coding standard §8: ignore the class, negate the
+# exceptions). These six files are tracked deliberately - app.py offers them as
+# the built-in demo databases and evaluation/cases.json runs against them, so
+# the hosted demo is non-functional without them.
+data/**/*.db
+data/**/*.csv
+!data/customers.csv
+!data/sales.csv
+!data/dynamic_agent.db
+!data/healthcare_analytics.db
+!data/retail_analytics.db
+!data/university_agent.db
