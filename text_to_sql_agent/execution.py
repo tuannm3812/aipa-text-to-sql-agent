@@ -99,7 +99,11 @@ def execute_query(
             rows = cur.fetchmany(max_rows + 1)
             columns = [d[0] for d in cur.description] if cur.description else []
         except sqlite3.OperationalError as exc:
-            if "interrupted" not in str(exc).lower():
+            # SQLite's own error code identifies the interrupt directly, so
+            # this is immune to any future change in the error message's
+            # wording (`sqlite_errorcode` is populated on Python >= 3.11,
+            # which this project requires).
+            if exc.sqlite_errorcode != sqlite3.SQLITE_INTERRUPT:
                 raise
             return QueryResult(
                 columns=[],

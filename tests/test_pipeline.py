@@ -59,3 +59,20 @@ def test_ask_database_does_not_repair_an_aborted_query(tmp_path: Path) -> None:
 
     assert gen.call_count == 1, "the repair path must not fire for an aborted query"
     assert result.error == "QUERY_ABORTED_AFTER_100000_VM_STEPS"
+
+
+def test_ask_database_with_sql_does_not_repair_an_aborted_query(tmp_path: Path) -> None:
+    """`ask_database_with_sql` shares the same abort path and must not repair it either."""
+    db_path = tmp_path / "big.db"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("CREATE TABLE n (i INTEGER)")
+        conn.executemany("INSERT INTO n VALUES (?)", [(i,) for i in range(60_000)])
+        conn.commit()
+
+    runaway = "SELECT COUNT(*) FROM n a JOIN n b ON a.i = b.i"
+    with patch("text_to_sql_agent.pipeline.generate_sql", return_value=runaway) as gen:
+        sql, result = agent.ask_database_with_sql("count pairs", db_path=str(db_path))
+
+    assert gen.call_count == 1, "the repair path must not fire for an aborted query"
+    assert sql == runaway
+    assert result.error == "QUERY_ABORTED_AFTER_100000_VM_STEPS"
