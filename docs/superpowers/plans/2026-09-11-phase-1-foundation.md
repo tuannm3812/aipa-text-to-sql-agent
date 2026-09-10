@@ -1017,7 +1017,28 @@ print('APP API OK')
 
 Expected: `used: 12 missing: []` then `APP API OK`.
 
-- [ ] **Step 7: Update the notebook's import cell**
+- [ ] **Step 7: Update the notebook's import cell AND its mock target**
+
+The notebook does not only import the shim — cell index 13 also patches
+`generate_sql` the same way the tests did:
+
+```python
+with patch.object(agent, "generate_sql", return_value=patched_sql):
+```
+
+Once `agent` is the package, that stops reaching
+`pipeline.ask_database_with_sql`'s call site, exactly as in the tests. The
+failure is silent: `pipeline.py` swallows the resulting exception into
+`QueryResult.error`, so the cell yields `''` for the SQL plus
+`ValueError: No Gemini API key found` rather than erroring loudly. None of the
+four gates catch this — ruff, mypy and pytest never execute a notebook.
+
+Change it to `patch("text_to_sql_agent.pipeline.generate_sql", ...)`.
+
+This does **not** require re-running the notebook or clearing its outputs.
+Verified 2026-09-11: the corrected patch reproduces cell 13's saved output
+byte-for-byte, because the patched path never calls an LLM and is fully
+deterministic. The fix makes the saved outputs more accurate, not less.
 
 In `text_to_sql_agent_mvp.ipynb`, change the source line
 `import text_to_sql_agent_mvp as agent` to `import text_to_sql_agent as agent`.
@@ -1118,7 +1139,7 @@ the package attribute does not reach the call site. The three affected
 tests now patch text_to_sql_agent.pipeline.generate_sql directly, which
 removes the reason for the shim.
 
-Net effect on coverage is positive: the four ask_database tests were
+Net effect on coverage is positive: the three ask_database tests were
 exercising the shim's copy, so pipeline.py had no coverage at all before
 this commit.
 
@@ -1478,7 +1499,21 @@ Expected from the final `ls`: `screenshots.md` only. Merge its content into
 `docs/2_architecture.md` as a "Screenshots" section, then
 `git rm docs/supporting/screenshots.md` and `rmdir docs/supporting`.
 
-- [ ] **Step 2: Find every link the move broke**
+- [ ] **Step 2: Fix the stale shim reference in the architecture diagram**
+
+`docs/supporting/architecture.drawio:256` labels a box
+`text_to_sql_agent_mvp.py — Compatibility wrapper for old imports and tests`.
+That module no longer exists. It is XML, not markdown, so a grep for `*.md`
+misses it. Retitle the box to describe `text_to_sql_agent/pipeline.py`, which
+absorbed that role, or delete it if the diagram reads correctly without it.
+
+Check the other diagram sources for the same string before moving on:
+
+```bash
+grep -rln "text_to_sql_agent_mvp" docs/ --include="*.drawio" --include="*.excalidraw" --include="*.html"
+```
+
+- [ ] **Step 3: Find every link the move broke**
 
 ```bash
 grep -rn "docs/supporting\|supporting/" --include="*.md" . | grep -v "^./docs/superpowers"
@@ -1488,7 +1523,7 @@ Fix each hit. Expected locations: `README.md` (screenshot table near the top, th
 architecture image, and the deeper-diagram sentence), `docs/2_architecture.md`
 (its own relative image paths), and `docs/academic/report.md`.
 
-- [ ] **Step 3: Fix the three stale shim references**
+- [ ] **Step 4: Fix the three stale shim references**
 
 `README.md:174` — the setup command:
 
@@ -1505,12 +1540,12 @@ python -c "import text_to_sql_agent as a; a.write_university_db('data/university
 tests, and Streamlit app." and replace it with: "The Streamlit app, the notebook,
 and the test suite all import the package directly."
 
-- [ ] **Step 4: Fix the Python version claim**
+- [ ] **Step 5: Fix the Python version claim**
 
 `README.md` badge and prose say Python 3.10+. `pyproject.toml` now requires
 `>=3.11,<3.14`. Change the badge URL to `Python-3.11%2B` and any prose to 3.11+.
 
-- [ ] **Step 5: Write `docs/1_brief.md`**
+- [ ] **Step 6: Write `docs/1_brief.md`**
 
 ```markdown
 # Brief
@@ -1540,7 +1575,7 @@ Timestamped 2026-09-11. See `docs/superpowers/specs/2026-09-10-refactor-roadmap.
 for the phased plan and `docs/4_next_steps.md` for what remains.
 ```
 
-- [ ] **Step 6: Write `docs/3_decisions.md`**
+- [ ] **Step 7: Write `docs/3_decisions.md`**
 
 Seed it with the decisions the spec already recorded, dated:
 
@@ -1596,7 +1631,7 @@ the five-phase roadmap is. Doing it now costs one commit; doing it after Phases
 2-5 would churn far more links.
 ```
 
-- [ ] **Step 7: Write `docs/4_next_steps.md`**
+- [ ] **Step 8: Write `docs/4_next_steps.md`**
 
 ```markdown
 # Next Steps
@@ -1651,7 +1686,7 @@ Anything suppressed during Phase 1 with a `# noqa: ... # Phase 2` or
 `grep -rn "Phase 2" --include="*.py" .`
 ```
 
-- [ ] **Step 8: Write `docs/6_agent_log.md`**
+- [ ] **Step 9: Write `docs/6_agent_log.md`**
 
 Append-only from here on — master §13 says correct a past entry by adding a new
 one, never by rewriting it.
@@ -1690,7 +1725,7 @@ all left untouched by design; this phase changed no behaviour.
 has confirmed it; do not "fix" it in Phase 2 without deciding that first.
 ```
 
-- [ ] **Step 9: Verify no dead links remain**
+- [ ] **Step 10: Verify no dead links remain**
 
 ```bash
 uv run python - <<'PY'
@@ -1710,7 +1745,7 @@ PY
 
 Expected: `ALL LINKS RESOLVE`. Fix every listed path before committing.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git status --short
