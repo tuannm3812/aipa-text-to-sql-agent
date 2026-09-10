@@ -2,6 +2,17 @@
 
 from __future__ import annotations
 
+from typing import TypedDict
+
+
+class DemoDatabase(TypedDict):
+    """One demo database entry: where it lives and how to talk about it."""
+
+    path: str
+    description: str
+    questions: list[str]
+
+
 GEMINI_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-pro",
@@ -19,7 +30,7 @@ OLLAMA_MODELS = [
     "Custom",
 ]
 
-DEMO_DATABASES = {
+DEMO_DATABASES: dict[str, DemoDatabase] = {
     "University": {
         "path": "data/university_agent.db",
         "description": "Students, courses, grades, majors",

@@ -8,12 +8,13 @@ import uuid
 from pathlib import Path
 
 import streamlit as st
+from streamlit.runtime.uploaded_file_manager import UploadedFile
 
 import text_to_sql_agent as backend
 from ui.constants import DEMO_DATABASES
 
 
-def write_uploaded_db(uploaded) -> str:
+def write_uploaded_db(uploaded: UploadedFile) -> str:
     """Write an uploaded `.db` file to a temp path and return that path."""
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
@@ -65,13 +66,13 @@ def active_db_path() -> str | None:
     files = st.session_state.get("sb_upload_csv")
     if not files:
         return None
-    sig = tuple(sorted((f.name, getattr(f, "size", 0)) for f in files))
-    if st.session_state.get("_csv_sig") != sig:
+    csv_sig = tuple(sorted((f.name, getattr(f, "size", 0)) for f in files))
+    if st.session_state.get("_csv_sig") != csv_sig:
         try:
             csv_paths = write_uploaded_csvs(list(files))
             out_db = Path(tempfile.gettempdir()) / f"ingested_{uuid.uuid4().hex}.db"
             st.session_state["_csv_db_path"] = backend.ingest_csvs_to_db(csv_paths, str(out_db))
-            st.session_state["_csv_sig"] = sig
+            st.session_state["_csv_sig"] = csv_sig
         except Exception:
             st.session_state["_csv_db_path"] = None
             st.session_state["_csv_sig"] = None

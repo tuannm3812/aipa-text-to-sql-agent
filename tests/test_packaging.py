@@ -39,3 +39,15 @@ def test_requirements_txt_covers_every_runtime_dependency() -> None:
         f"requirements.txt is stale, missing {sorted(missing)}. Regenerate with: "
         "uv export --no-hashes --no-dev --no-emit-project -o requirements.txt"
     )
+
+
+def test_mypy_covers_the_presentation_layer() -> None:
+    """app.py and ui/ must stay in mypy's scope.
+
+    Narrowing this back to the package alone would let a rename in
+    __all__ rot `backend.<name>` in app.py with every gate still green.
+    """
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    files = pyproject["tool"]["mypy"]["files"]
+    for required in ("text_to_sql_agent", "ui", "app.py"):
+        assert required in files, f"mypy must check {required}"
