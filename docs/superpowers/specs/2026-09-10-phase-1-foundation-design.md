@@ -15,7 +15,7 @@ B docs, a test suite split along module lines, and CI that runs all of it across
 supported Python versions.
 
 This phase changes **no runtime behaviour**. The success test is that the
-existing 19 tests pass, with only the patch-target change forced by §5.5 and the hosted Streamlit demo
+existing 18 tests pass, with only the patch-target change forced by §5.5 and the hosted Streamlit demo
 still boots.
 
 ## 2. Non-goals
@@ -261,7 +261,7 @@ is written into `docs/0_coding_standards.md` so it reads as chosen, not missed.
 
 ### 5.6 Tests
 
-`tests/test_text_to_sql_agent.py` (284 lines, 19 tests, one class) splits into:
+`tests/test_text_to_sql_agent.py` (284 lines, 18 tests, one class) splits into:
 
 | New file | Tests moved |
 |----------|-------------|
@@ -298,7 +298,7 @@ Note `python_classes = ["Test*"]` does not match the existing
 `TextToSqlAgentTests` class. The split renames each class to `Test<Module>` as it
 moves, which is required for collection and is a rename, not a rewrite.
 
-**Verification:** `pytest` reports 20 passed, 0 failed (19 existing + `test_packaging.py`).
+**Verification:** `pytest` reports 20 passed, 0 failed (18 existing + 2 in `test_packaging.py`).
 
 ### 5.7 CI
 
@@ -401,7 +401,7 @@ uv sync
 ruff check .
 ruff format --check .
 mypy text_to_sql_agent          # if §5.4 kept
-uv run pytest                   # 20 passed
+uv run pytest                   # 20 passed (18 existing + 2 packaging)
 uv export --no-hashes --no-dev -o /tmp/req.check && diff -u requirements.txt /tmp/req.check
 uv run streamlit run app.py     # boots, demo DB loads, one query returns rows
 ```

@@ -118,12 +118,21 @@ convention = "google"
 "text_to_sql_agent/llm.py" = ["E501"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 files = ["text_to_sql_agent"]
 strict = true
 
 [[tool.mypy.overrides]]
 module = ["google.genai.*", "langchain_ollama.*", "sqlglot.*"]
+ignore_missing_imports = true
+
+# pandas ships no type stubs. numpy's bundled stubs use PEP 695 `type`
+# statements that only parse under python_version >= 3.12, which is why
+# [tool.mypy] targets 3.12 while requires-python still allows 3.11 - ruff's
+# target-version = "py311" and the CI test matrix are what actually hold the
+# 3.11 floor.
+[[tool.mypy.overrides]]
+module = ["pandas.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
@@ -255,7 +264,10 @@ verbatim — this task changes no assertions.
 - [ ] **Step 1: Record the baseline before touching anything**
 
 Run: `uv run pytest`
-Expected: `19 passed`. Write the number down; every later step compares to it.
+Expected: `18 passed, 5 subtests passed`. Write the number down; every later step
+compares to it. (The 5 subtests come from the `subTest` loop in
+`test_is_safe_query_blocks_unsafe_sql`; pytest reports them separately and they
+do not add to the test count.)
 
 - [ ] **Step 2: Create `tests/conftest.py`**
 
@@ -648,9 +660,8 @@ git rm tests/test_text_to_sql_agent.py
 uv run pytest
 ```
 
-Expected: `19 passed`, matching the Step 1 baseline exactly. A count of 18 means
-a test was dropped in the move; a count of 14 means `python_classes` did not
-collect a renamed class. Do not proceed until it reads 19.
+Expected: `18 passed`, matching the Step 1 baseline exactly. A lower count means
+a test was dropped in the move. Do not proceed until it reads 18.
 
 - [ ] **Step 11: Commit**
 
@@ -673,20 +684,20 @@ Patch targets still name the compatibility shim. Repointing them is the
 next commit, deliberately kept separate so a failure there is
 unambiguous.
 
-Verified: uv run pytest reports 19 passed, matching the pre-split
+Verified: uv run pytest reports 18 passed, matching the pre-split
 baseline."
 ```
 
 ---
 
-### Task 3: Docstrings, formatting, and the first clean lint
+### Task 3: Docstrings, formatting, and a clean lint and type gate
 
 **Files:**
-- Modify: `text_to_sql_agent/config.py`, and any file ruff flags
+- Modify: `text_to_sql_agent/config.py`, `text_to_sql_agent/safety.py`, `text_to_sql_agent/env.py`, `text_to_sql_agent/llm.py`, `text_to_sql_agent/schema.py`, and any other file ruff flags
 
 **Interfaces:**
 - Consumes: the ruff config from Task 1.
-- Produces: `uv run ruff check .` and `uv run ruff format --check .` both exit 0. Every later task must keep them at 0.
+- Produces: `uv run ruff check .`, `uv run ruff format --check .`, and `uv run mypy text_to_sql_agent` all exit 0. Every later task must keep all three at 0.
 
 - [ ] **Step 1: See the full scale of the problem before changing anything**
 
@@ -766,17 +777,68 @@ def execute_query(
 Describe what the code already does. If writing the docstring reveals a bug,
 note it in `docs/4_next_steps.md` for Phase 2 — do not fix it here.
 
-- [ ] **Step 6: Verify lint is clean and behaviour is unchanged**
+- [ ] **Step 6: Fix the strict-mode type errors**
+
+Task 1 left `uv run mypy text_to_sql_agent` reporting **14 errors in 5 files**.
+All are annotation-level and fixable without touching behaviour. Confirmed
+2026-09-11; run it and work the list:
+
+```bash
+uv run mypy text_to_sql_agent
+```
+
+Most are one pattern — an optional import guarded by `try/except
+ImportError` that rebinds the module name to `None`. mypy infers the name as
+`Module` from the successful branch and rejects the `None`. Annotate the name
+as optional. In `text_to_sql_agent/safety.py`:
+
+```python
+from types import ModuleType
+
+try:
+    import sqlglot
+    from sqlglot import exp
+except ModuleNotFoundError:  # pragma: no cover
+    sqlglot = None  # type: ignore[assignment]
+    exp = None  # type: ignore[assignment]
+```
+
+If a `# type: ignore` is reported as `[unused-ignore]` — four such comments
+exist in `llm.py` at lines 61, 62, 76 and 77 — **delete the comment**; do not
+add another ignore on top of it.
+
+The remaining three are individual:
+
+- `schema.py:127` — a function missing its return annotation. Add the real
+  return type. This also clears the two `[no-untyped-call]` errors at
+  `rag.py:157` and `rag.py:159`, which only fire because the callee is untyped.
+- `llm.py:95` and `llm.py:97` — `[no-any-return]`. The provider SDK returns
+  `Any`; wrap the returned value in `str(...)` **only if it is already a string
+  at runtime**, otherwise use `typing.cast(str, value)`. `cast` is the safer
+  choice here because it changes no runtime behaviour, which this phase forbids.
+- `llm.py:133` — `[union-attr]` on a possibly-`None` module. Guard it with an
+  explicit `if genai is None: raise RuntimeError(...)` **only if** such a guard
+  already exists elsewhere in the function; if not, use `assert genai is not
+  None` so no new runtime branch is introduced.
+
+Do not relax `strict = true`, and do not add blanket `# type: ignore` comments
+to make errors disappear. If a specific error genuinely cannot be fixed without
+changing behaviour, leave `# type: ignore[<code>]  # Phase 2` with a comment
+naming why, and record it in `docs/4_next_steps.md`.
+
+- [ ] **Step 7: Verify lint, types, and behaviour together**
 
 ```bash
 uv run ruff check .
 uv run ruff format --check .
+uv run mypy text_to_sql_agent
 uv run pytest
 ```
 
-Expected: no findings from either ruff command, and `19 passed`.
+Expected: both ruff commands silent, mypy `Success: no issues found in 13
+source files`, and `18 passed`. All four must pass before you commit.
 
-- [ ] **Step 7: Commit formatting separately from docstrings**
+- [ ] **Step 8: Commit formatting, docstrings, and types separately**
 
 Two commits, so review can skim the mechanical one:
 
@@ -791,7 +853,7 @@ STOPWORDS block with fmt: off so the formatter does not reflow it to one
 token per line.
 
 Verified: ruff format --check and ruff check both clean; uv run pytest
-reports 19 passed. Confirmed by diff that SQL_TRANSLATION_SYSTEM_PROMPT
+reports 18 passed. Confirmed by diff that SQL_TRANSLATION_SYSTEM_PROMPT
 in llm.py is byte-identical - its long lines are prompt content, excluded
 from E501 in pyproject.toml rather than rewrapped."
 
@@ -803,7 +865,20 @@ master standard §3: Args, Returns, and Raises sections describing what
 the code already does. Private helpers are untouched - ruff's pydocstyle
 rules skip underscore-prefixed names.
 
-No behaviour change. Verified: uv run pytest reports 19 passed."
+No behaviour change. Verified: uv run pytest reports 18 passed."
+
+git add text_to_sql_agent/
+git commit -m "fix(types): satisfy mypy strict over the agent package
+
+Annotations only - no behaviour change. Most errors were one pattern:
+optional imports guarded by try/except ImportError that rebind the module
+name to None, which mypy infers as Module from the successful branch.
+Also removes four type: ignore comments mypy reported as unused, and adds
+a return annotation to schema.py that clears two knock-on no-untyped-call
+errors in rag.py.
+
+Verified: mypy text_to_sql_agent reports Success: no issues found in 13
+source files; uv run pytest reports 18 passed."
 ```
 
 ---
@@ -883,7 +958,7 @@ with patch("text_to_sql_agent.pipeline.generate_sql", return_value="SELECT name 
 - [ ] **Step 4: Run the tests — they now cover `pipeline.py` for the first time**
 
 Run: `uv run pytest`
-Expected: `19 passed`.
+Expected: `18 passed`.
 
 If `test_ask_database_executes_safe_generated_sql` fails with a real Gemini or
 Ollama call attempt, the patch target is still wrong — the mock is not
@@ -1003,7 +1078,7 @@ uv run mypy text_to_sql_agent
 uv run pytest
 ```
 
-Expected: ruff silent, mypy `Success: no issues found`, pytest `19 passed`.
+Expected: ruff silent, mypy `Success: no issues found`, pytest `18 passed`.
 
 If mypy reports errors in `pipeline.py` that were previously hidden, fix only
 annotations. If a fix would change behaviour, add
@@ -1036,7 +1111,7 @@ this commit.
 The notebook keeps its saved outputs as academic evidence - a deliberate
 exemption from master §4, now recorded in a dated cell at its top.
 
-Verified: uv run pytest 19 passed; mypy clean; ruff clean; app.py's
+Verified: uv run pytest 18 passed; mypy clean; ruff clean; app.py's
 twelve backend.* attributes all resolve against the package __all__;
 notebook JSON well-formed at 25 cells with 11 outputs."
 ```
@@ -1050,7 +1125,7 @@ notebook JSON well-formed at 25 cells with 11 outputs."
 
 **Interfaces:**
 - Consumes: `pyproject.toml` and `requirements.txt` from Task 1.
-- Produces: the 20th test. Task 8's CI drift check is the second line of defence; this one fails locally and faster.
+- Produces: tests 19 and 20. Task 8's CI drift check is the second line of defence; this one fails locally and faster.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1583,7 +1658,7 @@ file into seven per-module files plus `conftest.py`. Deleted
 `text_to_sql_agent_mvp.py`. Renumbered `docs/` to Shape B. Rewrote CI as a
 3.11-3.13 matrix.
 
-**Verified:** `uv run pytest` 20 passed. `ruff check` and `ruff format --check`
+**Verified:** `uv run pytest` 20 passed (18 pre-existing plus two packaging guards). `ruff check` and `ruff format --check`
 clean. `mypy text_to_sql_agent` clean. `requirements.txt` installs into a clean
 venv. `app.py`'s twelve `backend.*` attributes all resolve against the package
 `__all__`. Notebook JSON well-formed, 25 cells, 11 with outputs. The packaging
