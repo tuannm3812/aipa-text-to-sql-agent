@@ -1,7 +1,7 @@
 # Phase 1 — Foundation and Standards Alignment
 
 **Date:** 2026-09-10
-**Status:** Awaiting review
+**Status:** Approved 2026-09-11
 **Parent:** `2026-09-10-refactor-roadmap.md`
 **Addresses:** Roadmap defects 7, 8, 9, 10
 **Baseline standard:** `~/Documents/GitHub/coding-standards/coding_standards.md`
@@ -38,12 +38,21 @@ still boots.
 | ruff pinned exactly | Matches `ai-meal-planner` (`ruff==0.16.4`). An unpinned formatter turns an upstream release into a red CI on an unrelated PR. |
 | Keep `unittest.TestCase` classes, run them under pytest | pytest collects them natively. A file-split plus a runner swap keeps the diff reviewable; a failure points at the split, not at rewritten asserts. |
 
-**Open decision — mypy.** Neither the master standard nor `ai-meal-planner`
-uses a type checker; master §3 asks for type hints but does not enforce them.
-Phases 3 and 4 rewrite `text_to_sql_agent/` hard, and a strict `mypy` over that
-package would be worth real money there. This spec includes it as a proposed
-delta in §5.4, to be confirmed or dropped before implementation. If dropped,
-delete §5.4 and its CI step; nothing else in the phase depends on it.
+**Resolved 2026-09-11 — mypy is kept.** Neither the master standard nor
+`ai-meal-planner` uses a type checker; master §3 asks for type hints but does not
+enforce them. It is included here as a deliberate delta because Phases 3 and 4
+rewrite `text_to_sql_agent/` hard and strict typing over that package pays for
+itself there. Recorded in `docs/0_coding_standards.md` as a project delta. See
+§5.4.
+
+**Resolved 2026-09-11 — no feature branches.** The project is single-owner, so
+work commits directly to `tuannm3812/main-refinement`, which is this repo's
+default branch (not `main`). Master §10's pre-push workflow still applies in
+full — review every path, verify proportionally, then push without force. This
+is a project delta and belongs in `docs/0_coding_standards.md`; it also means
+each phase lands as a series of commits on the default branch rather than as a
+merge, so commit hygiene per master §9 carries the whole burden of keeping the
+history reviewable.
 
 ## 4. Target structure
 
@@ -285,7 +294,7 @@ uv export --no-hashes --no-dev -o /tmp/requirements.check
 diff -u requirements.txt /tmp/requirements.check
 ```
 
-**Verification:** the workflow is green on the branch before merge.
+**Verification:** the workflow is green on `tuannm3812/main-refinement` after the phase's last commit is pushed.
 
 ### 5.8 Git hygiene (master §8)
 
@@ -357,12 +366,12 @@ narrowed to `D1`-only (missing docstrings) and the prose pass moves to Phase 2.
 
 **Streamlit Cloud rejects the regenerated `requirements.txt`.** `uv export`
 emits a different format than the current hand-written file (environment markers,
-resolved extras). Mitigated by deploying the branch to a Streamlit preview before
-merge, not after.
+resolved extras). Mitigated by testing `pip install -r requirements.txt` into a clean
+virtualenv locally before the commit that regenerates it is pushed.
 
 ## 7. Definition of done
 
-All of the following pass on the branch:
+All of the following pass before the phase is called done:
 
 ```
 uv sync
@@ -374,7 +383,7 @@ uv export --no-hashes --no-dev -o /tmp/req.check && diff -u requirements.txt /tm
 uv run streamlit run app.py     # boots, demo DB loads, one query returns rows
 ```
 
-CI is green across 3.11, 3.12, and 3.13. `text_to_sql_agent_mvp.py` no longer
+CI is green across 3.11, 3.12, and 3.13 on `tuannm3812/main-refinement`. `text_to_sql_agent_mvp.py` no longer
 exists and nothing references it. `AGENTS.md`, `CLAUDE.md`, and
 `docs/0_coding_standards.md` exist. `docs/` follows Shape B. `docs/6_agent_log.md`
 records what was verified in this phase.
