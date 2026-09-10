@@ -21,6 +21,10 @@ def test_rows_match_ignores_row_order() -> None:
     assert evaluation.rows_match([("b", 2), ("a", 1)], [("a", 1), ("b", 2)])
 
 
+def test_rows_match_ignores_row_order_when_gold_is_unsorted() -> None:
+    assert evaluation.rows_match([("a", 1), ("b", 2)], [("b", 2), ("a", 1)])
+
+
 def test_rows_match_ignores_numeric_formatting() -> None:
     assert evaluation.rows_match([("a", 1)], [("a", 1.0)])
     assert evaluation.rows_match([("a", "1.00")], [("a", 1)])
