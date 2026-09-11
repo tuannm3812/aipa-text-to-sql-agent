@@ -71,17 +71,15 @@ strict = true
 module = ["google.genai.*", "langchain_ollama.*", "sqlglot.*"]
 ignore_missing_imports = true
 
-# Streamlit's decorated API produces no-any-return and type-arg noise that
-# strict mode cannot resolve without casts that document nothing. The backend
-# package stays strict; the presentation layer is checked for real errors -
-# above all, attribute access against the package - rather than for total
-# annotation coverage.
+# Streamlit's decorated API returns Any in places strict mode cannot resolve
+# without casts that document nothing, and its generic containers are often
+# unparameterised. Everything else stays strict: a new UI function still needs
+# annotations, and a genuinely missing stub should surface rather than be
+# ignored. text_to_sql_agent keeps full strict = true.
 [[tool.mypy.overrides]]
 module = ["app", "ui.*", "scripts.*"]
-disallow_untyped_defs = false
 disallow_any_generics = false
 warn_return_any = false
-ignore_missing_imports = true
 
 # pandas ships no type stubs. numpy's bundled stubs use PEP 695 `type`
 # statements that only parse under python_version >= 3.12, which is why
