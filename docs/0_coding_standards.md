@@ -32,7 +32,30 @@ reworked anyway" — see `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`
   this standard* uses a type checker; master §3 asks for type hints without
   enforcing them. Adopted here because Phases 3 and 4 of the refactor rewrite
   that package heavily and strict typing pays for itself across a rewrite.
-  `app.py`, `scripts/` and `tests/` are deliberately excluded.
+  `tests/` is deliberately excluded. (Phase 2 brought `app.py`, `ui/` and
+  `scripts/` into scope at a lower strictness — see the next bullet.)
+
+- **Two-tier mypy strictness.** As of Phase 2, `mypy` also covers `app.py`,
+  `ui/` and `scripts/` (26 files total, up from 14), not just
+  `text_to_sql_agent/`. `text_to_sql_agent` stays `strict = true`. The other
+  three relax exactly two settings from strict —
+  `disallow_any_generics` and `warn_return_any` — because Streamlit's
+  decorated API returns `Any` in places strict mode cannot resolve without
+  casts that document nothing, and its generic containers are often
+  unparameterised. Everything else, including `disallow_incomplete_defs`,
+  stays on: a new UI function still needs full annotations, and attribute
+  access against the backend package is still checked, which is what closes
+  the gap a rename in `__init__.py`'s `__all__` used to leave open. See
+  `docs/3_decisions.md` for the full rationale.
+
+- **`ui/` sits beside `app.py`, not inside `text_to_sql_agent/`, and is not
+  packaged.** Presentation code (Streamlit layout, widgets, session-state
+  wiring) does not belong in the backend package that the notebook and the
+  evaluation script import independently of Streamlit.
+  `[tool.hatch.build.targets.wheel] packages` lists only
+  `["text_to_sql_agent"]`; `ui/` is deliberately absent so the wheel never
+  pulls in a Streamlit-dependent module for a consumer that only wants the
+  backend. See `docs/3_decisions.md`.
 
 - **No feature branches.** Single-owner project, so work commits directly to
   `tuannm3812/main-refinement` — this repo's default branch, not `main`. Master
@@ -96,6 +119,11 @@ reworked anyway" — see `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`
 - Error codes returned in `QueryResult.error` are `SCREAMING_SNAKE_CASE` string
   constants (`BLOCKED_UNSAFE_SQL`, `UNANSWERABLE_WITH_GIVEN_SCHEMA`), never
   free-form prose, because `app.py` and the evaluation harness branch on them.
+  The full set is `BLOCKED_UNSAFE_SQL`, `UNANSWERABLE_WITH_GIVEN_SCHEMA`,
+  `RESULT_TRUNCATED_TO_<n>_ROWS` and `QUERY_ABORTED_AFTER_<n>_VM_STEPS`.
+  `ui/results.py`'s `describe_error` maps each to a message a non-technical
+  reader can act on; anything unrecognised passes through unchanged, because
+  the backend also puts raw exception text in that field.
 
 ## 4. Safety Conventions
 

@@ -212,7 +212,7 @@ python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemi
 |-- .devcontainer/                  # Codespaces/devcontainer setup (uv sync)
 |-- .github/                        # CI workflow (tests.yml)
 |-- AGENTS.md                       # Agent operating rules and coding-standard pointers
-|-- app.py                          # Streamlit frontend
+|-- app.py                          # Streamlit entrypoint (51 lines: page config + wiring)
 |-- CLAUDE.md                       # Claude Code entrypoint (points to AGENTS.md)
 |-- data/
 |   |-- customers.csv               # Small CSV sample
@@ -255,6 +255,7 @@ python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemi
 |   |-- config.py                   # Defaults, model names, RAG constants
 |   |-- data_setup.py               # Demo university database generation
 |   |-- env.py                      # Environment loading
+|   |-- evaluation.py               # Gold-vs-generated comparison (shared by app and CLI)
 |   |-- execution.py                # Read-only SQLite execution
 |   |-- ingestion.py                # CSV ingestion
 |   |-- llm.py                      # Gemini/Ollama SQL generation
@@ -265,6 +266,16 @@ python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemi
 |   |-- schema.py                   # Schema extraction/chunking
 |   `-- types.py                    # Shared dataclasses
 |-- text_to_sql_agent_mvp.ipynb     # Reproducible notebook walkthrough
+|-- ui/                             # Streamlit presentation layer (not packaged in the wheel)
+|   |-- chat.py                     # Chat loop and the sample-question block
+|   |-- constants.py                # Model lists and demo database registry
+|   |-- evaluation.py               # Benchmark runner and the results expander
+|   |-- results.py                  # Result tables, auto chart, error messages
+|   |-- secrets.py                  # API key lookup and model resolution
+|   |-- settings.py                 # Frozen Settings the sidebar returns
+|   |-- sidebar.py                  # All sidebar controls; returns Settings
+|   |-- styles.py                   # Chat CSS
+|   `-- uploads.py                  # Uploaded .db/.csv handling, active database
 `-- uv.lock                         # Locked dependency versions (uv)
 ```
 

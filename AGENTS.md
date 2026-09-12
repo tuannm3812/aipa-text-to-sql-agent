@@ -43,14 +43,6 @@ Project-specific rules and deliberate overrides: @docs/0_coding_standards.md
 
 ## Open risks
 
-- `safety.py`'s keyword regex falsely rejects SQLite's `REPLACE()` string
-  function and any string literal containing `update`/`delete`/`create`. The
-  sqlglot AST check beside it already enforces read-only correctly. Phase 2.
-- `execution.py`'s progress handler returns a truthy value, so SQLite **aborts**
-  any query exceeding 100,000 VM steps, surfacing as a bare
-  `OperationalError: interrupted`. Intent unconfirmed. Phase 2.
 - The RAG "embedding" in `rag.py` is a hashed bag of character n-grams, not a
   semantic embedding, and is recomputed per chunk per question with no cache. It
   largely duplicates the semantic signal beside it. Phase 4.
-- Evaluation row-matching is duplicated between `app.py` and
-  `scripts/evaluate_text_to_sql.py`. Phase 2.

@@ -25,13 +25,13 @@ The implemented backend flow is:
 2. Build table-level schema chunks with columns, DDL, relationship data, and low-cardinality value hints.
 3. Retrieve relevant schema using hybrid lexical, synonym, character n-gram, hashed embedding, value-hint, and graph-neighbour signals.
 4. Generate one SQLite query with Gemini or a local Ollama model.
-5. Validate that the query is read-only with deterministic checks and optional `sqlglot` AST parsing.
+5. Validate that the query is read-only: it must be a single statement, start with `SELECT`/`WITH`, reference no SQLite internals, and contain no data-modifying node. Enforced by `sqlglot` AST parsing, which is required rather than optional — if `sqlglot` is unavailable the check fails closed and refuses the query.
 6. Execute through a read-only SQLite connection with `PRAGMA query_only` and an authorizer.
 7. Display generated SQL, result rows, selected schema context, and retrieval diagnostics in Streamlit, with an automatic bar chart when the result is a two-column category + number shape.
 
 The local verification status as of this documentation pass is:
 
-- Unit tests: `20` tests passing with `uv run pytest`.
+- Unit tests: `107` tests passing with `uv run pytest`.
 - Gold evaluation: `12/12` safe, executed, value-matched, row-matched, and exact-matched cases with `python3 scripts/evaluate_text_to_sql.py --mode gold`.
 - Gemini evaluation: `gemini-2.5-flash` completed all `12` cases with multi-key quota failover, reaching `11/12` value match.
 - Local LLM evaluation: Ollama `llama3:latest` reached `8/12` value match with `12/12` safe/executed queries; `gemma4:latest` reached `8/12` value match overall and `8/10` among executed queries.
