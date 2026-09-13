@@ -382,3 +382,34 @@ mypy clean.
 is the security half of it, done by hand. The behaviour half rests on the Task 6
 differential evidence — 27 AppTest scenarios with an empty element-tree diff, and
 the pixel-identical screenshots — which has not been re-established since.
+
+## 2026-09-14 — whole-phase behaviour verification, now closed
+
+The previous entry left the behaviour half of the whole-phase review
+outstanding. It is now done, and against the **whole** of Phase 2 rather than
+the split commit alone — which matters, because `ui/evaluation.py` changed twice
+after the Task 6 evidence was taken, so that evidence was stale.
+
+Compared `1e0bd7a` (immediately before Phase 2) against `e9dfb38` (current):
+
+- **Rendered page is pixel-identical.** Both served headless and screenshotted
+  full-page at 1400×1200; the PNGs share SHA-256 `65aefe32d491e84f…`.
+- **Element trees are identical across four driven scenarios** — cold start,
+  provider switched to Ollama, demo database switched to Retail Analytics, and a
+  full gold benchmark run. 1375 lines of normalised element JSON on each side,
+  `diff` empty.
+- The benchmark scenario genuinely executed rather than vacuously skipping: the
+  `Run benchmark` button was found and clicked, the
+  `Evaluation summary - Gold SQL baseline` expander rendered, 2 dataframes and 5
+  metrics were produced, and no exception was raised.
+
+That last point is the useful one. The five metrics include Value match, and
+they are **unchanged** — so the scoring fix removes credit for failed queries
+without altering any figure the gold benchmark actually reports. The CLI already
+showed this (12/12, CSV identical with latency masked); this shows it through the
+UI too.
+
+**What this does and does not establish.** It establishes that Phase 2 changed
+no UI behaviour reachable by those four scenarios, and no rendered output. It
+does not exercise a live provider, a real browser upload, or the "Selected LLM"
+evaluation mode, all of which remain unverified for the same reasons as before.
