@@ -27,6 +27,7 @@ from .evaluation import (
     load_cases,
     normalise_rows,
     rows_match,
+    run_gold,
     score_case,
 )
 from .execution import execute_query
@@ -75,6 +76,7 @@ __all__ = [
     "retrieve_schema_chunks",
     "retrieve_schema_context",
     "rows_match",
+    "run_gold",
     "score_case",
     "write_university_db",
 ]

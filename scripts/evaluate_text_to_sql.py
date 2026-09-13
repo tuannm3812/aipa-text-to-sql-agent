@@ -23,10 +23,7 @@ RETRYABLE_ERROR_MARKERS = (
 
 
 def _run_gold(case: dict[str, Any]) -> tuple[str, agent.QueryResult]:
-    sql = case["gold_sql"]
-    if not agent.is_safe_query(sql):
-        return sql, agent.QueryResult(columns=[], rows=[], sql=sql, error="GOLD_SQL_UNSAFE")
-    return sql, agent.execute_query(case["db_path"], sql)
+    return agent.run_gold(case)
 
 
 def _run_llm(

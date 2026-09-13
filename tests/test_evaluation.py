@@ -177,3 +177,34 @@ def test_both_harnesses_score_through_the_shared_function() -> None:
         source = path.read_text(encoding="utf-8")
         assert "score_case(" in source, f"{path} must score through score_case"
         assert "rows_match(" not in source, f"{path} must not compare rows itself"
+
+
+def test_run_gold_refuses_unsafe_reference_sql() -> None:
+    """The UI executed unsafe gold SQL while the CLI refused it; now neither does."""
+    sql, result = evaluation.run_gold(
+        {"gold_sql": "SELECT * FROM sqlite_master", "db_path": "data/university_agent.db"}
+    )
+    assert sql == "SELECT * FROM sqlite_master"
+    assert result.error == "GOLD_SQL_UNSAFE"
+    assert result.rows == []
+
+
+def test_run_gold_executes_safe_reference_sql() -> None:
+    _, result = evaluation.run_gold(
+        {"gold_sql": "SELECT major FROM students LIMIT 2", "db_path": "data/university_agent.db"}
+    )
+    assert result.error is None
+    assert len(result.rows) == 2
+
+
+def test_both_harnesses_run_gold_through_the_shared_function() -> None:
+    """Neither harness may execute reference SQL itself.
+
+    The UI previously called `execute_query` on `gold_sql` directly, skipping the
+    safety check the CLI applied, so an unsafe reference query ran in one
+    harness and was refused in the other.
+    """
+    for path in (Path("ui/evaluation.py"), Path("scripts/evaluate_text_to_sql.py")):
+        source = path.read_text(encoding="utf-8")
+        assert "run_gold(" in source, f"{path} must run reference SQL through run_gold"
+        assert "execute_query(" not in source, f"{path} must not execute SQL itself"

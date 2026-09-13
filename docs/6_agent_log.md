@@ -337,3 +337,48 @@ specified, which is precisely the gap a second reviewer catches.
 established on 2026-09-12 by screenshotting `110e09f` and `a08aac0` headless and
 comparing SHA-256; nothing since has touched `ui/` layout, but no new screenshot
 was taken. Codex's limits note on that point stands.
+
+## 2026-09-14 — third UI/CLI divergence, found while finishing the review
+
+Codex's review noted its result was bounded — "no write escape or abort-triggered
+repair regression was found **in the reviewed paths**". The whole-phase review I
+had queued never ran (rate limit), so I did its central question by hand: after
+`app.py` was gutted and rebuilt, is the safety gate still in every path to the
+database?
+
+**Every LLM-facing path is gated.** Tracing all four call sites of
+`execute_query` outside tests — `pipeline.ask_database`,
+`pipeline.ask_database_with_sql` (both including their repair branches),
+`ui/evaluation.py` and `scripts/evaluate_text_to_sql.py` — each passes generated
+SQL through `is_safe_query` first. `execution.py`'s read-only connection and
+authorizer are untouched and remain an independent second defence.
+
+**But the gold path was not, in the UI.** `scripts/evaluate_text_to_sql.py`
+checked reference SQL and returned `GOLD_SQL_UNSAFE` when it failed;
+`ui/evaluation.py` called `execute_query(case["db_path"], gold_sql)` directly.
+With `SELECT * FROM sqlite_master` as a case's `gold_sql`, the CLI refused it and
+the UI executed it, returning 6 rows of schema.
+
+This is the same family as Codex's finding 1 — a divergence left by extracting
+helpers without extracting the contract — and it is **low impact**: `gold_sql`
+comes from `evaluation/cases.json`, which is repo-controlled rather than model
+output, so it is not an injection path, and the read-only connection still blocks
+writes regardless. It is a consistency defect: a broken reference query would be
+reported as passing in one harness and refused in the other.
+
+Fixed the same way as the scoring gap, in the shared module rather than by
+duplicating the guard: `text_to_sql_agent.evaluation.run_gold(case)` applies the
+check and both harnesses call it. `test_both_harnesses_run_gold_through_the_shared_function`
+asserts neither executes SQL itself.
+
+**Verified:** `uv run pytest` → **125 passed**. Load-bearing: disabling the guard
+fails `test_run_gold_refuses_unsafe_reference_sql`. `run_gold` refuses
+`SELECT * FROM sqlite_master` with `GOLD_SQL_UNSAFE` and 0 rows, and returns 2
+rows for a safe query. Gold benchmark still **12/12**; regenerated CSV identical
+to the committed copy with `latency_ms` masked, then reverted. ruff, format and
+mypy clean.
+
+**Still not done:** the queued whole-phase review itself. What is written above
+is the security half of it, done by hand. The behaviour half rests on the Task 6
+differential evidence — 27 AppTest scenarios with an empty element-tree diff, and
+the pixel-identical screenshots — which has not been re-established since.

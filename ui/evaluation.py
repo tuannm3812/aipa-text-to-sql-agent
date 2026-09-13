@@ -35,8 +35,7 @@ def evaluate_cases(
     rows: list[dict] = []
     for case in backend.load_cases():
         started = time.perf_counter()
-        gold_sql = case["gold_sql"]
-        gold_result = backend.execute_query(case["db_path"], gold_sql)
+        gold_sql, gold_result = backend.run_gold(case)
 
         if mode == "Gold SQL baseline":
             generated_sql = gold_sql

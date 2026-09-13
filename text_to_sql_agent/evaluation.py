@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .execution import execute_query
+from .safety import is_safe_query
 from .types import QueryResult
 
 DEFAULT_CASES_PATH = Path("evaluation/cases.json")
@@ -121,3 +123,25 @@ def score_case(result: QueryResult, gold_result: QueryResult) -> CaseScore:
         value_match=value_match,
         exact_match=row_match and result.columns == gold_result.columns,
     )
+
+
+def run_gold(case: dict[str, Any]) -> tuple[str, QueryResult]:
+    """Run a case's reference SQL, refusing it if it is not read-only.
+
+    Gold SQL comes from `evaluation/cases.json` rather than from a model, so
+    this is a consistency guard rather than an injection defence — but a
+    reference query that reads schema internals or writes is a broken case, and
+    both harnesses should say so identically instead of one executing it and the
+    other refusing.
+
+    Args:
+        case: An evaluation case; `gold_sql` and `db_path` are required.
+
+    Returns:
+        A `(sql, QueryResult)` tuple. The result carries `GOLD_SQL_UNSAFE` and
+        no rows when the reference SQL fails the safety check.
+    """
+    sql: str = case["gold_sql"]
+    if not is_safe_query(sql):
+        return sql, QueryResult(columns=[], rows=[], sql=sql, error="GOLD_SQL_UNSAFE")
+    return sql, execute_query(case["db_path"], sql)
