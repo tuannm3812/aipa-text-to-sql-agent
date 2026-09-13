@@ -99,8 +99,15 @@ scheme — a bare path or `sqlite://` to SQLite, `duckdb://` to DuckDB,
 `postgresql://` to PostgreSQL.
 
 `execute_query(db_path, sql, ...)` stays as a module-level function delegating to
-`open_engine`, so `pipeline.py`, the notebook and the evaluation harness keep
-working unchanged. Its signature does not change.
+`open_engine`. Its signature does not change, so the notebook and the evaluation
+harness keep working for SQLite paths.
+
+**An execution wrapper alone is not enough, and the first draft of this spec was
+wrong to imply it was.** Two things reject a DSN before any engine is reached.
+Verified 2026-09-14: `ask_database("q", db_path="duckdb:///tmp/x.duckdb")` and the
+`postgresql://` form both raise `FileNotFoundError: input database not found`,
+and `schema._db_cache_key` raises `FileNotFoundError` for each. §4.8 specifies
+the fix.
 
 ### 4.2 Read-only, proven per engine
 
@@ -202,6 +209,69 @@ DSN where they currently take a path. No layout changes.
 redacted in any error surfaced to the page — a connection failure must not print
 a password back to the user.
 
+### 4.8 Connection validation and schema dispatch
+
+Three places assume a local filesystem path and must become engine-aware.
+
+**1. Both pipeline entry points.** `pipeline.ask_database` and
+`ask_database_with_sql` each begin with `os.path.exists(db_path)` and raise
+`FileNotFoundError` before touching an engine. Replace with
+`open_engine(dsn).check_reachable()`, which each engine implements in its own
+terms — a file that exists for SQLite and DuckDB, a connection that opens for
+PostgreSQL — and which raises `EngineUnreachableError` carrying an engine-named
+message. The error must not echo a DSN password.
+
+**2. The schema facade.** `get_schema` and `get_schema_chunks` connect with
+`sqlite3` directly. They dispatch to `engine.raw_schema()` and
+`engine.schema_chunks()`. `rag.py` calls these and is otherwise untouched, which
+is what keeps Phase 4 free of this work.
+
+**3. The schema cache key.** `schema._db_cache_key` resolves and stats its input,
+so it is meaningless for a server engine. It becomes `engine.schema_fingerprint()`:
+
+| Engine | Fingerprint |
+|---|---|
+| SQLite, DuckDB | resolved path plus `st_mtime_ns` and `st_size` — today's behaviour |
+| PostgreSQL | a hash of the catalogue query result: table names, column names and types, and foreign keys, for the connection's visible schemas |
+
+PostgreSQL therefore pays one catalogue query per cache check rather than a stat.
+That is the honest cost of a server engine, and it is bounded — no DDL-change
+notification exists to make it cheaper without a staleness window. The existing
+`get_schema_chunk_cache_info()` interface stays, still reporting hits and misses;
+`SchemaRetrievalResult.cache_hit`, which the UI's RAG report renders, keeps
+meaning the same thing.
+
+### 4.9 Generation and repair must know the dialect
+
+`llm.py`'s `SQL_TRANSLATION_SYSTEM_PROMPT` hard-codes SQLite in four places —
+"a SINGLE SQLite SELECT query", a "SQLITE DIALECT (must follow)" section, an
+explicit dialect instruction, and `strftime` date guidance. Both provider paths
+use it, and `pipeline._repair_sql` calls the same `generate_sql` with no dialect
+context. Left alone, a PostgreSQL question and every repair attempt on it are
+instructed to emit SQLite.
+
+The prompt splits into a shared body plus a per-engine dialect block that each
+engine supplies as `Engine.prompt_dialect_section`. SQLite's block is the current
+text moved verbatim, so **the SQLite prompt stays byte-identical** and no existing
+evaluation figure can move — the same property Phase 1 protected when it excluded
+this string from reformatting. `generate_sql(question, schema, *, engine=...)`
+and `_repair_sql` both take the engine and pass its block through.
+
+Verified by provider-stubbed tests, not by a conformance query: a plain `SELECT`
+runs identically on all three engines and would never catch this. The tests assert
+the prompt reaching the stub contains the selected engine's dialect block and not
+another's, for both initial generation and repair.
+
+### 4.10 End-to-end tests per engine
+
+Engine conformance alone cannot catch a failure that happens *before* the engine
+is reached — which is precisely what §4.8 fixes. So each engine also gets
+provider-stubbed tests through both public question paths, `ask_database` and
+`ask_database_with_sql`, with RAG enabled and disabled: four combinations per
+engine. They assert a result comes back, the schema reaching the prompt came from
+that engine, and that an unreachable DSN produces `EngineUnreachableError` rather
+than `FileNotFoundError`.
+
 ## 5. Sub-phases
 
 The owner chose to deliver both engines in one phase. To keep each half
@@ -209,8 +279,11 @@ independently reviewable and to stop PostgreSQL's infrastructure risk blocking
 DuckDB, this spec produces **two implementation plans**:
 
 - **3a — protocol, SQLite port, DuckDB.** No new infrastructure; `duckdb` is one
-  pip install and runs in-process. Ends with the conformance suite passing for
-  two engines.
+  pip install and runs in-process. Includes §4.8's connection validation and
+  schema dispatch, §4.9's dialect-aware prompt, and §4.10's end-to-end tests —
+  all of which are engine-independent plumbing that PostgreSQL then inherits
+  rather than re-invents. Ends with the conformance suite passing for two
+  engines.
 - **3b — PostgreSQL.** Adds the CI service container, the testcontainer-or-skip
   local strategy, the read-only role, and DSN handling in the UI.
 
@@ -240,6 +313,11 @@ run the suite. Mitigation: PostgreSQL tests skip with an explicit reason when no
 server is reachable, and CI asserts they were **not** skipped, so a silent skip
 cannot hide a broken engine.
 
+**The dialect prompt change moves an evaluation figure.** Splitting the prompt
+risks altering SQLite's text. Mitigation: SQLite's block is moved verbatim and a
+test asserts the assembled SQLite prompt is byte-identical to today's constant,
+the same guard Phase 1 used. The gold benchmark must still report 12/12.
+
 **Credential leakage.** A DSN carries a password. It must never reach a log, an
 error message, `evaluation/results/`, or the page.
 
@@ -251,6 +329,8 @@ uv run ruff check . && uv run ruff format --check .
 uv run mypy
 uv run pytest                      # conformance green for sqlite, duckdb, postgres
 uv run pytest -m conformance -v    # every engine listed, none silently skipped
+uv run pytest -k "end_to_end" -v   # both entry points x RAG on/off x every engine
+uv run pytest -k "prompt_dialect"  # generation and repair carry the right dialect
 uv run python -c "import app"
 uv run streamlit run app.py        # SQLite demos unchanged; a DuckDB file queryable
 uv run python scripts/evaluate_text_to_sql.py --mode gold   # still 12/12
