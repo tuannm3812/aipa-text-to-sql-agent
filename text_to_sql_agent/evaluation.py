@@ -8,8 +8,11 @@ apart, silently making the app and the CLI disagree about accuracy.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .types import QueryResult
 
 DEFAULT_CASES_PATH = Path("evaluation/cases.json")
 
@@ -72,3 +75,49 @@ def load_cases(path: str | Path = DEFAULT_CASES_PATH) -> list[dict[str, Any]]:
         return []
     parsed: list[dict[str, Any]] = json.loads(cases_path.read_text(encoding="utf-8"))
     return parsed
+
+
+@dataclass(frozen=True)
+class CaseScore:
+    """How one evaluation case scored, for a generated result against gold.
+
+    Attributes:
+        executed: Whether the generated query itself came back without an error.
+        row_match: Rows equal as strings, in order.
+        value_match: Rows equal ignoring order and numeric formatting.
+        exact_match: `row_match` and the column names agree.
+    """
+
+    executed: bool
+    row_match: bool
+    value_match: bool
+    exact_match: bool
+
+
+def score_case(result: QueryResult, gold_result: QueryResult) -> CaseScore:
+    """Score one case, requiring both sides to have executed before any match.
+
+    Both results must be error-free for a match to count. Without that guard a
+    failed query compares `[]` against `[]` and scores as a perfect match — so
+    an aborted or blocked query would *inflate* the reported accuracy. The
+    Streamlit tab and `scripts/evaluate_text_to_sql.py` both call this so they
+    cannot drift apart on what "correct" means.
+
+    Args:
+        result: The result of the generated (or gold, in baseline mode) SQL.
+        gold_result: The result of the reference SQL.
+
+    Returns:
+        A `CaseScore`. `executed` reflects only the generated side, matching how
+        both harnesses have always reported it; every match field requires both
+        sides to have succeeded.
+    """
+    both_ok = result.error is None and gold_result.error is None
+    row_match = both_ok and normalise_rows(result.rows) == normalise_rows(gold_result.rows)
+    value_match = both_ok and rows_match(result.rows, gold_result.rows)
+    return CaseScore(
+        executed=result.error is None,
+        row_match=row_match,
+        value_match=value_match,
+        exact_match=row_match and result.columns == gold_result.columns,
+    )

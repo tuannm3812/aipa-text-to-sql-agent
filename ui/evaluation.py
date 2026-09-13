@@ -52,11 +52,7 @@ def evaluate_cases(
             )
 
         latency_ms = round((time.perf_counter() - started) * 1000, 2)
-        exact_match = (
-            result.error is None
-            and result.columns == gold_result.columns
-            and backend.normalise_rows(result.rows) == backend.normalise_rows(gold_result.rows)
-        )
+        score = backend.score_case(result, gold_result)
         expected_tables = set(case.get("expected_tables", []))
         rag_context = backend.retrieve_schema_context(
             case["db_path"],
@@ -75,11 +71,10 @@ def evaluate_cases(
                 "dataset": case["dataset"],
                 "difficulty": case["difficulty"],
                 "safe_sql": backend.is_safe_query(generated_sql),
-                "executed": result.error is None,
-                "row_match": backend.normalise_rows(result.rows)
-                == backend.normalise_rows(gold_result.rows),
-                "value_match": backend.rows_match(result.rows, gold_result.rows),
-                "exact_match": exact_match,
+                "executed": score.executed,
+                "row_match": score.row_match,
+                "value_match": score.value_match,
+                "exact_match": score.exact_match,
                 "schema_recall": schema_recall,
                 "prompt_saved_pct": rag_context.prompt_savings_pct,
                 "cache_hit": rag_context.cache_hit,

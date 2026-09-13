@@ -21,7 +21,14 @@ from .config import (
 )
 from .data_setup import create_dummy_university_data, write_university_db
 from .env import load_env
-from .evaluation import canonical_value, load_cases, normalise_rows, rows_match
+from .evaluation import (
+    CaseScore,
+    canonical_value,
+    load_cases,
+    normalise_rows,
+    rows_match,
+    score_case,
+)
 from .execution import execute_query
 from .ingestion import ingest_csvs_to_db, normalize_table_name
 from .llm import SQL_TRANSLATION_SYSTEM_PROMPT, generate_sql
@@ -32,6 +39,7 @@ from .schema import get_schema, get_schema_chunks
 from .types import QueryResult, SchemaChunk, SchemaRetrievalResult
 
 __all__ = [
+    "CaseScore",
     "DEFAULT_MAX_ROWS",
     "DEFAULT_MAX_VM_STEPS",
     "DEFAULT_MODEL_NAME",
@@ -67,5 +75,6 @@ __all__ = [
     "retrieve_schema_chunks",
     "retrieve_schema_context",
     "rows_match",
+    "score_case",
     "write_university_db",
 ]

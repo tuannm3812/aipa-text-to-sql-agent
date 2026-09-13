@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from text_to_sql_agent import evaluation
+from text_to_sql_agent.types import QueryResult
 
 
 def test_canonical_value_rounds_numbers_to_two_decimals() -> None:
@@ -78,3 +79,101 @@ def test_shipped_cases_file_loads_and_has_the_required_keys() -> None:
     assert cases, "evaluation/cases.json should not be empty"
     for case in cases:
         assert {"question", "gold_sql", "db_path"} <= set(case)
+
+
+def _ok(columns: list[str], rows: list[tuple[object, ...]]) -> QueryResult:
+    return QueryResult(columns=columns, rows=rows, sql="SELECT 1")
+
+
+def _failed(error: str) -> QueryResult:
+    """A query that errored: the backend returns no rows alongside the code."""
+    return QueryResult(columns=[], rows=[], sql="SELECT 1", error=error)
+
+
+def test_score_case_scores_an_ordinary_match() -> None:
+    score = evaluation.score_case(_ok(["a"], [("x",)]), _ok(["a"], [("x",)]))
+    assert (score.executed, score.row_match, score.value_match, score.exact_match) == (
+        True,
+        True,
+        True,
+        True,
+    )
+
+
+def test_score_case_rejects_a_genuine_mismatch() -> None:
+    score = evaluation.score_case(_ok(["a"], [("x",)]), _ok(["a"], [("y",)]))
+    assert score.executed
+    assert not score.row_match
+    assert not score.value_match
+    assert not score.exact_match
+
+
+def test_score_case_does_not_credit_an_aborted_query() -> None:
+    """Two failed queries both return no rows; `[] == []` must not be a match.
+
+    This is the regression that mattered: without the both-succeeded guard an
+    aborted query scored as a perfect match and inflated reported accuracy.
+    """
+    aborted = _failed("QUERY_ABORTED_AFTER_100000_VM_STEPS")
+    score = evaluation.score_case(aborted, aborted)
+
+    assert not score.executed
+    assert not score.row_match
+    assert not score.value_match
+    assert not score.exact_match
+
+
+def test_score_case_does_not_credit_a_blocked_query() -> None:
+    score = evaluation.score_case(_failed("BLOCKED_UNSAFE_SQL"), _ok(["a"], []))
+    assert not score.executed
+    assert not score.row_match
+    assert not score.value_match
+
+
+def test_score_case_does_not_credit_a_failed_gold_side() -> None:
+    """A succeeding generated query cannot match a gold query that failed."""
+    score = evaluation.score_case(_ok(["a"], []), _failed("QUERY_ABORTED_AFTER_100000_VM_STEPS"))
+    assert score.executed, "the generated side did execute"
+    assert not score.row_match
+    assert not score.value_match
+
+
+def test_score_case_treats_a_truncated_result_as_not_executed() -> None:
+    """Truncation sets `error` while returning rows; both harnesses have always
+    reported that as not-executed, and the match fields follow the same guard."""
+    truncated = QueryResult(
+        columns=["a"], rows=[("x",)], sql="SELECT 1", error="RESULT_TRUNCATED_TO_1_ROWS"
+    )
+    score = evaluation.score_case(truncated, _ok(["a"], [("x",)]))
+    assert not score.executed
+    assert not score.row_match
+    assert not score.value_match
+
+
+def test_score_case_matches_two_successful_empty_results() -> None:
+    """Empty is a legitimate answer when both sides genuinely executed."""
+    score = evaluation.score_case(_ok(["a"], []), _ok(["a"], []))
+    assert score.executed
+    assert score.row_match
+    assert score.value_match
+    assert score.exact_match
+
+
+def test_score_case_requires_matching_columns_for_an_exact_match() -> None:
+    score = evaluation.score_case(_ok(["a"], [("x",)]), _ok(["b"], [("x",)]))
+    assert score.row_match
+    assert score.value_match
+    assert not score.exact_match
+
+
+def test_both_harnesses_score_through_the_shared_function() -> None:
+    """Guards the parity this module exists to provide.
+
+    Either harness recomputing a match field locally is how the UI and the CLI
+    drifted apart in the first place: the UI compared rows with no error guard
+    and credited aborted queries that the CLI correctly rejected.
+    """
+    for path in (Path("ui/evaluation.py"), Path("scripts/evaluate_text_to_sql.py")):
+        source = path.read_text(encoding="utf-8")
+        assert "score_case(" in source, f"{path} must score through score_case"
+        assert "rows_match(" not in source, f"{path} must not compare rows itself"

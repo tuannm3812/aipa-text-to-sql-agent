@@ -87,15 +87,7 @@ def evaluate_case(
         )
 
     latency_ms = round((time.perf_counter() - started) * 1000, 2)
-    generated_rows = agent.normalise_rows(result.rows)
-    gold_rows = agent.normalise_rows(gold_result.rows)
-    row_match = result.error is None and gold_result.error is None and generated_rows == gold_rows
-    value_match = (
-        result.error is None
-        and gold_result.error is None
-        and agent.rows_match(result.rows, gold_result.rows)
-    )
-    exact_result_match = row_match and result.columns == gold_result.columns
+    score = agent.score_case(result, gold_result)
     expected_tables = set(case.get("expected_tables", []))
     retrieved_tables: set[str] = set()
     rag_context = agent.retrieve_schema_context(
@@ -121,10 +113,10 @@ def evaluate_case(
         "use_rag": use_rag if mode == "llm" else "",
         "rag_top_k": rag_top_k if mode == "llm" else "",
         "safe_sql": agent.is_safe_query(generated_sql),
-        "execution_ok": result.error is None,
-        "row_match": row_match,
-        "value_match": value_match,
-        "exact_result_match": exact_result_match,
+        "execution_ok": score.executed,
+        "row_match": score.row_match,
+        "value_match": score.value_match,
+        "exact_result_match": score.exact_match,
         "schema_table_recall": table_recall,
         "prompt_saved_pct": rag_context.prompt_savings_pct,
         "cache_hit": rag_context.cache_hit,
