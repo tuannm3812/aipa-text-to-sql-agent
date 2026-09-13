@@ -124,13 +124,19 @@ class SQLiteEngine:
     sqlglot_dialect: str = "sqlite"
     internal_prefixes: tuple[str, ...] = ("sqlite_", "pragma_")
     internal_names: frozenset[str] = frozenset({"dbstat"})
+    # This block must stay byte-identical to the corresponding lines of
+    # SQL_TRANSLATION_SYSTEM_PROMPT in llm.py: a future task assembles the
+    # prompt from a shared body plus this per-engine section and pins the
+    # result with a sha256 test. The long line is intentionally not
+    # wrapped - an unexpected mid-sentence newline would be a real change
+    # to text the model reads, not just a formatting choice, so line
+    # length loses to fidelity here (llm.py carries the same exclusion).
     prompt_dialect_section: str = """\
 SQLITE DIALECT (must follow):
 - Generate SQLite-compatible SQL only.
 - Do NOT use EXTRACT, DATE_TRUNC, ILIKE, INTERVAL, FILTER, DISTINCT ON.
-- For dates/timestamps use SQLite functions like: strftime('%Y', col),
-  strftime('%Y-%m', col), date(col), datetime(col).
-"""
+- For dates/timestamps use SQLite functions like: strftime('%Y', col), strftime('%Y-%m', col), date(col), datetime(col).
+"""  # noqa: E501
 
     def __init__(self, dsn: str) -> None:
         """Hold the filesystem path to the SQLite database file.
