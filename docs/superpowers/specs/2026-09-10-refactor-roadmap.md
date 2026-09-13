@@ -69,10 +69,18 @@ by both the app and the CLI script, and splits `app.py` into focused UI modules
 behind a thin entrypoint. Every fix ships with a regression test.
 
 ### Phase 3 — Engine abstraction
-Introduces a dialect/engine protocol behind `schema.py` and `execution.py`.
-SQLite becomes one implementation; DuckDB is added as the second to prove the
-seam, with PostgreSQL following. This precedes the RAG work deliberately, because
-schema chunking is engine-specific and doing RAG first would mean rewriting it.
+Introduces a dialect/engine protocol behind `schema.py`, `execution.py` and
+`safety.py`. SQLite becomes one implementation, with **DuckDB and PostgreSQL both
+delivered in this phase** (owner's decision, 2026-09-14), split into plans 3a and
+3b so PostgreSQL's infrastructure does not block DuckDB. This precedes the RAG
+work deliberately, because schema chunking is engine-specific and doing RAG first
+would mean rewriting it.
+
+The governing constraint is that the safety model does not port: SQLite's
+read-only guarantee is a URI flag plus a 28-constant authorizer, and neither
+DuckDB nor PostgreSQL has anything shaped like it. Each engine proves read-only
+its own way against a shared conformance suite. Detailed spec:
+`2026-09-14-phase-3-engine-abstraction-design.md`.
 
 ### Phase 4 — Real RAG
 Fixes defects 3 and 4. Decomposes scoring into named, individually testable
