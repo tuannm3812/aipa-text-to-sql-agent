@@ -18,6 +18,11 @@ LEGITIMATE = [
     "GROUP BY customer_id) SELECT * FROM totals",
     "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 2",
     "SELECT strftime('%Y', d) AS yr, SUM(amt) FROM s GROUP BY yr",
+    # Scalar sqlite_* functions read no internal table; only a table-source
+    # position does. Narrowed after a review found these wrongly rejected.
+    "SELECT sqlite_version()",
+    "SELECT sqlite_source_id()",
+    "SELECT sqlite_version() AS v FROM customers",
     # The old text-based internals check matched "sqlite_master" anywhere in
     # the string, including inside a literal, and a real table just happening
     # to be prefixed "sqlite_" would have been indistinguishable from it.
@@ -69,6 +74,9 @@ DANGEROUS = [
     "SELECT * FROM \"pragma_table_info\"('customers')",
     "WITH x AS (SELECT * FROM dbstat('main')) SELECT * FROM x",
     "SELECT * FROM dbstat('main') AS d",
+    "SELECT * FROM t JOIN pragma_table_info('c') p",
+    "SELECT (SELECT count(*) FROM dbstat('main'))",
+    "SELECT * FROM (SELECT * FROM dbstat('main'))",
 ]
 
 

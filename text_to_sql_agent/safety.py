@@ -24,6 +24,29 @@ _INTERNAL_TABLE_PREFIXES = ("sqlite_", "pragma_")
 _INTERNAL_TABLE_NAMES = frozenset({"dbstat"})
 
 
+def _is_table_source(node: sqlglot_exp.Expression) -> bool:
+    """True if `node` sits where a table would, rather than in a value position.
+
+    A table-valued function call reached through `FROM`, a `JOIN`, a derived
+    table or a subquery is a table source; the same function name used as a
+    scalar in the select list is not.
+
+    Args:
+        node: The parsed node to locate.
+
+    Returns:
+        True if any ancestor places this node in a table-source position.
+    """
+    if exp is None:
+        return False
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, (exp.From, exp.Join, exp.Subquery, exp.Table)):
+            return True
+        parent = parent.parent
+    return False
+
+
 def _references_internals(parsed: sqlglot_exp.Expression) -> bool:
     """True if the statement reads SQLite's own schema or statistics tables.
 
@@ -54,9 +77,15 @@ def _references_internals(parsed: sqlglot_exp.Expression) -> bool:
     # `.this` alone breaks on a quoted name and, for the bare form, misses
     # that "dbstat" is also a table-valued function (dbstat('main')), which
     # only the name-set check below (not just the prefix check) catches.
+    #
+    # Only functions in a *table source* position count. Applying the name
+    # rules to every call also rejected harmless scalars like
+    # `SELECT sqlite_version()`, which read no internal table.
     for function in parsed.find_all(exp.Anonymous):
         name = (function.name or "").lower()
-        if name in _INTERNAL_TABLE_NAMES or name.startswith(_INTERNAL_TABLE_PREFIXES):
+        if not (name in _INTERNAL_TABLE_NAMES or name.startswith(_INTERNAL_TABLE_PREFIXES)):
+            continue
+        if _is_table_source(function):
             return True
     return False
 
