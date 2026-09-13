@@ -27,22 +27,32 @@ _INTERNAL_TABLE_NAMES = frozenset({"dbstat"})
 def _is_table_source(node: sqlglot_exp.Expression) -> bool:
     """True if `node` sits where a table would, rather than in a value position.
 
-    A table-valued function call reached through `FROM`, a `JOIN`, a derived
-    table or a subquery is a table source; the same function name used as a
-    scalar in the select list is not.
+    A call reached through `FROM` or a `JOIN` is a table source; the same name
+    used as a value — in a select list, a `WHERE`, a scalar subquery — is not.
+
+    The walk stops at the first enclosing `SELECT`, which is what makes the
+    distinction hold inside nesting. Treating any `Subquery` ancestor as proof
+    of a table position was wrong: it rejected `SELECT (SELECT sqlite_version())`
+    and `SELECT * FROM (SELECT sqlite_version() AS v)`, where the scalar is a
+    value inside its own SELECT and the subquery belongs to an outer query. A
+    genuine nested table read such as
+    `SELECT (SELECT count(*) FROM dbstat('main'))` still reaches `FROM` before
+    that boundary, so it stays rejected.
 
     Args:
         node: The parsed node to locate.
 
     Returns:
-        True if any ancestor places this node in a table-source position.
+        True if this node sits in a table-source position in its own scope.
     """
     if exp is None:
         return False
     parent = node.parent
     while parent is not None:
-        if isinstance(parent, (exp.From, exp.Join, exp.Subquery, exp.Table)):
+        if isinstance(parent, (exp.From, exp.Join)):
             return True
+        if isinstance(parent, exp.Select):
+            return False
         parent = parent.parent
     return False
 

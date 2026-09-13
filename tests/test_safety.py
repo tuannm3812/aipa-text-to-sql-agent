@@ -23,6 +23,12 @@ LEGITIMATE = [
     "SELECT sqlite_version()",
     "SELECT sqlite_source_id()",
     "SELECT sqlite_version() AS v FROM customers",
+    # A scalar stays a scalar inside nesting. Classifying it from an enclosing
+    # query's subquery position rejected all three of these.
+    "SELECT (SELECT sqlite_version())",
+    "SELECT * FROM (SELECT sqlite_version() AS v)",
+    "WITH x AS (SELECT sqlite_version() AS v) SELECT * FROM x",
+    "SELECT name FROM customers WHERE sqlite_version() IS NOT NULL",
     # The old text-based internals check matched "sqlite_master" anywhere in
     # the string, including inside a literal, and a real table just happening
     # to be prefixed "sqlite_" would have been indistinguishable from it.
