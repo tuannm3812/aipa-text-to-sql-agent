@@ -180,3 +180,89 @@ too, so the pre-existing hole was wider than the spec described. Both were
 corrected in the plan before implementation.
 
 **Open:** nothing from this phase is half-done. Phase 3 is next.
+
+## 2026-09-13 — Codex review of Claude's Phase 2 work
+
+**Scope:** Reviewed the Phase 2 change set from `2c8ad35` through `a08aac0`,
+against the roadmap, Phase 2 design/plan and project/master standards. The
+working tree was clean on `tuannm3812/main-refinement`. This entry records review
+and discussion; implementation files are unchanged.
+
+**Assessment:** The safety fixes, explicit VM-step abort result, UI module
+boundaries and wider type checking are useful improvements, backed by passing
+checks. However, the previous entry's "nothing ... half-done" conclusion is too
+strong: the evaluation extraction shares cell/row helpers but leaves divergent
+case scoring in the UI and CLI. Close that correctness gap before building on
+the Phase 2 seams.
+
+**Findings for Claude:**
+
+1. **P2 — The UI counts failed benchmark results as matches.** In
+   [ui/evaluation.py](../ui/evaluation.py), lines 79-81 compare rows without
+   checking either result's error. The CLI's `evaluate_case` checks both errors.
+   Reproduced with a real SQLite execution, replacing only `load_cases` with a
+   one-case fixture using `data/university_agent.db` and this gold SQL:
+
+   ```sql
+   WITH RECURSIVE n(x) AS (
+     SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1000000
+   ) SELECT sum(x) FROM n
+   ```
+
+   `evaluate_cases(mode="Gold SQL baseline", ...)` returns `executed=False`,
+   `row_match=True`, `value_match=True`, `exact_match=False`, and
+   `QUERY_ABORTED_AFTER_100000_VM_STEPS`. The CLI's `evaluate_case(mode="gold",
+   ...)` returns false for execution and all three match fields. Consequently,
+   the UI's headline Value match metric can credit an aborted query. The
+   missing error guards already existed in pre-phase `app.py`; the new returned
+   interrupt result makes this specific abort path reach scoring instead of
+   raising. This is an integration gap, not a newly invented comparator bug.
+   **Requested follow-up:** share outcome scoring, require both results to be
+   successful for every match metric, and test UI/CLI parity for aborted,
+   truncated, successful-empty and ordinary successful results.
+
+2. **P3 — The internals check also rejects harmless scalar functions.** In
+   [safety.py](../text_to_sql_agent/safety.py), lines 57-60 apply internal-table
+   name prefixes to every anonymous function call. `SELECT sqlite_version()`
+   and `SELECT sqlite_source_id()` both pass the validator at `2c8ad35`, fail at
+   `a08aac0`, and execute successfully under the current read-only executor.
+   Neither query reads an internal table. This is a new false rejection, with
+   low impact on the business-question demos. **Requested follow-up:** narrow
+   the check to table sources or explicitly document the broader function
+   restriction; retain the `dbstat` and quoted `pragma_*` regression coverage.
+
+**Design and handoff discussion:**
+
+- Phase 2 design §4.3 specifies `EvaluationCase`, `CaseOutcome` and `run_case`;
+  none exists in the shared module. The implementation plan's file table also
+  promises shared case running, but its implementation extracts only helpers.
+  No explicit decision to reduce that scope was found in `docs/3_decisions.md`.
+  The scoring divergence above demonstrates why the remaining seam matters.
+  Claude should either complete the shared outcome contract or record a scoped
+  alternative that still guarantees identical UI/CLI scoring.
+- [Next steps](4_next_steps.md), lines 13-15, says `execution.py` returns typed
+  error codes "rather than raising". That applies to the VM-step interrupt,
+  not every failure: a direct call with `SELECT * FROM missing_review_table`
+  still raises `sqlite3.OperationalError`, as intended and tested. Before Phase
+  3, describe this mixed contract precisely so new engines preserve repairable
+  SQL exceptions as well as returned abort/truncation results.
+
+**Fresh verification:** All commands used the current checkout, with
+`UV_CACHE_DIR=/private/tmp/aipa-review-uv` to keep the cache writable.
+
+- `uv run pytest` → **107 passed**.
+- `uv run ruff check .` → **All checks passed!**
+- `uv run ruff format --check .` → **59 files already formatted**.
+- `uv run mypy` → **no issues in 26 source files**.
+- `uv run python scripts/evaluate_text_to_sql.py --mode gold --out-dir
+  /private/tmp/aipa-claude-review-gold` → **12/12 exact result matches**.
+  Outputs stayed outside the repository; tracked benchmark artifacts were not
+  regenerated. The targeted abort probe above is additional evidence beyond
+  these twelve successful cases.
+
+**Limits:** No live provider calls or browser screenshot comparison were run in
+this review. The earlier pixel-equality claim is not independently reverified
+here. No write escape or abort-triggered repair regression was found in the
+reviewed paths; that is a bounded review result, not an exhaustive security
+guarantee. Claude can append a response with the chosen fixes, any disagreement
+and reproduction evidence, leaving both agents' original entries intact.
