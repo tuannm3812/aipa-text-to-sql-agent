@@ -2,6 +2,52 @@
 
 Newest first. Each entry states what was chosen and what it ruled out.
 
+## 2026-09-14 — share case *scoring*, not case *running*
+
+**Chosen:** `text_to_sql_agent.evaluation.score_case` returns a `CaseScore`
+(`executed`, `row_match`, `value_match`, `exact_match`), and both the Streamlit
+tab and `scripts/evaluate_text_to_sql.py` score exclusively through it. A test
+asserts neither harness compares rows itself.
+
+**Ruled out:** the full contract the Phase 2 design §4.3 specified —
+`EvaluationCase`, `CaseOutcome` and a shared `run_case`. Also ruled out: leaving
+the two harnesses to score independently.
+
+**Why:** Phase 2 extracted only the cell and row helpers, so the two harnesses
+still computed their own verdicts — and they disagreed. The UI compared rows
+with no error guard, so two failed queries each returning `[]` scored as a
+perfect match; a Codex review reproduced this with a gold query that trips the
+VM-step guard, where the UI reported `value_match=True` and the CLI reported
+`False`. Because an aborted query now *returns* a typed result rather than
+raising, that path reached scoring instead of blowing up, which is what exposed
+the gap.
+
+Sharing the verdict is what removes the divergence. Sharing the *running* of a
+case would also merge two genuinely different jobs: the CLI owns retries,
+provider backoff and CSV/Markdown output, while the UI owns Streamlit progress
+and a dataframe. Merging them is a larger refactor with no correctness payoff
+now that the verdict is common, so it is deliberately not done. The gold
+benchmark still reports 12/12, unchanged — the fix removes credit for failures,
+not for genuine passes.
+
+## 2026-09-14 — the internals check applies to table sources only
+
+**Chosen:** `_references_internals` flags a `sqlite_`/`pragma_`/`dbstat` function
+name only when it sits in a table-source position — reached through `FROM`, a
+`JOIN`, a derived table or a subquery.
+
+**Ruled out:** applying the name rules to every function call, which is what the
+first version did.
+
+**Why:** the broad form rejected harmless scalars. `SELECT sqlite_version()` and
+`SELECT sqlite_source_id()` read no internal table, executed fine under the
+read-only connection, and were allowed before Phase 2 — so blocking them was a
+new false rejection rather than a deliberate hardening. It was disclosed in a
+commit body at the time but never justified, and a Codex review was right to ask
+for it to be narrowed or documented. Every table-valued bypass stays blocked,
+including inside joins, derived tables and scalar subqueries, and the `dbstat`
+and quoted-`pragma_*` regression cases are retained.
+
 ## 2026-09-11 — relaxed mypy for `app.py`/`ui.*`/`scripts.*` rather than full strict
 
 **Chosen:** Extend `mypy`'s `files` to cover `app.py`, `ui/` and `scripts/` (26

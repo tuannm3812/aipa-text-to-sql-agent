@@ -10,9 +10,14 @@ Dialect/engine protocol behind `schema.py` and `execution.py`; SQLite becomes on
 implementation, DuckDB the second, PostgreSQL third. Must precede Phase 4 —
 schema chunking is engine-specific.
 
-Phase 2 left two seams this will build on: `execution.py` now returns typed
-error codes rather than raising, so a second engine has a contract to implement
-rather than an exception shape to imitate; and `is_safe_query` is SQLite-specific
+Phase 2 left two seams this will build on. First, `execution.py` has a **mixed**
+contract that a second engine must reproduce exactly: resource limits are
+*returned* as typed codes (`QUERY_ABORTED_AFTER_<n>_VM_STEPS`,
+`RESULT_TRUNCATED_TO_<n>_ROWS`), while genuine SQL errors — a missing table, a
+bad column — still **raise**, because `pipeline.py` relies on the exception to
+trigger its repair attempt. An engine that returned errors for both would
+silently disable repair; one that raised for both would resurrect the wasted
+LLM call on an aborted query. Second, `is_safe_query` is SQLite-specific
 today (its internals check keys off `sqlite_`/`pragma_` names), so the safety
 layer needs a per-dialect story before a second engine lands.
 
