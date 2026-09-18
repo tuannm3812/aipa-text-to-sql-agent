@@ -771,6 +771,13 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
   internals list is its own.
 - A `threading.Timer` calling `connection.interrupt()` aborts a runaway query
   with `duckdb.InterruptException`.
+- **`read_only=True` does not stop filesystem access.** Probed 2026-09-18:
+  `SELECT * FROM read_csv('<file>')` and `SELECT * FROM '<file>'` both read an
+  arbitrary file, `glob` lists directories, and `COPY … TO` writes a file — all
+  from a read-only connection. Adding `config={"enable_external_access": False}`
+  refuses every one with `duckdb.PermissionException`. **This setting is
+  mandatory.** The bare quoted-path form has no function call, so `is_safe_query`
+  cannot catch it by name; the connection setting is the load-bearing guard.
 
 - [ ] **Step 1: Add the optional dependency**
 
@@ -795,7 +802,9 @@ internal_prefixes = ("duckdb_", "pg_")
 internal_names = frozenset({"information_schema", "sqlite_master"})
 ```
 
-`execute` opens `read_only=True`, arms a `threading.Timer` for `work_limit`
+`execute` opens with `duckdb.connect(path, read_only=True,
+config={"enable_external_access": False})` — **both**, never `read_only` alone —
+then arms a `threading.Timer` for `work_limit`
 milliseconds calling `connection.interrupt()`, and converts
 `duckdb.InterruptException` into
 `QueryResult(error=f"QUERY_ABORTED_AFTER_{work_limit}_MS")`. **Cancel the timer
@@ -831,6 +840,61 @@ skipping with an explicit reason if the driver is absent:
         return open_engine(f"duckdb://{db}")
 ```
 
+- [ ] **Step 3a: Pin DuckDB's external-access guard**
+
+These are DuckDB-specific, so they go in a new `tests/test_engine_duckdb.py`, not
+the engine-agnostic conformance suite — the same reasoning that put SQLite's
+authorizer tests in `test_execution.py`. Each calls `engine.execute` directly,
+bypassing `is_safe_query`, and asserts refusal:
+
+```python
+import pytest
+
+duckdb = pytest.importorskip("duckdb", reason="install the duckdb extra")
+
+from text_to_sql_agent.engines import open_engine
+
+
+@pytest.fixture
+def secret_and_engine(tmp_path):
+    secret = tmp_path / "secret.csv"
+    secret.write_text("k,v\napi_key,hunter2\n", encoding="utf-8")
+    db = tmp_path / "t.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE t (a INTEGER)")
+    con.close()
+    return secret, open_engine(f"duckdb://{db}")
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "SELECT * FROM read_csv('{secret}')",
+        "SELECT * FROM '{secret}'",
+        "SELECT * FROM glob('{parent}/*')",
+    ],
+)
+def test_filesystem_reads_are_refused_by_the_connection(secret_and_engine, template):
+    secret, engine = secret_and_engine
+    sql = template.format(secret=secret, parent=secret.parent)
+    with pytest.raises(Exception) as caught:  # noqa: B017
+        engine.execute(sql, max_rows=10, work_limit=0)
+    assert "hunter2" not in str(caught.value)
+
+
+def test_copy_to_a_file_is_refused_by_the_connection(secret_and_engine, tmp_path):
+    _, engine = secret_and_engine
+    target = tmp_path / "exfil.csv"
+    with pytest.raises(Exception):  # noqa: B017
+        engine.execute(f"COPY (SELECT 1) TO '{target}'", max_rows=10, work_limit=0)
+    assert not target.exists(), "nothing may be written to disk"
+```
+
+**Prove it load-bearing:** remove only the `enable_external_access` config from
+`engines/duckdb.py` and confirm every one of these fails. Then restore and
+confirm `git diff` is empty. If any still passes without the setting, something
+else is refusing it and it is not pinning the guard — report which.
+
 - [ ] **Step 4: Run conformance for both engines**
 
 ```bash
@@ -865,14 +929,23 @@ for n in sorted(set(names)):
         leaks.append(q)
 for q in ["SELECT * FROM information_schema.tables",
           "SELECT * FROM pg_catalog.pg_tables",
-          "SELECT * FROM duckdb_settings()"]:
+          "SELECT * FROM duckdb_settings()",
+          "SELECT * FROM read_csv('/etc/hosts')",
+          "SELECT * FROM '/etc/hosts'",
+          "SELECT * FROM glob('/etc/*')"]:
     if is_safe_query(q, engine=engine):
         leaks.append(q)
 print("ALLOWED internals reads:", leaks or "none")
 EOF
 ```
 
-Every entry it prints is a hole. Add the missing prefixes or names, re-run until
+The last three are filesystem reads, not catalogue reads. The quoted-path form
+will likely still print as allowed, because it has no function name for
+`is_safe_query` to match — that is expected, and it is exactly why Step 3a pins
+`enable_external_access=false` as the load-bearing defence. Record whether it
+prints, and do not claim the validator covers it.
+
+Every other entry it prints is a hole. Add the missing prefixes or names, re-run until
 it prints `none`, and **record the probe output in your report** — it is the
 evidence that the list is complete.
 

@@ -58,6 +58,27 @@ Verified by probe:
 - `Connection.interrupt()` exists, so a work limit is implementable — though not
   via SQLite's progress-handler mechanism.
 
+### 3.2a DuckDB: `read_only` does not stop filesystem access
+
+Found 2026-09-18, before any DuckDB code existed, and it changes the design.
+`read_only=True` protects the *database file*, not the *filesystem*. Probed
+against a read-only connection with a planted `secret.csv`:
+
+| Statement | `read_only=True` only | + `enable_external_access=false` |
+|---|---|---|
+| `SELECT * FROM read_csv('<secret>')` | **read the file** — `api_key, hunter2` | refused |
+| `SELECT * FROM '<secret>'` — a bare quoted path, no function | **read the file** | refused |
+| `SELECT * FROM glob('<dir>/*')` | **listed the directory** | refused |
+| `COPY (SELECT 1) TO '<path>'` | **wrote a file to disk** | refused |
+| `ATTACH '<other.duckdb>' AS o` | allowed | refused |
+
+The first three parse as an ordinary `SELECT`, so they pass `is_safe_query`'s
+structural rules. The second has no function call at all, so **no denylist of
+function names can catch it**. The only complete defence is DuckDB's
+`enable_external_access = false` connection setting, which refused all of them
+with `PermissionException`. It is to DuckDB what the authorizer is to SQLite: the
+connection-layer guard that holds even if the validator is bypassed.
+
 ### 3.3 sqlglot covers all three dialects
 
 `sqlglot.parse_one(sql, read=d)` works for `sqlite`, `duckdb` and `postgres`, so
@@ -114,7 +135,7 @@ the fix.
 | Engine | Mechanism |
 |---|---|
 | SQLite | `mode=ro` URI, `PRAGMA query_only`, the existing 28-constant authorizer. Unchanged. |
-| DuckDB | `read_only=True` on connect, verified to refuse writes natively. |
+| DuckDB | `read_only=True` **and** `config={"enable_external_access": False}` on connect. `read_only` alone refuses database writes but still permits reading and writing arbitrary files — see §3.2a. Both are mandatory. |
 | PostgreSQL | A dedicated read-only role **and** `BEGIN TRANSACTION READ ONLY` per statement. Both, not either: the transaction flag is the per-statement guarantee, the role is what survives a driver that resets state. |
 
 ### 4.3 The conformance suite is the real deliverable
@@ -302,6 +323,14 @@ needs changing to fit DuckDB, that is the protocol working, not a failure.
 the serious one. Mitigation: conformance test 2 bypasses `is_safe_query` and
 attacks the connection directly, so an engine whose read-only enforcement is
 nominal fails. No engine may be added without passing the suite.
+
+**A new engine exposes the filesystem, not just its catalogue.** DuckDB's
+`read_csv`, `glob`, `COPY TO` and bare quoted-path table references reach the
+disk from a `read_only` connection (§3.2a). PostgreSQL has analogues —
+`pg_read_file`, `COPY … FROM PROGRAM`, `lo_import` — which 3b must probe the same
+way. Mitigation: each engine's connection-layer setting that disables external
+access is mandatory, is pinned by a test that bypasses `is_safe_query`, and is
+proven load-bearing by removing it.
 
 **The internals blocklists are incomplete.** Assume they are, because SQLite's
 was. Each engine's list must be probed against its own catalogue before the phase
