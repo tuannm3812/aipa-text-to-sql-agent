@@ -285,3 +285,24 @@ SQLITE DIALECT (must follow):
         path = Path(self.dsn).resolve()
         stat = path.stat()
         return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+
+    def table_names(self) -> frozenset[str]:
+        """Every user table's name, lowercased, via the cached schema chunks.
+
+        `is_safe_query`'s default-deny table check never actually reaches
+        this for SQLite - `SQLiteEngine.allowed_functions` is `None`, so
+        `safety.is_safe_query` never calls `table_names()` in the first
+        place - but the method is implemented for real, not stubbed, so it
+        stays correct if anything else ever calls it directly.
+
+        Deferred import: `schema.py` imports this package (`from .engines
+        import open_engine`) at its own module level, so importing it back
+        from here at *this* module's top level would risk a circular import
+        depending on which module happens to be imported first; deferring it
+        to call time, after both modules are already loaded, avoids that
+        while still reusing `schema.py`'s single fingerprint-keyed cache
+        rather than a second, driftable one here.
+        """
+        from ..schema import get_schema_chunks
+
+        return frozenset(chunk.table_name.lower() for chunk in get_schema_chunks(self.dsn))

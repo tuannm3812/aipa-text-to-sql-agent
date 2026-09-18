@@ -558,5 +558,31 @@ DUCKDB DIALECT (must follow):
         stat = path.stat()
         return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
 
+    def table_names(self) -> frozenset[str]:
+        """Every user table's name, lowercased, via the cached schema chunks.
+
+        This is what `safety.is_safe_query`'s default-deny table check
+        (`_references_unknown_table`) calls to tell a real table from a
+        replacement-scan path or an unattached schema like
+        `information_schema` - see that function's docstring for the full
+        reasoning on why table existence, not a quoting heuristic, is what
+        closes that gap.
+
+        Routed through `schema.get_schema_chunks` with the `duckdb://`
+        scheme reattached (`self.dsn` is the bare filesystem path -
+        `open_engine` strips the scheme before constructing this class) so
+        this shares `schema.py`'s single fingerprint-keyed cache rather than
+        a second, driftable one here: the expensive catalogue read only
+        happens again when `schema_fingerprint()` actually changes, and
+        every other call is a cheap `Path.stat()` plus a cache hit.
+
+        Deferred import for the same circular-import reason as
+        `SQLiteEngine.table_names` - see that method's docstring.
+        """
+        from ..schema import get_schema_chunks
+
+        chunks = get_schema_chunks(f"duckdb://{self.dsn}")
+        return frozenset(chunk.table_name.lower() for chunk in chunks)
+
 
 __all__ = ["DuckDBEngine"]

@@ -40,10 +40,13 @@ class Engine(Protocol):
     table-source position) - SQLite stays here, since its function surface is
     small and that list has held. A `frozenset[str]` switches to default-deny:
     every function call anywhere in the query - scalar, aggregate, window or
-    table - must resolve to a name in the set, or the query is rejected. See
-    `DuckDBEngine.allowed_functions` for why DuckDB needed the stronger
-    guarantee and `text_to_sql_agent/safety.py`'s `_resolve_function_name` for
-    how a parsed call is resolved to a name to check.
+    table - must resolve to a name in the set, or the query is rejected, and
+    every `FROM`/`JOIN` target must name a real table (from `table_names()`)
+    or a CTE defined in the same statement. See `DuckDBEngine.allowed_functions`
+    for why DuckDB needed the stronger guarantee,
+    `text_to_sql_agent/safety.py`'s `_resolve_function_name` for how a parsed
+    call is resolved to a name to check, and `_references_unknown_table` for
+    the table rule.
     """
 
     name: str
@@ -75,4 +78,15 @@ class Engine(Protocol):
 
     def schema_fingerprint(self) -> tuple[object, ...]:
         """A value that changes when the schema changes, for cache keying."""
+        ...
+
+    def table_names(self) -> frozenset[str]:
+        """Every user table's name, lowercased.
+
+        Used by `safety.is_safe_query`'s default-deny table check
+        (`_references_unknown_table`) - only called for an engine whose
+        `allowed_functions` is not `None`. Implementations should reuse
+        `schema.py`'s fingerprint-keyed schema-chunk cache rather than
+        issuing a fresh catalogue query on every call.
+        """
         ...

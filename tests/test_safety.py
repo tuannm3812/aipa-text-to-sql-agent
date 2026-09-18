@@ -224,25 +224,60 @@ def test_is_safe_query_internal_prefixes_also_come_from_the_engine() -> None:
     assert not agent.is_safe_query(sql, engine=_FakeInternalsEngine())
 
 
-def test_is_safe_query_blocks_a_schema_qualified_internal_reference() -> None:
+@pytest.fixture(scope="module")
+def duckdb_engine_with_tables(tmp_path_factory):
+    """A real DuckDB file with tables `t` and `tables`, for Task 6b tests
+    that need `is_safe_query`'s default-deny table check
+    (`_references_unknown_table`) to have real tables to check against.
+
+    `DuckDBEngine("unused.duckdb")`, used throughout this file's DuckDB
+    tests before Fix 1, stopped being enough once that check started
+    calling `engine.table_names()`, which needs a real, connectable
+    database - a nonexistent path now raises rather than quietly validating
+    on attributes alone. `tables` is created deliberately: it is what proves
+    a table that merely *looks* like the `information_schema.tables`
+    internal stays allowed when referenced unqualified.
+    """
+    duckdb = pytest.importorskip("duckdb", reason="install the duckdb extra")
+    from text_to_sql_agent.engines import open_engine
+
+    db = tmp_path_factory.mktemp("safety_default_deny") / "t.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE t (a INTEGER)")
+    con.execute('CREATE TABLE "tables" (a INTEGER)')
+    con.close()
+    return open_engine(f"duckdb://{db}")
+
+
+def test_is_safe_query_blocks_a_schema_qualified_internal_reference(
+    duckdb_engine_with_tables,
+) -> None:
     """`information_schema.tables` must be blocked via its schema qualifier.
 
     Found during Task 6's Step 5 DuckDB probe: `table.name` alone is "tables",
     which is not itself internal (a table genuinely named "tables" must stay
     allowed unqualified), so the schema qualifier ("information_schema") has
     to be checked too, or a schema-qualified reference to it slips through.
-    """
-    pytest.importorskip("duckdb", reason="install the duckdb extra")
-    from text_to_sql_agent.engines.duckdb import DuckDBEngine
 
-    engine = DuckDBEngine("unused.duckdb")
+    Task 6b's `_references_unknown_table` (Fix 1) enforces this same
+    schema-qualifier rule independently, for a different reason: any schema
+    other than `main` fails regardless of whether the bare name matches a
+    real table. Both gates agree here, which is why `tables` - a table this
+    engine's own database really has - is what proves the unqualified form
+    stays allowed rather than merely "not yet found to be blocked".
+    """
+    engine = duckdb_engine_with_tables
     assert not agent.is_safe_query("SELECT * FROM information_schema.tables", engine=engine)
     assert not agent.is_safe_query("SELECT * FROM pg_catalog.pg_tables", engine=engine)
-    # An unqualified table actually named "tables" must stay allowed.
+    # An unqualified table actually named "tables" (created by the
+    # `duckdb_engine_with_tables` fixture) must stay allowed - it is the
+    # schema qualifier, not the bare name, that makes the first two rejected.
     assert agent.is_safe_query("SELECT * FROM tables", engine=engine)
 
 
-def test_is_safe_query_blocks_duckdb_filesystem_functions_it_can_name() -> None:
+def test_is_safe_query_blocks_duckdb_filesystem_functions_it_can_name(
+    duckdb_engine_with_tables,
+) -> None:
     """`read_csv`/`read_parquet` parse as sqlglot's own expression classes, not
     `exp.Anonymous`, so their function name lives behind `.sql_name()` rather
     than `.name`. Found during Task 6's Step 5 probe: `read_csv(...)` passed
@@ -252,16 +287,16 @@ def test_is_safe_query_blocks_duckdb_filesystem_functions_it_can_name() -> None:
 
     The bare quoted-path form (`SELECT * FROM '<path>'`) used to be an
     accepted gap here, since it has no function name at all for a name-based
-    check to match. Task 6b's default-deny gate closes it structurally
-    instead: `_has_string_literal_table_source` rejects any `FROM`/`JOIN`
-    target that is a quoted string rather than a name, independent of
-    `read_csv` even existing. See `test_is_safe_query_rejects_a_bare_quoted_
-    path_table_source` for that gate on its own.
+    check to match. Task 6b's default-deny gate closes it, but not with a
+    quoting heuristic - Fix 1 replaced that first attempt
+    (`_has_string_literal_table_source`, which missed the unquoted and
+    double-quoted forms of the same replacement-scan read) with
+    `_references_unknown_table`: any `FROM`/`JOIN` target that is not a real
+    table is rejected, independent of quoting style and independent of
+    `read_csv` even existing. See `test_is_safe_query_rejects_unknown_table_
+    references` for that gate on its own.
     """
-    pytest.importorskip("duckdb", reason="install the duckdb extra")
-    from text_to_sql_agent.engines.duckdb import DuckDBEngine
-
-    engine = DuckDBEngine("unused.duckdb")
+    engine = duckdb_engine_with_tables
     assert not agent.is_safe_query("SELECT * FROM read_csv('/etc/hosts')", engine=engine)
     assert not agent.is_safe_query("SELECT * FROM read_parquet('/etc/x.parquet')", engine=engine)
     assert not agent.is_safe_query("SELECT * FROM glob('/etc/*')", engine=engine)
@@ -283,58 +318,123 @@ def test_is_safe_query_fails_closed_on_non_string_input() -> None:
     assert not safety.is_safe_query(None)  # type: ignore[arg-type]
 
 
-# --- Task 6b: DuckDB's default-deny function allowlist ---
+# --- Task 6b: DuckDB's default-deny function *and table* allowlist ---
 # The mechanism itself (`_resolve_function_name`, `_FUNCTION_NAME_OVERRIDES`,
 # the round trip for every entry in `DuckDBEngine.allowed_functions`, the
-# full-catalogue sweep, the analytics corpus, and the two pinned leaks) is
+# full-catalogue sweep, the analytics corpus, and the pinned leaks) is
 # exercised in `tests/test_engine_duckdb.py`, since it only ever activates
 # for an engine whose `allowed_functions` is a set - today, only DuckDB.
-# These few tests stay here because they are about `is_safe_query`'s general
+# These tests stay here because they are about `is_safe_query`'s general
 # contract: that default-deny is skipped entirely for an engine that opts
-# out (`allowed_functions is None`), and that an unrecognised function is
-# rejected in a table-source position specifically, which is the one
-# `_has_string_literal_table_source` covers and nothing else in this file
-# does.
+# out (`allowed_functions is None`), that an unrecognised function is
+# rejected regardless of position, and that a `FROM`/`JOIN` target naming no
+# real table is rejected regardless of how it is quoted - the last of which
+# is `_references_unknown_table`'s job and nothing else in this file's.
 
 
-def test_is_safe_query_rejects_a_bare_quoted_path_table_source() -> None:
-    """Step 2: `FROM '<path>'` is rejected in default-deny mode even though it
-    names no function at all for `_references_disallowed_function` to catch.
+def test_is_safe_query_rejects_unknown_table_references(duckdb_engine_with_tables) -> None:
+    """Fix 1 (2026-09-19 review round): every quoting style DuckDB's
+    replacement scan accepts is rejected, plus a comma-join and a `JOIN`.
 
-    Also proves the case `_has_string_literal_table_source` exists
-    specifically to get right: sqlglot parses a double-quoted identifier and
-    a single-quoted string used as a table source into the *same*
-    `exp.Identifier(quoted=True)` node, so a real double-quoted table name
-    must stay allowed while the string-literal form is rejected - the
-    tokenizer-level check is what tells them apart, not the parsed AST.
+    Task 6b's first attempt (`_has_string_literal_table_source`, deleted)
+    checked the token immediately after `FROM`/`JOIN` for a `STRING` token,
+    which only ever caught the single-quoted form. Verified live with
+    external access enabled (2026-09-19) that DuckDB's replacement scan
+    reads a file identically whether the path is single-quoted, double-quoted,
+    or not quoted at all - `FROM 'data.csv'`, `FROM "data.csv"` and `FROM
+    data.csv` all read the file - so a token-type check could never have
+    covered the last two: sqlglot's own parse tree gives `"data.csv"` and
+    `'data.csv'` the *same* `exp.Identifier(quoted=True)` node, indistinguishable
+    from a real double-quoted table name, and unquoted `data.csv` parses as
+    an ordinary schema-qualified reference (`db="data"`, `name="csv"`), no
+    different in shape from `main.orders`. `_references_unknown_table`
+    replaces the heuristic with the actual question: does this name a real
+    table? None of these five names ever could.
     """
-    pytest.importorskip("duckdb", reason="install the duckdb extra")
-    from text_to_sql_agent.engines.duckdb import DuckDBEngine
-
-    engine = DuckDBEngine("unused.duckdb")
-    assert not agent.is_safe_query("SELECT * FROM '/etc/passwd'", engine=engine)
-    assert not agent.is_safe_query("SELECT * FROM t JOIN '/etc/passwd' ON 1=1", engine=engine)
-    assert not agent.is_safe_query("SELECT a FROM 'my/data.parquet'", engine=engine)
-    # Control: a genuinely double-quoted identifier is not a string literal
-    # and must stay allowed.
+    engine = duckdb_engine_with_tables
+    assert not agent.is_safe_query("SELECT * FROM 'data.csv'", engine=engine)
+    assert not agent.is_safe_query('SELECT * FROM "data.csv"', engine=engine)
+    assert not agent.is_safe_query("SELECT * FROM data.csv", engine=engine)
+    assert not agent.is_safe_query("SELECT * FROM t, 'data.csv'", engine=engine)
+    assert not agent.is_safe_query("SELECT * FROM t JOIN 'data.csv' ON true", engine=engine)
+    # Pinned here too, not just in test_is_safe_query_blocks_a_schema_
+    # qualified_internal_reference: information_schema is a real DuckDB
+    # schema, not a nonexistent path, so it exercises the schema-qualifier
+    # branch of this same function rather than the "no such table" branch
+    # the five assertions above exercise.
+    assert not agent.is_safe_query("SELECT * FROM information_schema.tables", engine=engine)
+    # Controls: a real double-quoted identifier, a real schema-qualified
+    # reference to a real table, and a string literal that is not a
+    # FROM/JOIN target, must all stay allowed.
     assert agent.is_safe_query('SELECT * FROM "t"', engine=engine)
-    # Control: a string literal that is not a FROM/JOIN target (e.g. inside
-    # WHERE) must not be flagged - only the token position matters.
-    assert agent.is_safe_query("SELECT * FROM t WHERE note = 'FROM'", engine=engine)
+    assert agent.is_safe_query("SELECT * FROM main.t", engine=engine)
+    assert agent.is_safe_query("SELECT * FROM t WHERE a = 'data.csv'", engine=engine)
+
+
+def test_default_deny_table_check_is_load_bearing(monkeypatch, duckdb_engine_with_tables) -> None:
+    """Kills `_references_unknown_table` directly, proving it - not some
+    other check - is what rejects the unquoted and double-quoted forms.
+
+    Neutering it (always returning `False`, as if every table existed) flips
+    both from rejected to allowed. That both were rejected *before* this
+    patch and are *not* rejected once it is neutered is the demonstration
+    that this function is genuinely load-bearing for them, and that neither
+    form was ever caught by anything else in `is_safe_query` - the same
+    proof `test_is_safe_query_rejects_unknown_table_references` above states
+    from the DuckDB-behaviour side; this states it from the code side.
+    """
+    from text_to_sql_agent import safety
+
+    engine = duckdb_engine_with_tables
+    assert not agent.is_safe_query("SELECT * FROM data.csv", engine=engine)
+    assert not agent.is_safe_query('SELECT * FROM "data.csv"', engine=engine)
+
+    monkeypatch.setattr(safety, "_references_unknown_table", lambda *args, **kwargs: False)
+
+    assert agent.is_safe_query("SELECT * FROM data.csv", engine=engine)
+    assert agent.is_safe_query('SELECT * FROM "data.csv"', engine=engine)
+
+
+def test_list_aggregate_dispatch_argument_is_validated(duckdb_engine_with_tables) -> None:
+    """Fix 1: `list_aggregate`'s own name being in `allowed_functions` is not
+    enough - its second argument names a *different* function to actually
+    run (`duckdb_functions()` itself calls that parameter `function_name`),
+    and that name must independently be allowed too, or the call is
+    rejected outright.
+
+    `list_aggregate([...], 'histogram')` really does run `histogram` against
+    the list at the SQL level, even though `histogram` is correctly rejected
+    everywhere else `is_safe_query` would see it - proven live against this
+    build before this fix existed. A non-literal second argument (a column
+    reference here) is rejected too, since no static check can know what it
+    would dispatch to.
+    """
+    engine = duckdb_engine_with_tables
+    assert agent.is_safe_query("SELECT list_aggregate(a, 'sum') FROM t", engine=engine)
+    assert agent.is_safe_query("SELECT list_aggregate(a, 'count') FROM t", engine=engine)
+    assert not agent.is_safe_query("SELECT list_aggregate(a, 'histogram') FROM t", engine=engine)
+    assert not agent.is_safe_query("SELECT list_aggregate(a, 'checkpoint') FROM t", engine=engine)
+    assert not agent.is_safe_query("SELECT list_aggregate(a, a) FROM t", engine=engine)
+    # The four aliases of the same scalar function are already rejected
+    # outright by name (none are in DuckDBEngine.allowed_functions), so the
+    # dispatch-argument rule never even has to run for them - but confirm
+    # they stay rejected regardless of which argument they are given.
+    for alias in ("array_aggregate", "list_aggr", "array_aggr", "aggregate"):
+        assert not agent.is_safe_query(f"SELECT {alias}(a, 'sum') FROM t", engine=engine)
 
 
 def test_is_safe_query_default_deny_is_skipped_when_allowed_functions_is_none() -> None:
     """Kills the `if allowed_functions is not None:` guard in `_is_safe_ast`.
 
     SQLite's `allowed_functions` is `None`, so neither the function-name
-    gate nor the string-literal-table-source gate may run for it - both are
-    DuckDB-only today. This uses a function name that is real DuckDB syntax
-    but is nowhere in `DuckDBEngine.allowed_functions`
-    (`current_setting`, proven live-leaking in the task brief) against
-    `SQLiteEngine`: since sqlglot's SQLite dialect parses it as an ordinary
-    unrecognised identifier/function call rather than rejecting the text
-    outright, this only stays allowed under SQLite if default-deny is
-    genuinely skipped rather than accidentally applied with an empty set.
+    gate nor the table-existence gate may run for it - both are DuckDB-only
+    today. This uses a function name that is real DuckDB syntax but is
+    nowhere in `DuckDBEngine.allowed_functions` (`current_setting`, proven
+    live-leaking in the task brief) against `SQLiteEngine`: since sqlglot's
+    SQLite dialect parses it as an ordinary unrecognised identifier/function
+    call rather than rejecting the text outright, this only stays allowed
+    under SQLite if default-deny is genuinely skipped rather than
+    accidentally applied with an empty set.
     """
     from text_to_sql_agent.engines.sqlite import SQLiteEngine
 

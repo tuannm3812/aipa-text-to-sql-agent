@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from types import ModuleType
 from typing import TYPE_CHECKING
 
@@ -21,6 +22,18 @@ except ModuleNotFoundError:  # pragma: no cover
     exp = None
 
 _ALLOWED_PREFIX = re.compile(r"(?is)^(select|with)\b")
+
+
+def _no_table_names() -> frozenset[str]:
+    """The `get_real_table_names` default for `engine=None` (SQLite).
+
+    Never called in practice, since `SQLiteEngine.allowed_functions` is
+    `None` and `_references_unknown_table` only runs when it isn't - exists
+    so the `engine=None` path has a value of the right type to pass down
+    without instantiating `SQLiteEngine` or touching the filesystem.
+    """
+    return frozenset()
+
 
 # sqlglot parses many function calls into typed classes (`exp.Count`,
 # `exp.Upper`, `exp.TimestampTrunc`, ...) rather than leaving them as
@@ -129,6 +142,69 @@ def _resolve_function_name(node: sqlglot_exp.Func) -> str:
     return node.sql_name().lower()  # type: ignore[no-any-return, no-untyped-call]
 
 
+# Fix 1 (2026-09-19 review round): DuckDB registers five functions whose
+# *second argument* names another function to run at the SQL level rather
+# than compute anything itself - `duckdb_functions()`'s own catalogue calls
+# that parameter `function_name` for exactly these five:
+# `list_aggregate`, `array_aggregate`, `list_aggr`, `array_aggr`,
+# `aggregate` (all synonyms of the same scalar function; verified against
+# `duckdb_functions()` directly, not guessed). `list_aggregate([...],
+# 'histogram')` really does run `histogram` against the list, even though
+# `histogram` is correctly rejected everywhere else in this file. Only
+# `list_aggregate` is in `DuckDBEngine.allowed_functions` today - the other
+# four are already rejected outright by `_references_disallowed_function`
+# since no literal spelling of them is in that set - but all five are listed
+# here so the dispatch-argument rule below still applies if one of the other
+# four is ever added.
+_STRING_DISPATCH_FUNCTIONS: frozenset[str] = frozenset(
+    {"list_aggregate", "array_aggregate", "list_aggr", "array_aggr", "aggregate"}
+)
+
+
+def _dispatches_to_disallowed_function(
+    node: sqlglot_exp.Func, resolved_name: str, *, allowed_functions: frozenset[str]
+) -> bool:
+    """True if `node` is a string-dispatch call whose target isn't allowed.
+
+    Being a member of `allowed_functions` by its own name is not enough for
+    one of `_STRING_DISPATCH_FUNCTIONS`: its second argument must *also* be a
+    string literal naming a function that is itself in `allowed_functions`.
+    A non-literal second argument (a column, an expression, anything whose
+    value is not known until DuckDB evaluates it) is rejected too, since this
+    check cannot then know what it would dispatch to - and neither can any
+    static check.
+
+    This closes a gap the function-name gate cannot see by construction:
+    `list_aggregate` itself resolves to an allowed name and is not rejected
+    by `_references_disallowed_function`, but the aggregate it actually runs
+    is named by a second, independent argument that gate never inspects.
+
+    Args:
+        node: A parsed `exp.Func` node already known to resolve to a name in
+            `allowed_functions`.
+        resolved_name: `_resolve_function_name(node)`, passed in rather than
+            recomputed since the caller already has it.
+        allowed_functions: The engine's function allowlist.
+
+    Returns:
+        True if `node` is one of `_STRING_DISPATCH_FUNCTIONS` and its
+        dispatch argument is missing, not a string literal, or names a
+        function not in `allowed_functions`.
+    """
+    if exp is None:
+        return True
+    if resolved_name not in _STRING_DISPATCH_FUNCTIONS:
+        return False
+    args = getattr(node, "expressions", None) or []
+    if len(args) < 2:
+        return True
+    dispatch_arg = args[1]
+    if not (isinstance(dispatch_arg, exp.Literal) and dispatch_arg.is_string):
+        return True
+    target = (dispatch_arg.this or "").lower()
+    return target not in allowed_functions
+
+
 def _references_disallowed_function(
     parsed: sqlglot_exp.Expression, *, allowed_functions: frozenset[str]
 ) -> bool:
@@ -144,6 +220,10 @@ def _references_disallowed_function(
     rejected regardless of where it appears, rather than relying on anyone
     having thought to list it.
 
+    Also rejects a call whose own name is allowed but which dispatches, via a
+    second string-literal argument, to a function that is not - see
+    `_dispatches_to_disallowed_function`.
+
     Args:
         parsed: The parsed statement.
         allowed_functions: The engine's function allowlist. Only called when
@@ -155,54 +235,100 @@ def _references_disallowed_function(
     if exp is None:
         return True
     for function in parsed.find_all(exp.Func):
-        if _resolve_function_name(function) not in allowed_functions:
+        resolved = _resolve_function_name(function)
+        if resolved not in allowed_functions:
+            return True
+        if _dispatches_to_disallowed_function(
+            function, resolved, allowed_functions=allowed_functions
+        ):
             return True
     return False
 
 
-def _has_string_literal_table_source(sql_string: str, *, dialect: str) -> bool:
-    """True if a `FROM`/`JOIN` target is a quoted string literal, not a name.
+def _references_unknown_table(
+    parsed: sqlglot_exp.Expression, *, get_real_table_names: Callable[[], frozenset[str]]
+) -> bool:
+    """True if any `FROM`/`JOIN` target is not a real table or a CTE name.
 
-    DuckDB accepts a bare quoted path as a table source - `FROM
-    '/etc/passwd'` - with no function name involved at all, which is exactly
-    why `_references_disallowed_function` alone cannot catch it. The parsed
-    AST cannot either: sqlglot folds *both* a double-quoted identifier
-    (`FROM "t"`) and a single-quoted string used as a table source (`FROM
-    '/etc/passwd'`) into the same `exp.Identifier(quoted=True)` node, so
-    `table.this` carries no trace of which quote character was used. The
-    tokenizer keeps them apart - `IDENTIFIER` for the former, `STRING` for the
-    latter - so this checks the token stream directly instead of re-deriving
-    the distinction from a parse tree that has already erased it.
+    Default-deny extended from functions to tables (2026-09-19 review
+    round): a bare quoted path (`FROM '/etc/passwd'`), a double-quoted one
+    (`FROM "data.csv"`), an entirely unquoted one that merely looks
+    schema-qualified (`FROM data.csv`, which DuckDB's replacement scan reads
+    as a file the same as the other two), and a comma-joined or `JOIN`ed
+    string literal (`FROM orders, '/etc/passwd'`) all parse to an
+    `exp.Table` whose name is not a real table - none of them name any
+    function at all, so `_references_disallowed_function` cannot reach any
+    of them, and no per-quote-style token heuristic can either (DuckDB's
+    replacement scan treats all three quoting styles identically; verified
+    live 2026-09-19 with external access enabled that all three read the
+    file). Checking table existence directly is the one rule that covers
+    every quoting style, comma joins, and `JOIN`, uniformly.
 
-    Only the token immediately after `FROM`/`JOIN` is checked, which is
-    narrow by design: a function call's argument list always has the
-    function's own identifier token in that position (`FROM
-    json_each('[1]')` sees `VAR` there, not `STRING`), and old-style comma
-    joins (`FROM a, 'x'`) are not covered - the connection's
-    `enable_external_access=False` is what's actually load-bearing against a
-    bare path table source; this only makes the validator agree with it
-    rather than relying on that second layer alone.
+    A schema-qualified reference is only accepted when the schema is `main`
+    - DuckDB's fixed default schema name for every database this engine
+    opens, verified via `SELECT current_schema()` - or absent entirely. Any
+    other schema (`information_schema`, `pg_catalog`, or anything else) is
+    rejected regardless of whether the bare table name happens to match one
+    of the user's own tables, which is what makes `information_schema.tables`
+    rejected here even though a table literally named `tables` is fine
+    unqualified. A catalog-qualified (three-part) reference is rejected
+    outright rather than resolved: the engine's own catalog name varies per
+    database file and nothing in the LLM's prompt ever teaches a three-part
+    name, so there is no legitimate query this could cost.
+
+    A table-valued function call (`FROM range(5)`, `FROM read_csv(...)`,
+    `FROM histogram_values(...)`) also parses to an `exp.Table`, but its
+    `.this` is an `exp.Func` node rather than a plain identifier - those are
+    left entirely to `_references_disallowed_function` instead, which is
+    what actually gates them; treating a table-valued function's own name as
+    "not a real table" here would reject `range(5)` even though it is
+    correctly allowed.
+
+    A CTE alias defined anywhere in the statement counts as a real table for
+    this purpose (`WITH totals AS (...) SELECT * FROM totals`) - collected
+    across the whole parsed tree rather than scoped precisely to where each
+    CTE is visible, which only widens what counts as a known name, never
+    narrows it below what SQL scoping would allow.
+
+    `get_real_table_names` is a zero-argument callable rather than an
+    already-computed set: it is only invoked once at least one table
+    reference has survived the checks above (not a table-valued function,
+    not catalog-qualified, not schema-qualified to anything but `main`) and
+    still needs a real name to compare against. A query with no `FROM`
+    clause at all (`SELECT current_setting('x')`), or one whose only table
+    reference is a table-valued function (`FROM range(5)`), never calls it -
+    `Engine.table_names()` does at least a cache-key `Path.stat()`, and
+    there is no reason to pay even that for a query this function will
+    return `False` for regardless.
 
     Args:
-        sql_string: The SQL text to check (already validated to parse).
-        dialect: The sqlglot dialect to tokenize under.
+        parsed: The parsed statement.
+        get_real_table_names: Returns the engine's own table names,
+            lowercased - see `Engine.table_names()`.
 
     Returns:
-        True if a string literal sits directly after `FROM` or `JOIN`.
+        True if the statement must be rejected.
     """
-    if sqlglot is None:
+    if exp is None:
+        return True
+    candidates: list[str] = []
+    for table in parsed.find_all(exp.Table):
+        if isinstance(table.this, exp.Func):
+            continue
+        if (table.catalog or "").lower():
+            return True
+        schema = (table.db or "").lower()
+        if schema and schema != "main":
+            return True
+        candidates.append((table.name or "").lower())
+    if not candidates:
         return False
-    from sqlglot.tokens import TokenType
-
-    try:
-        tokens = sqlglot.Dialect.get_or_raise(dialect).tokenize(sql_string)
-    except Exception:
-        return False
-    for i, token in enumerate(tokens[:-1]):
-        if (
-            token.token_type in (TokenType.FROM, TokenType.JOIN)
-            and tokens[i + 1].token_type == TokenType.STRING
-        ):
+    cte_names = {(cte.alias or "").lower() for cte in parsed.find_all(exp.CTE)}
+    real_table_names = get_real_table_names()
+    for name in candidates:
+        if name in cte_names:
+            continue
+        if name not in real_table_names:
             return True
     return False
 
@@ -325,6 +451,7 @@ def _is_safe_ast(
     internal_prefixes: tuple[str, ...],
     internal_names: frozenset[str],
     allowed_functions: frozenset[str] | None,
+    get_real_table_names: Callable[[], frozenset[str]],
 ) -> bool:
     """Reject anything that parses to more than one statement or writes data.
 
@@ -358,10 +485,18 @@ def _is_safe_ast(
     # engine that opted into it (DuckDB). `None` (SQLite) skips both of these
     # entirely, so SQLite's behaviour is unchanged by construction, not just
     # by test coverage.
+    #
+    # The function check runs before the table check deliberately: it never
+    # needs `get_real_table_names()` (no I/O), and most rejected queries are
+    # rejected on function name alone, so ordering this first means the
+    # (cached, but still real) catalogue lookup behind the table check is
+    # skipped for every one of those - not just an optimisation, since it is
+    # also what lets tests exercise the function gate without needing a real
+    # database backing every `FROM` clause they write.
     if allowed_functions is not None:
-        if _has_string_literal_table_source(sql_string, dialect=dialect):
-            return False
         if _references_disallowed_function(parsed, allowed_functions=allowed_functions):
+            return False
+        if _references_unknown_table(parsed, get_real_table_names=get_real_table_names):
             return False
 
     forbidden = (
@@ -405,10 +540,13 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         engine: The engine to validate against - its `sqlglot_dialect` picks
             the parser dialect, its `internal_prefixes`/`internal_names` pick
             the internals blocklist, and its `allowed_functions` switches on
-            default-deny function validation when it is a set rather than
-            `None`. Defaults to `None`, meaning SQLite - resolved from
+            default-deny function *and table* validation when it is a set
+            rather than `None`, calling `engine.table_names()` only in that
+            case. Defaults to `None`, meaning SQLite - resolved from
             `SQLiteEngine`'s own class attributes, so this stays a single
-            source rather than a second, driftable copy of its blocklist.
+            source rather than a second, driftable copy of its blocklist,
+            and performs no I/O: `engine=None` never reads a table list,
+            exactly as before this function had one to read.
             Every pre-engine caller and the notebook keep working unchanged.
 
     Returns:
@@ -433,15 +571,34 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         internal_prefixes: tuple[str, ...] = SQLiteEngine.internal_prefixes
         internal_names: frozenset[str] = SQLiteEngine.internal_names
         allowed_functions: frozenset[str] | None = SQLiteEngine.allowed_functions
+        get_real_table_names: Callable[[], frozenset[str]] = _no_table_names
     else:
         dialect = engine.sqlglot_dialect
         internal_prefixes = engine.internal_prefixes
         internal_names = engine.internal_names
         allowed_functions = engine.allowed_functions
+        # A closure, not an eagerly-computed value: `engine.table_names()`
+        # reads the schema (cached by `schema.py`'s own fingerprint-keyed
+        # cache, so this is a cheap fingerprint check on every call and a
+        # real catalogue read only when the schema has actually changed),
+        # and `_is_safe_ast`/`_references_unknown_table` only call it at all
+        # when default-deny is on for this engine *and* the parsed statement
+        # has a real table reference left to check - a query rejected on
+        # function name alone, or one with no table reference at all, never
+        # triggers it. The attribute itself is only read when
+        # `allowed_functions is not None`, too: an engine that opts out of
+        # default-deny is not required to implement `table_names()` at all
+        # (see `Engine.table_names`'s docstring), and binding the method
+        # unconditionally would raise `AttributeError` for one that doesn't,
+        # even though it would never actually be called.
+        get_real_table_names = (
+            engine.table_names if allowed_functions is not None else _no_table_names
+        )
     return _is_safe_ast(
         s,
         dialect=dialect,
         internal_prefixes=internal_prefixes,
         internal_names=internal_names,
         allowed_functions=allowed_functions,
+        get_real_table_names=get_real_table_names,
     )

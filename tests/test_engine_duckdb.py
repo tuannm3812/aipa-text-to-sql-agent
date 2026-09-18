@@ -28,6 +28,33 @@ from text_to_sql_agent.engines import open_engine  # noqa: E402
 from text_to_sql_agent.engines.duckdb import DuckDBEngine  # noqa: E402
 
 
+@pytest.fixture(scope="module")
+def engine_with_table_t(tmp_path_factory):
+    """A real DuckDB file with one empty table `t` (and nothing else), for
+    tests that need `is_safe_query`'s default-deny table check
+    (`_references_unknown_table`) to have a real table to say yes to -
+    `DuckDBEngine("unused.duckdb")`, used throughout this file before Fix 1,
+    stopped being enough once that check started calling `engine.table_names()`,
+    which needs a real, connectable database.
+
+    Module-scoped rather than rebuilt per test: nothing in this file mutates
+    the database (`engine.execute` is never called against it - only
+    `is_safe_query`, which is read-only validation), so one file safely backs
+    every test that needs it, including the 127-way `test_allowed_function_
+    round_trip` parametrization and the ~1,800-check catalogue sweep.
+
+    No column is referenced by name in `is_safe_query`'s own checks - it
+    validates table and function names, never column existence - so `t`'s
+    single dummy column is enough regardless of which column names a given
+    probe SQL string happens to mention.
+    """
+    db = tmp_path_factory.mktemp("default_deny_table_check") / "t.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE t (a INTEGER)")
+    con.close()
+    return open_engine(f"duckdb://{db}")
+
+
 @pytest.fixture
 def secret_and_engine(tmp_path):
     secret = tmp_path / "secret.csv"
@@ -177,16 +204,15 @@ def test_allowed_table_functions_are_not_blocked_by_the_internals_check(function
     assert not blocked, f"{function_name} is both allowed and blocklisted - remove one"
 
 
-def test_repeat_is_allowed_as_a_scalar_and_blocked_as_a_table_source():
+def test_repeat_is_allowed_as_a_scalar_and_blocked_as_a_table_source(engine_with_table_t):
     """Names the `repeat` exception in `ALLOWED_TABLE_FUNCTIONS` above directly.
 
     `is_safe_query` -> `engine.execute` end to end: the scalar use must both
     validate and run; the table-position use must be rejected by
     `is_safe_query` before `engine.execute` is ever called.
     """
-    engine = DuckDBEngine("unused.duckdb")
-    assert is_safe_query("SELECT repeat('ab', 3) FROM t", engine=engine)
-    assert not is_safe_query("SELECT * FROM repeat(1, 3)", engine=engine)
+    assert is_safe_query("SELECT repeat('ab', 3) FROM t", engine=engine_with_table_t)
+    assert not is_safe_query("SELECT * FROM repeat(1, 3)", engine=engine_with_table_t)
 
 
 # Window functions need an `OVER (...)` clause to parse at all; a handful
@@ -361,7 +387,7 @@ def _round_trip_snippet(name: str) -> str:
 
 
 @pytest.mark.parametrize("name", sorted(DuckDBEngine.allowed_functions))
-def test_allowed_function_round_trip(name):
+def test_allowed_function_round_trip(name, engine_with_table_t):
     """The hardest part of this task, proven directly: for every one of the
     127 names in `DuckDBEngine.allowed_functions`, a realistic call using
     that name parses under the DuckDB dialect, and `safety._resolve_function_
@@ -384,7 +410,7 @@ def test_allowed_function_round_trip(name):
     independently, across the whole catalogue rather than just this
     allowlist).
     """
-    engine = DuckDBEngine("unused.duckdb")
+    engine = engine_with_table_t
     snippet = _round_trip_snippet(name)
     is_table_function = name in _TABLE_FUNCTION_ARGS
     sql = f"SELECT * FROM {snippet}" if is_table_function else f"SELECT {snippet} FROM t"
@@ -498,7 +524,7 @@ def _resolved_name_of_only_func(sql: str) -> str | None:
     return _safety._resolve_function_name(funcs[0])
 
 
-def test_every_unlisted_duckdb_function_is_rejected_by_default_deny():
+def test_every_unlisted_duckdb_function_is_rejected_by_default_deny(engine_with_table_t):
     """Step 4: proves the property, not the list.
 
     Sweeps every distinct function name `duckdb_functions()` reports, across
@@ -536,8 +562,34 @@ def test_every_unlisted_duckdb_function_is_rejected_by_default_deny():
     changes nothing about this test's outcome: an unrecognised name fails
     closed by construction, and a new synonym of an already-allowed function
     resolves to the same canonical token and is correctly allowed.
+
+    **What this does not prove**, per the 2026-09-19 review round: every
+    "expected" verdict in this sweep is derived from `_resolve_function_
+    name` itself (`resolved in allowed`, below), the very function
+    `is_safe_query` also uses internally - so this test can only ever show
+    that `is_safe_query` *agrees with the resolver*, never that the resolver
+    is correct in some independent sense. A bug shared by both the resolver
+    and this test's own "expected" computation (for instance, a function
+    whose *dispatch argument* names a second, unchecked function - Fix 1's
+    `list_aggregate` finding) is invisible here by construction: both sides
+    would agree, and agreement is all this sweep checks. `test_allowed_
+    function_round_trip` above and the hand-written attack/corpus tests
+    elsewhere in this file are what catch a class of bug like that; this
+    sweep's job is narrower - proving *coverage* (every catalogue name is
+    checked somewhere) and *consistency* (the two paths through the same
+    logic never diverge), not independent proof of the resolver's own
+    correctness or of the string-dispatch rule now applied on top of it (see
+    `_STRING_DISPATCH_FUNCTIONS` in `safety.py`).
+
+    This test also depends on a real table named `t` existing (via
+    `engine_with_table_t`) for every scalar-position probe now that
+    default-deny extends to tables as well as functions - `is_safe_query`
+    would otherwise reject every `SELECT name(...) FROM t` probe on the
+    table alone, regardless of whether `name` is allowed, which would make
+    every "should be allowed" case in this sweep a false mismatch rather
+    than a true one.
     """
-    engine = DuckDBEngine("unused.duckdb")
+    engine = engine_with_table_t
     allowed = engine.allowed_functions or frozenset()
     all_names = sorted(
         _duckdb_catalog_function_names(
@@ -577,6 +629,20 @@ def test_every_unlisted_duckdb_function_is_rejected_by_default_deny():
             # gate is doing exactly what it is for.
             if (position, resolved) == ("table", "repeat"):
                 assert not actual_safe, "repeat as a table source must stay blocked"
+                continue
+            # Fix 1: `list_aggregate` additionally requires its second
+            # argument to be a string literal naming an allowed function
+            # (`_dispatches_to_disallowed_function` in safety.py). None of
+            # `_PROBE_ARG_TEMPLATES` supplies one - the first template that
+            # merely *parses* (`()`, zero args) is what `_first_parseable_call`
+            # picks, and `is_safe_query` correctly rejects it regardless of
+            # `list_aggregate` itself being allowed. The dispatch-argument
+            # rule is exercised directly by
+            # `test_list_aggregate_dispatch_argument_is_validated` instead.
+            if resolved == "list_aggregate":
+                assert not actual_safe, (
+                    "list_aggregate without a valid dispatch argument must stay blocked"
+                )
                 continue
             if actual_safe != expected_safe:
                 mismatches.append((position, name, sql, resolved, actual_safe, expected_safe))
@@ -679,6 +745,12 @@ def analytics_db(tmp_path):
     two customer regions - enough surface for grouping, date bucketing,
     window functions, string cleaning, and list/JSON access to all have
     something real to operate on.
+
+    `"order items"` (Fix 1 addition) is a table whose name needs quoting
+    because it contains a space - part of the corpus proving
+    `_references_unknown_table` accepts a real table under any legal
+    identifier, not just the single-word, no-quoting-needed names every
+    other table here happens to have.
     """
     db = tmp_path / "analytics.duckdb"
     con = duckdb.connect(str(db))
@@ -733,6 +805,8 @@ def analytics_db(tmp_path):
          '{"channel": "web"}')
         """
     )
+    con.execute('CREATE TABLE "order items" (item_id INTEGER PRIMARY KEY, order_id INTEGER)')
+    con.execute('INSERT INTO "order items" VALUES (1, 1), (2, 1), (3, 4)')
     con.close()
     return open_engine(f"duckdb://{db}")
 
@@ -866,6 +940,16 @@ ANALYTICS_CORPUS = [
         "WHERE o.status = 'completed' "
         "GROUP BY c.region, month ORDER BY month, c.region"
     ),
+    # Fix 1 additions (2026-09-19 review round): EXTRACT's and TRIM's own
+    # FROM keyword must not be mistaken for a table source by the new
+    # table-existence check; list_aggregate's dispatch argument must still
+    # work for a legitimately allowed target; a schema-qualified `main.<table>`
+    # reference and a space-quoted table name must both resolve as real.
+    "SELECT EXTRACT(YEAR FROM DATE '2024-01-01') AS yr",
+    "SELECT customer_id, TRIM(BOTH ' ' FROM name) AS clean_name FROM customers",
+    "SELECT order_id, list_aggregate(tags, 'count') AS tag_count FROM orders",
+    "SELECT COUNT(*) FROM main.orders",
+    'SELECT COUNT(*) FROM "order items"',
 ]
 
 
