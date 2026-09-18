@@ -164,14 +164,25 @@ class DuckDBEngine:
     # analytical use" reason, not because they touch the filesystem or state -
     # they were on the allowlist first, moved after re-reviewing every
     # allowlist entry against "would a real business question ever need
-    # this", not just "is it safe", and finding no case for either. See
-    # `tests/test_engine_duckdb.py::VERIFIED_SAFE_TABLE_FUNCTIONS` for the
-    # complementary allowlist: the small set of table functions kept
-    # *allowed* because a legitimate analytical question could use them
-    # (`range`, `generate_series`, `unnest`, `json_each`, `json_tree`,
-    # `histogram`, `histogram_values`, `summary`) - everything else
-    # `duckdb_functions()` reports is blocked, one way or another, by this
-    # class's prefixes/names.
+    # this", not just "is it safe", and finding no case for either.
+    #
+    # Task 6b (2026-09-19) superseded this list's role as the primary
+    # defence: a name-based blocklist against DuckDB's ~960 functions leaked
+    # in four successive review rounds - `sniff_csv`; then `query`/
+    # `query_table` (a string argument hiding an arbitrary query, invisible
+    # to a name-based check); then the administrative functions above; then
+    # `current_setting('secret_directory')`, a **scalar**, which no blocklist
+    # entry could ever reach because the internals check below deliberately
+    # fires only in a table-source position; and `histogram_values`, a macro
+    # whose body calls `query_table(source)` and was on the *allowlist*, so
+    # `SELECT * FROM histogram_values('information_schema.tables', ...)` read
+    # the catalogue through a name nobody had reason to suspect. `histogram`
+    # and `summary` share that macro body and are excluded for the same
+    # reason. This blocklist stays - see `allowed_functions` below for why it
+    # is still worth keeping as a second, independent gate - but the primary
+    # guarantee is now `allowed_functions`'s default-deny: an unlisted
+    # function is rejected regardless of position, not merely absent from a
+    # list someone had to remember to grow.
     #
     # See Step 5 of the task brief (and its Fix 1/Fix 2 follow-ups) for the
     # probe that swept every table function `duckdb_functions()` reports and
@@ -214,6 +225,182 @@ class DuckDBEngine:
             "test_vector_types",
             "repeat",
             "repeat_row",
+        }
+    )
+    # Task 6b's default-deny gate (see `Engine.allowed_functions` and
+    # `text_to_sql_agent/safety.py`'s `_references_disallowed_function`):
+    # every function call `is_safe_query` finds anywhere in a DuckDB query -
+    # scalar, aggregate, window or table position alike - must resolve to a
+    # name in this set or the query is rejected outright. `internal_prefixes`/
+    # `internal_names` above still run as an additional, independent gate;
+    # this does not replace them, it closes what they structurally cannot
+    # reach (a function used as a *value*, not a table source - see the long
+    # comment above `internal_names`).
+    #
+    # Curated 2026-09-19 to the functions an analytical question over a
+    # user's own schema could plausibly need: aggregates, window functions,
+    # string/date/time/numeric/conditional functions, and list/JSON access.
+    # No macro is included unless its body was read and shown not to reach
+    # `query`, `query_table` or a catalogue object - none were; every entry
+    # below is a scalar, aggregate, or (for the five table functions) a
+    # genuine table function. `current_setting` and every other
+    # configuration/session-introspection function are deliberately absent,
+    # as are `histogram`/`histogram_values`/`summary` (see the note above
+    # `internal_names`). When a function's place in a legitimate analytical
+    # question was unclear, it was left out, per the task brief.
+    #
+    # Every entry here is the name DuckDB itself registers the function
+    # under, not necessarily the literal spelling `_resolve_function_name`
+    # sees at the call site - `lpad`/`rpad`, `var_samp`/`variance`,
+    # `string_agg`/`group_concat`/`listagg`, `range`/`generate_series` and
+    # several others are synonyms sqlglot parses into the same typed AST
+    # node, which `_resolve_function_name` then resolves to one canonical
+    # token from this set - see that function's docstring and
+    # `_FUNCTION_NAME_OVERRIDES` in `safety.py` for the full mapping, and
+    # `tests/test_engine_duckdb.py::test_allowed_function_round_trip` for the
+    # proof that every entry below round-trips correctly: parsed under the
+    # DuckDB dialect, resolved, and found in this set.
+    allowed_functions: frozenset[str] | None = frozenset(
+        {
+            # -- Aggregates --
+            "count",
+            "sum",
+            "avg",
+            "min",
+            "max",
+            "median",
+            "mode",
+            "stddev",
+            "stddev_pop",
+            "stddev_samp",
+            "variance",
+            "var_pop",
+            "string_agg",
+            "array_agg",
+            "bool_and",
+            "bool_or",
+            "first",
+            "last",
+            "approx_count_distinct",
+            "corr",
+            "covar_pop",
+            "covar_samp",
+            "quantile",
+            "quantile_cont",
+            "quantile_disc",
+            "arg_min",
+            "arg_max",
+            "count_if",
+            # -- Window functions --
+            "row_number",
+            "rank",
+            "dense_rank",
+            "percent_rank",
+            "cume_dist",
+            "ntile",
+            "lag",
+            "lead",
+            "first_value",
+            "last_value",
+            "nth_value",
+            # -- String functions --
+            "upper",
+            "lower",
+            "concat",
+            "concat_ws",
+            "length",
+            "trim",
+            "substring",
+            "replace",
+            "split_part",
+            "string_split",
+            "lpad",
+            "position",
+            "regexp_replace",
+            "regexp_extract",
+            "regexp_matches",
+            "regexp_full_match",
+            "contains",
+            "starts_with",
+            "ends_with",
+            "reverse",
+            "left",
+            "right",
+            "repeat",
+            # -- Date and time functions --
+            "date_trunc",
+            "extract",
+            "date_part",
+            "datepart",
+            "date_diff",
+            "date_add",
+            "date_sub",
+            "age",
+            "current_date",
+            "now",
+            "strftime",
+            "strptime",
+            "epoch",
+            "epoch_ms",
+            "make_date",
+            "last_day",
+            "year",
+            "month",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "dayofweek",
+            "dayofyear",
+            "week",
+            "isodow",
+            "quarter",
+            # -- Numeric functions --
+            "round",
+            "ceil",
+            "floor",
+            "abs",
+            "power",
+            "sqrt",
+            "sign",
+            "exp",
+            "ln",
+            "log",
+            "cbrt",
+            "greatest",
+            "least",
+            # -- Conditional / type functions --
+            "coalesce",
+            "nullif",
+            "if",
+            "case",
+            "cast",
+            "try_cast",
+            # -- List and JSON access --
+            "list_extract",
+            "list_value",
+            "list_aggregate",
+            "list_contains",
+            "list_position",
+            "list_sort",
+            "list_distinct",
+            "json_extract",
+            "json_extract_string",
+            "json_array_length",
+            "json_keys",
+            "json_type",
+            "json_valid",
+            "to_json",
+            # -- Table functions --
+            # `range` and `generate_series` both parse to the same typed AST
+            # node and resolve to "generate_series"; only that name needs to
+            # be here, but `range` costs nothing to list for a reader
+            # checking this set against the brief.
+            "range",
+            "generate_series",
+            "unnest",
+            "json_each",
+            "json_tree",
         }
     )
     # See SQLiteEngine.schema_header - this is the DuckDB counterpart llm.py's

@@ -124,6 +124,11 @@ class SQLiteEngine:
     sqlglot_dialect: str = "sqlite"
     internal_prefixes: tuple[str, ...] = ("sqlite_", "pragma_")
     internal_names: frozenset[str] = frozenset({"dbstat"})
+    # `None` keeps `is_safe_query`'s original blocklist-only behaviour for
+    # SQLite - see `Engine.allowed_functions` for what a `frozenset` here
+    # would mean instead. SQLite's function surface is small and this list
+    # has held; Task 6b's default-deny switch is DuckDB-only.
+    allowed_functions: frozenset[str] | None = None
     # Must stay exactly "SQLite schema (DDL)": llm.py's user-prompt header is
     # f"### {engine.schema_header}\n", and a previous task's reviewer captured
     # the full SDK payload and proved it byte-identical to before this engine

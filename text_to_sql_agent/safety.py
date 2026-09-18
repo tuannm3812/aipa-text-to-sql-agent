@@ -22,6 +22,190 @@ except ModuleNotFoundError:  # pragma: no cover
 
 _ALLOWED_PREFIX = re.compile(r"(?is)^(select|with)\b")
 
+# sqlglot parses many function calls into typed classes (`exp.Count`,
+# `exp.Upper`, `exp.TimestampTrunc`, ...) rather than leaving them as
+# `exp.Anonymous`. Each typed class's own `.sql_name()` is sqlglot's
+# *cross-dialect* canonical token, not necessarily the name DuckDB itself
+# registers the function under - `date_trunc(...)` parses to `TimestampTrunc`,
+# whose `.sql_name()` is `TIMESTAMP_TRUNC`, a name DuckDB does not recognise as
+# a function at all. Comparing that token against an allowlist of *real*
+# DuckDB names would either reject every legitimate call through that class or
+# require the allowlist to carry sqlglot's internal vocabulary instead of
+# DuckDB's own, which is what a reviewer actually needs to audit.
+#
+# This table maps each such class to one real, DuckDB-registered name for the
+# function family it represents, chosen from `duckdb_functions()`'s own alias
+# list for that class (verified 2026-09-19 by sweeping every scalar/
+# aggregate/table/table_macro name DuckDB registers through sqlglot's DuckDB
+# parser and grouping the results by resulting class - see
+# `tests/test_engine_duckdb.py` for the round-trip proof this produces the
+# right token for every entry in `DuckDBEngine.allowed_functions`). Only
+# classes whose `.sql_name()` actually diverges from the chosen name are
+# listed; every other typed class's `.sql_name()` lowered already equals it
+# (`Upper` -> `upper`, `Count` -> `count`, `Round` -> `round`, ...), so no
+# entry is needed there.
+#
+# A single class often represents several literal spellings DuckDB treats as
+# synonyms (`lpad`/`rpad` both parse to `Pad`; `var_samp`/`variance` both
+# parse to `Variance`; `string_agg`/`group_concat`/`listagg` all parse to
+# `GroupConcat`). Resolving all of them to one canonical token is deliberate:
+# the allowlist only needs to contain that one token, not every alias, and a
+# caller who writes any alias gets the same, correctly-gated behaviour.
+_FUNCTION_NAME_OVERRIDES: dict[type[sqlglot_exp.Expression], str] = {}
+if exp is not None:
+    _FUNCTION_NAME_OVERRIDES = {
+        exp.TimestampTrunc: "date_trunc",
+        exp.TimeToStr: "strftime",
+        exp.StrToTime: "strptime",
+        exp.GroupConcat: "string_agg",
+        exp.DateDiff: "date_diff",
+        exp.SortArray: "list_sort",
+        exp.ArrayContains: "list_contains",
+        exp.Pad: "lpad",
+        exp.StrPosition: "position",
+        exp.RegexpLike: "regexp_matches",
+        exp.UnixToTime: "epoch_ms",
+        exp.TimeToUnix: "epoch",
+        exp.Array: "list_value",
+        exp.VariancePop: "var_pop",
+        exp.DayOfWeekIso: "isodow",
+        exp.DateFromParts: "make_date",
+        exp.PercentileCont: "quantile_cont",
+        exp.PercentileDisc: "quantile_disc",
+        exp.ApproxDistinct: "approx_count_distinct",
+        exp.LogicalAnd: "bool_and",
+        exp.LogicalOr: "bool_or",
+        exp.Split: "string_split",
+        exp.DayOfWeek: "dayofweek",
+        exp.DayOfYear: "dayofyear",
+        exp.JSONExtractScalar: "json_extract_string",
+        # `unnest(...)` parses to `exp.Unnest` in a table (`FROM`) position
+        # but to `exp.Explode` in a select-list/scalar position (DuckDB
+        # supports both - `SELECT unnest(tags) FROM t` expands the list
+        # in place, without a `FROM unnest(...)` at all). Verified 2026-09-19
+        # that `Explode` has no other DuckDB name mapped to it.
+        exp.Explode: "unnest",
+    }
+
+
+def _resolve_function_name(node: sqlglot_exp.Func) -> str:
+    """Resolve a parsed function-call node to the name DuckDB itself calls it by.
+
+    `exp.Anonymous` (sqlglot's catch-all for a function name it has no
+    dedicated class for) is name-transparent by construction: `.name` is
+    exactly the identifier the caller typed, lowered for a case-insensitive
+    compare, with no reinterpretation in between. Every function this task's
+    brief proved leaked through the old blocklist - `current_setting`,
+    `query`, `query_table`, `histogram_values`, `checkpoint`, ... - parses as
+    `exp.Anonymous` (verified 2026-09-19), so this is also the path that
+    carries every dangerous name through untouched rather than through a
+    class-based remapping that could coincidentally land on an allowed token.
+
+    A typed class instead goes through `_FUNCTION_NAME_OVERRIDES` where its
+    `.sql_name()` would otherwise diverge from DuckDB's own name, and falls
+    back to `.sql_name()` lowered everywhere else.
+
+    Args:
+        node: A parsed `exp.Func` node.
+
+    Returns:
+        The lowercased name to compare against `Engine.allowed_functions`.
+        Empty string if `sqlglot` is unavailable.
+    """
+    if exp is None:
+        return ""
+    if isinstance(node, exp.Anonymous):
+        return (node.name or "").lower()
+    override = _FUNCTION_NAME_OVERRIDES.get(type(node))
+    if override is not None:
+        return override
+    # sqlglot ships its own type annotations, but `Func.sql_name` is one of
+    # the methods it leaves untyped - mypy's strict `no-untyped-call` fires
+    # here specifically because `node` is statically typed as
+    # `sqlglot_exp.Func` (needed above for `isinstance`/dict-key correctness)
+    # rather than reached through the module-level `exp: ModuleType | None`
+    # escape hatch the rest of this file uses, whose `ModuleType.__getattr__
+    # -> Any` is what lets every other `sqlglot` call through untyped.
+    return node.sql_name().lower()  # type: ignore[no-any-return, no-untyped-call]
+
+
+def _references_disallowed_function(
+    parsed: sqlglot_exp.Expression, *, allowed_functions: frozenset[str]
+) -> bool:
+    """True if any function call anywhere in `parsed` is not in `allowed_functions`.
+
+    Unlike `_references_internals`, this has no table-source restriction: it
+    walks every function call regardless of position - scalar, aggregate,
+    window or table. That is the point. `current_setting('secret_directory')`
+    is a **scalar**; the internals check above deliberately fires only in a
+    table-source position (so `SELECT sqlite_version()` stays legal), which
+    means no name added to a blocklist can ever reach a function used as a
+    value. Default-deny closes that gap structurally: an unrecognised name is
+    rejected regardless of where it appears, rather than relying on anyone
+    having thought to list it.
+
+    Args:
+        parsed: The parsed statement.
+        allowed_functions: The engine's function allowlist. Only called when
+            this is not `None` - see `_is_safe_ast`.
+
+    Returns:
+        True if the statement must be rejected.
+    """
+    if exp is None:
+        return True
+    for function in parsed.find_all(exp.Func):
+        if _resolve_function_name(function) not in allowed_functions:
+            return True
+    return False
+
+
+def _has_string_literal_table_source(sql_string: str, *, dialect: str) -> bool:
+    """True if a `FROM`/`JOIN` target is a quoted string literal, not a name.
+
+    DuckDB accepts a bare quoted path as a table source - `FROM
+    '/etc/passwd'` - with no function name involved at all, which is exactly
+    why `_references_disallowed_function` alone cannot catch it. The parsed
+    AST cannot either: sqlglot folds *both* a double-quoted identifier
+    (`FROM "t"`) and a single-quoted string used as a table source (`FROM
+    '/etc/passwd'`) into the same `exp.Identifier(quoted=True)` node, so
+    `table.this` carries no trace of which quote character was used. The
+    tokenizer keeps them apart - `IDENTIFIER` for the former, `STRING` for the
+    latter - so this checks the token stream directly instead of re-deriving
+    the distinction from a parse tree that has already erased it.
+
+    Only the token immediately after `FROM`/`JOIN` is checked, which is
+    narrow by design: a function call's argument list always has the
+    function's own identifier token in that position (`FROM
+    json_each('[1]')` sees `VAR` there, not `STRING`), and old-style comma
+    joins (`FROM a, 'x'`) are not covered - the connection's
+    `enable_external_access=False` is what's actually load-bearing against a
+    bare path table source; this only makes the validator agree with it
+    rather than relying on that second layer alone.
+
+    Args:
+        sql_string: The SQL text to check (already validated to parse).
+        dialect: The sqlglot dialect to tokenize under.
+
+    Returns:
+        True if a string literal sits directly after `FROM` or `JOIN`.
+    """
+    if sqlglot is None:
+        return False
+    from sqlglot.tokens import TokenType
+
+    try:
+        tokens = sqlglot.Dialect.get_or_raise(dialect).tokenize(sql_string)
+    except Exception:
+        return False
+    for i, token in enumerate(tokens[:-1]):
+        if (
+            token.token_type in (TokenType.FROM, TokenType.JOIN)
+            and tokens[i + 1].token_type == TokenType.STRING
+        ):
+            return True
+    return False
+
 
 def _is_table_source(node: sqlglot_exp.Expression) -> bool:
     """True if `node` sits where a table would, rather than in a value position.
@@ -140,6 +324,7 @@ def _is_safe_ast(
     dialect: str,
     internal_prefixes: tuple[str, ...],
     internal_names: frozenset[str],
+    allowed_functions: frozenset[str] | None,
 ) -> bool:
     """Reject anything that parses to more than one statement or writes data.
 
@@ -167,6 +352,17 @@ def _is_safe_ast(
         parsed, internal_prefixes=internal_prefixes, internal_names=internal_names
     ):
         return False
+
+    # Default-deny, additional to the internals check above rather than a
+    # replacement for it: `allowed_functions` is only non-`None` for an
+    # engine that opted into it (DuckDB). `None` (SQLite) skips both of these
+    # entirely, so SQLite's behaviour is unchanged by construction, not just
+    # by test coverage.
+    if allowed_functions is not None:
+        if _has_string_literal_table_source(sql_string, dialect=dialect):
+            return False
+        if _references_disallowed_function(parsed, allowed_functions=allowed_functions):
+            return False
 
     forbidden = (
         exp.Alter,
@@ -207,12 +403,13 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
     Args:
         sql_string: The SQL text to validate.
         engine: The engine to validate against - its `sqlglot_dialect` picks
-            the parser dialect and its `internal_prefixes`/`internal_names`
-            pick the internals blocklist. Defaults to `None`, meaning
-            SQLite - resolved from `SQLiteEngine`'s own class attributes, so
-            this stays a single source rather than a second, driftable copy
-            of its blocklist. Every pre-engine caller and the notebook keep
-            working unchanged.
+            the parser dialect, its `internal_prefixes`/`internal_names` pick
+            the internals blocklist, and its `allowed_functions` switches on
+            default-deny function validation when it is a set rather than
+            `None`. Defaults to `None`, meaning SQLite - resolved from
+            `SQLiteEngine`'s own class attributes, so this stays a single
+            source rather than a second, driftable copy of its blocklist.
+            Every pre-engine caller and the notebook keep working unchanged.
 
     Returns:
         True if the query is judged safe to execute read-only. False when
@@ -235,13 +432,16 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         dialect: str = SQLiteEngine.sqlglot_dialect
         internal_prefixes: tuple[str, ...] = SQLiteEngine.internal_prefixes
         internal_names: frozenset[str] = SQLiteEngine.internal_names
+        allowed_functions: frozenset[str] | None = SQLiteEngine.allowed_functions
     else:
         dialect = engine.sqlglot_dialect
         internal_prefixes = engine.internal_prefixes
         internal_names = engine.internal_names
+        allowed_functions = engine.allowed_functions
     return _is_safe_ast(
         s,
         dialect=dialect,
         internal_prefixes=internal_prefixes,
         internal_names=internal_names,
+        allowed_functions=allowed_functions,
     )

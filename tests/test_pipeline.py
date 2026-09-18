@@ -262,6 +262,7 @@ class _StandInEngine:
     sqlglot_dialect = "sqlite"
     internal_prefixes: tuple[str, ...] = ("sqlite_", "pragma_")
     internal_names: frozenset[str] = frozenset({"dbstat"})
+    allowed_functions: frozenset[str] | None = None
     prompt_dialect_section = "STAND-IN DIALECT (must follow):\n- Definitely not SQLite.\n"
     schema_header = "Stand-in schema (DDL)"
 

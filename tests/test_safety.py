@@ -185,6 +185,7 @@ class _FakeInternalsEngine:
     sqlglot_dialect = "sqlite"
     internal_prefixes: tuple[str, ...] = ("widget_",)
     internal_names = frozenset({"widgets"})
+    allowed_functions: frozenset[str] | None = None
 
 
 def test_is_safe_query_internals_list_comes_from_the_engine_not_a_module_constant() -> None:
@@ -247,8 +248,15 @@ def test_is_safe_query_blocks_duckdb_filesystem_functions_it_can_name() -> None:
     than `.name`. Found during Task 6's Step 5 probe: `read_csv(...)` passed
     `is_safe_query` before that branch existed. `enable_external_access=False`
     on the connection is still the load-bearing defence either way - this is
-    defence-in-depth on top of it, and cannot cover the bare quoted-path form
-    (`SELECT * FROM '<path>'`), which has no function name to match at all.
+    defence-in-depth on top of it.
+
+    The bare quoted-path form (`SELECT * FROM '<path>'`) used to be an
+    accepted gap here, since it has no function name at all for a name-based
+    check to match. Task 6b's default-deny gate closes it structurally
+    instead: `_has_string_literal_table_source` rejects any `FROM`/`JOIN`
+    target that is a quoted string rather than a name, independent of
+    `read_csv` even existing. See `test_is_safe_query_rejects_a_bare_quoted_
+    path_table_source` for that gate on its own.
     """
     pytest.importorskip("duckdb", reason="install the duckdb extra")
     from text_to_sql_agent.engines.duckdb import DuckDBEngine
@@ -257,8 +265,7 @@ def test_is_safe_query_blocks_duckdb_filesystem_functions_it_can_name() -> None:
     assert not agent.is_safe_query("SELECT * FROM read_csv('/etc/hosts')", engine=engine)
     assert not agent.is_safe_query("SELECT * FROM read_parquet('/etc/x.parquet')", engine=engine)
     assert not agent.is_safe_query("SELECT * FROM glob('/etc/*')", engine=engine)
-    # Expected gap: no function name exists here for the AST check to match.
-    assert agent.is_safe_query("SELECT * FROM '/etc/hosts'", engine=engine)
+    assert not agent.is_safe_query("SELECT * FROM '/etc/hosts'", engine=engine)
 
 
 def test_is_safe_query_fails_closed_on_non_string_input() -> None:
@@ -274,3 +281,78 @@ def test_is_safe_query_fails_closed_on_non_string_input() -> None:
     from text_to_sql_agent import safety
 
     assert not safety.is_safe_query(None)  # type: ignore[arg-type]
+
+
+# --- Task 6b: DuckDB's default-deny function allowlist ---
+# The mechanism itself (`_resolve_function_name`, `_FUNCTION_NAME_OVERRIDES`,
+# the round trip for every entry in `DuckDBEngine.allowed_functions`, the
+# full-catalogue sweep, the analytics corpus, and the two pinned leaks) is
+# exercised in `tests/test_engine_duckdb.py`, since it only ever activates
+# for an engine whose `allowed_functions` is a set - today, only DuckDB.
+# These few tests stay here because they are about `is_safe_query`'s general
+# contract: that default-deny is skipped entirely for an engine that opts
+# out (`allowed_functions is None`), and that an unrecognised function is
+# rejected in a table-source position specifically, which is the one
+# `_has_string_literal_table_source` covers and nothing else in this file
+# does.
+
+
+def test_is_safe_query_rejects_a_bare_quoted_path_table_source() -> None:
+    """Step 2: `FROM '<path>'` is rejected in default-deny mode even though it
+    names no function at all for `_references_disallowed_function` to catch.
+
+    Also proves the case `_has_string_literal_table_source` exists
+    specifically to get right: sqlglot parses a double-quoted identifier and
+    a single-quoted string used as a table source into the *same*
+    `exp.Identifier(quoted=True)` node, so a real double-quoted table name
+    must stay allowed while the string-literal form is rejected - the
+    tokenizer-level check is what tells them apart, not the parsed AST.
+    """
+    pytest.importorskip("duckdb", reason="install the duckdb extra")
+    from text_to_sql_agent.engines.duckdb import DuckDBEngine
+
+    engine = DuckDBEngine("unused.duckdb")
+    assert not agent.is_safe_query("SELECT * FROM '/etc/passwd'", engine=engine)
+    assert not agent.is_safe_query("SELECT * FROM t JOIN '/etc/passwd' ON 1=1", engine=engine)
+    assert not agent.is_safe_query("SELECT a FROM 'my/data.parquet'", engine=engine)
+    # Control: a genuinely double-quoted identifier is not a string literal
+    # and must stay allowed.
+    assert agent.is_safe_query('SELECT * FROM "t"', engine=engine)
+    # Control: a string literal that is not a FROM/JOIN target (e.g. inside
+    # WHERE) must not be flagged - only the token position matters.
+    assert agent.is_safe_query("SELECT * FROM t WHERE note = 'FROM'", engine=engine)
+
+
+def test_is_safe_query_default_deny_is_skipped_when_allowed_functions_is_none() -> None:
+    """Kills the `if allowed_functions is not None:` guard in `_is_safe_ast`.
+
+    SQLite's `allowed_functions` is `None`, so neither the function-name
+    gate nor the string-literal-table-source gate may run for it - both are
+    DuckDB-only today. This uses a function name that is real DuckDB syntax
+    but is nowhere in `DuckDBEngine.allowed_functions`
+    (`current_setting`, proven live-leaking in the task brief) against
+    `SQLiteEngine`: since sqlglot's SQLite dialect parses it as an ordinary
+    unrecognised identifier/function call rather than rejecting the text
+    outright, this only stays allowed under SQLite if default-deny is
+    genuinely skipped rather than accidentally applied with an empty set.
+    """
+    from text_to_sql_agent.engines.sqlite import SQLiteEngine
+
+    engine = SQLiteEngine("data/university_agent.db")
+    assert engine.allowed_functions is None
+    assert agent.is_safe_query("SELECT current_setting('x')", engine=engine)
+
+
+def test_is_safe_query_rejects_an_unrecognised_function_in_any_position() -> None:
+    """The core default-deny property, independent of any specific leak: a
+    function name that is not real DuckDB syntax at all must be rejected
+    both as a scalar and as a table source, because default-deny does not
+    special-case "this name doesn't even exist" as somehow safer than a real
+    but unlisted one - unknown means no, unconditionally.
+    """
+    pytest.importorskip("duckdb", reason="install the duckdb extra")
+    from text_to_sql_agent.engines.duckdb import DuckDBEngine
+
+    engine = DuckDBEngine("unused.duckdb")
+    assert not agent.is_safe_query("SELECT totally_made_up_function(a) FROM t", engine=engine)
+    assert not agent.is_safe_query("SELECT * FROM totally_made_up_function(a)", engine=engine)
