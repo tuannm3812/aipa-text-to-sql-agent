@@ -9,6 +9,7 @@ KNOWN_CODES = [
     "UNANSWERABLE_WITH_GIVEN_SCHEMA",
     "RESULT_TRUNCATED_TO_1000_ROWS",
     "QUERY_ABORTED_AFTER_100000_VM_STEPS",
+    "QUERY_ABORTED_AFTER_5000_MS",
 ]
 
 
@@ -42,3 +43,14 @@ def test_describe_error_passes_through_an_unrecognised_message() -> None:
 
 def test_describe_error_handles_none() -> None:
     assert results.describe_error(None) == ""
+
+
+def test_describe_error_reports_duckdb_abort_in_ms_not_steps() -> None:
+    message = results.describe_error("QUERY_ABORTED_AFTER_5000_MS")
+    assert "5000 ms" in message
+    assert "steps" not in message
+
+
+def test_describe_error_redacts_a_dsn_password_in_raw_exception_text() -> None:
+    raw = "could not connect to postgresql://u:hunter2@host/db"
+    assert "hunter2" not in results.describe_error(raw)

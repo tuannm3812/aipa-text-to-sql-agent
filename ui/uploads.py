@@ -17,9 +17,13 @@ from ui.constants import DEMO_DATABASES
 # Matches the credentials portion of a `scheme://user:password@host` DSN.
 # `postgresql://user:password@host/db` (Phase 3b) is the motivating case, but
 # this matches any scheme so a `sqlite://`/`duckdb://` DSN with embedded
-# credentials is caught too, and does nothing to a DSN with none.
+# credentials is caught too, and does nothing to a DSN with none. The user may
+# be empty (`postgresql://:pw@host`), and the password runs greedily to the
+# *last* `@` before whitespace, so a pasted, unescaped `/` or `@` inside it is
+# masked rather than split. Over-masking a credential-free DSN is the
+# acceptable failure; leaking part of a password is not.
 _DSN_CREDENTIALS_RE = re.compile(
-    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)(?P<user>[^:@/\s]+):(?P<password>[^@/\s]+)@"
+    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)(?P<user>[^:@/\s]*):(?P<password>\S*)@"
 )
 
 

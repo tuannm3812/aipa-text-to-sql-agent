@@ -54,3 +54,20 @@ def test_redact_dsn_masks_a_dsn_embedded_inside_a_longer_error_message() -> None
 def test_redact_dsn_masks_credentials_for_any_scheme(dsn: str) -> None:
     assert ":p@" not in redact_dsn(dsn)
     assert ":***@" in redact_dsn(dsn)
+
+
+@pytest.mark.parametrize(
+    ("dsn", "secret"),
+    [
+        ("postgresql://:s3cret@host/db", "s3cret"),
+        ("postgresql://u:pa/ss@host/db", "pa/ss"),
+        ("postgresql://u:p@ss@host/db", "p@ss"),
+        ("postgresql://u:s3cret@host:5432/db?sslmode=require", "s3cret"),
+    ],
+)
+def test_redact_dsn_masks_the_whole_password_in_awkward_forms(dsn: str, secret: str) -> None:
+    """An empty user, or an unescaped `/` or `@` in the password, must not leak any of it."""
+    redacted = redact_dsn(dsn)
+    assert secret not in redacted
+    assert "ss@" not in redacted
+    assert redacted.endswith("host/db") or "host:5432/db" in redacted

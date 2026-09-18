@@ -6,6 +6,7 @@ import pandas as pd
 import streamlit as st
 
 import text_to_sql_agent as backend
+from ui.uploads import redact_dsn
 
 
 def result_to_dataframe(result: backend.QueryResult) -> pd.DataFrame | None:
@@ -47,8 +48,9 @@ _ABORTED_PREFIX = "QUERY_ABORTED_AFTER_"
 def describe_error(code: str | None) -> str:
     """Turn a `QueryResult.error` code into a message for a non-technical reader.
 
-    Anything unrecognised is passed through unchanged, since the backend also
-    puts raw exception text in this field.
+    Anything unrecognised is passed through, since the backend also puts raw
+    exception text in this field - with any DSN password masked by
+    `redact_dsn`, because a driver error can echo the connection string.
 
     Args:
         code: The `QueryResult.error` value, or None.
@@ -66,13 +68,20 @@ def describe_error(code: str | None) -> str:
             f"Showing the first {limit} rows. The query matched more than that, "
             "so add a filter or an aggregate to narrow it down."
         )
-    if code.startswith(_ABORTED_PREFIX):
+    if code.startswith(_ABORTED_PREFIX) and code.endswith("_VM_STEPS"):
         budget = code[len(_ABORTED_PREFIX) :].removesuffix("_VM_STEPS")
         return (
             f"The query was stopped after {budget} database steps to keep the demo "
             "responsive. It was probably joining tables without a matching condition."
         )
-    return code
+    if code.startswith(_ABORTED_PREFIX) and code.endswith("_MS"):
+        budget = code[len(_ABORTED_PREFIX) :].removesuffix("_MS")
+        return (
+            f"The query was stopped after {budget} ms to keep the demo "
+            "responsive. It was probably joining tables without a matching condition."
+        )
+    # Raw exception text: a driver may echo the DSN it failed to reach.
+    return redact_dsn(code)
 
 
 def render_assistant_turn(msg: dict) -> None:
