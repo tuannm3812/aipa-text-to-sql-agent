@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_RAG_TOP_K
+from .engines import open_engine
 from .execution import execute_query
 from .ingestion import ingest_csvs_to_db
 from .llm import generate_sql
@@ -55,6 +56,7 @@ def ask_database(
         raise FileNotFoundError("input database not found")
 
     try:
+        engine = open_engine(db_path)
         schema_text = (
             retrieve_relevant_schema(db_path, question, top_k=rag_top_k)
             if use_rag
@@ -64,7 +66,7 @@ def ask_database(
 
         if "UNANSWERABLE_WITH_GIVEN_SCHEMA" in sql:
             return QueryResult(columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA")
-        if not is_safe_query(sql):
+        if not is_safe_query(sql, engine=engine):
             return QueryResult(columns=[], rows=[], sql=sql, error="BLOCKED_UNSAFE_SQL")
         try:
             return execute_query(db_path, sql)
@@ -78,7 +80,7 @@ def ask_database(
                 provider=provider,
                 max_repair_attempts=max_repair_attempts,
             )
-            if repaired_sql and is_safe_query(repaired_sql):
+            if repaired_sql and is_safe_query(repaired_sql, engine=engine):
                 return execute_query(db_path, repaired_sql)
             raise
     except Exception as e:
@@ -120,6 +122,7 @@ def ask_database_with_sql(
     if not os.path.exists(db_path):
         raise FileNotFoundError("input database not found")
 
+    engine = open_engine(db_path)
     schema_text = (
         retrieve_relevant_schema(db_path, question, top_k=rag_top_k)
         if use_rag
@@ -134,7 +137,7 @@ def ask_database_with_sql(
         return sql, QueryResult(
             columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA"
         )
-    if not is_safe_query(sql):
+    if not is_safe_query(sql, engine=engine):
         return sql, QueryResult(columns=[], rows=[], sql=sql, error="BLOCKED_UNSAFE_SQL")
 
     try:
@@ -150,7 +153,7 @@ def ask_database_with_sql(
             provider=provider,
             max_repair_attempts=max_repair_attempts,
         )
-        if repaired_sql and is_safe_query(repaired_sql):
+        if repaired_sql and is_safe_query(repaired_sql, engine=engine):
             try:
                 return repaired_sql, execute_query(db_path, repaired_sql)
             except Exception as repaired_error:

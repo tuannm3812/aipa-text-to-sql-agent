@@ -109,7 +109,7 @@ def evaluate_case(
         "model_name": model_name if mode == "llm" else "gold_sql",
         "use_rag": use_rag if mode == "llm" else "",
         "rag_top_k": rag_top_k if mode == "llm" else "",
-        "safe_sql": agent.is_safe_query(generated_sql),
+        "safe_sql": agent.is_safe_query(generated_sql, engine=agent.open_engine(case["db_path"])),
         "execution_ok": score.executed,
         "row_match": score.row_match,
         "value_match": score.value_match,

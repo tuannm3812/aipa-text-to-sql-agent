@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from sqlglot import expressions as sqlglot_exp
 
+    from .engines import Engine
+
 sqlglot: ModuleType | None
 exp: ModuleType | None
 try:
@@ -20,8 +22,16 @@ except ModuleNotFoundError:  # pragma: no cover
 
 _ALLOWED_PREFIX = re.compile(r"(?is)^(select|with)\b")
 
-_INTERNAL_TABLE_PREFIXES = ("sqlite_", "pragma_")
-_INTERNAL_TABLE_NAMES = frozenset({"dbstat"})
+# Used only when `is_safe_query` is called with no engine, which keeps the
+# notebook and every pre-engine caller working exactly as before. These are
+# deliberately module constants rather than a `SQLiteEngine` instance, so
+# resolving the default never imports the engines package or performs I/O -
+# they must stay byte-identical to `SQLiteEngine.sqlglot_dialect`,
+# `SQLiteEngine.internal_prefixes` and `SQLiteEngine.internal_names` in
+# `engines/sqlite.py`.
+_DEFAULT_DIALECT = "sqlite"
+_DEFAULT_INTERNAL_PREFIXES = ("sqlite_", "pragma_")
+_DEFAULT_INTERNAL_NAMES = frozenset({"dbstat"})
 
 
 def _is_table_source(node: sqlglot_exp.Expression) -> bool:
@@ -57,12 +67,22 @@ def _is_table_source(node: sqlglot_exp.Expression) -> bool:
     return False
 
 
-def _references_internals(parsed: sqlglot_exp.Expression) -> bool:
-    """True if the statement reads SQLite's own schema or statistics tables.
+def _references_internals(
+    parsed: sqlglot_exp.Expression,
+    *,
+    internal_prefixes: tuple[str, ...],
+    internal_names: frozenset[str],
+) -> bool:
+    """True if the statement reads the engine's own schema or statistics tables.
 
     Checked against parsed table nodes rather than the raw text, so a table
     genuinely called `my_sqlite_notes` is fine and the string literal
     `'sqlite_master'` is not mistaken for a table reference.
+
+    `internal_prefixes` and `internal_names` come from the calling engine
+    (SQLite's `sqlite_`/`pragma_`/`dbstat` today) rather than being read from
+    a module constant, so a future engine with different internals - or none
+    at all - is not silently checked against SQLite's list.
 
     The `sqlglot_exp` type is imported under `TYPE_CHECKING` only, since
     `exp` itself is imported defensively (see the module-level try/except)
@@ -78,7 +98,7 @@ def _references_internals(parsed: sqlglot_exp.Expression) -> bool:
         return False
     for table in parsed.find_all(exp.Table):
         name = (table.name or "").lower()
-        if name in _INTERNAL_TABLE_NAMES or name.startswith(_INTERNAL_TABLE_PREFIXES):
+        if name in internal_names or name.startswith(internal_prefixes):
             return True
     # Table-valued functions such as pragma_table_info(...) parse as anonymous
     # function calls, not as tables. `.name` (not `.this`) is used here too,
@@ -93,14 +113,20 @@ def _references_internals(parsed: sqlglot_exp.Expression) -> bool:
     # `SELECT sqlite_version()`, which read no internal table.
     for function in parsed.find_all(exp.Anonymous):
         name = (function.name or "").lower()
-        if not (name in _INTERNAL_TABLE_NAMES or name.startswith(_INTERNAL_TABLE_PREFIXES)):
+        if not (name in internal_names or name.startswith(internal_prefixes)):
             continue
         if _is_table_source(function):
             return True
     return False
 
 
-def _is_safe_ast(sql_string: str) -> bool:
+def _is_safe_ast(
+    sql_string: str,
+    *,
+    dialect: str,
+    internal_prefixes: tuple[str, ...],
+    internal_names: frozenset[str],
+) -> bool:
     """Reject anything that parses to more than one statement or writes data.
 
     Returns False when `sqlglot` is unavailable: without a parser there is no
@@ -110,7 +136,7 @@ def _is_safe_ast(sql_string: str) -> bool:
     if sqlglot is None or exp is None:
         return False
     try:
-        statements = sqlglot.parse(sql_string, read="sqlite")
+        statements = sqlglot.parse(sql_string, read=dialect)
     except Exception:
         return False
 
@@ -123,7 +149,9 @@ def _is_safe_ast(sql_string: str) -> bool:
     if parsed is None:
         return False
 
-    if _references_internals(parsed):
+    if _references_internals(
+        parsed, internal_prefixes=internal_prefixes, internal_names=internal_names
+    ):
         return False
 
     forbidden = (
@@ -143,27 +171,32 @@ def _is_safe_ast(sql_string: str) -> bool:
     return isinstance(parsed, allowed_roots) or parsed.find(exp.Select) is not None
 
 
-def is_safe_query(sql_string: str) -> bool:
+def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
     """Conservatively allow only single-statement, read-only SELECT/CTE queries.
 
     Rejects anything empty, not starting with `SELECT`/`WITH`, parsing to more
-    than one statement, referencing SQLite's own schema/statistics tables
-    (`sqlite_*`, `pragma_*`, `dbstat`), or containing a data-modifying node.
-    Keyword matching is deliberately *not* used for any of this: a raw-text
-    scan rejected legitimate SQL such as `REPLACE(...)` and string literals
-    containing words like `update`, and would just as easily have let a
-    literal `'sqlite_master'` masquerade as a real table reference in the
+    than one statement, referencing the engine's own schema/statistics tables
+    (`sqlite_*`/`pragma_*`/`dbstat` for SQLite), or containing a data-modifying
+    node. Keyword matching is deliberately *not* used for any of this: a
+    raw-text scan rejected legitimate SQL such as `REPLACE(...)` and string
+    literals containing words like `update`, and would just as easily have let
+    a literal `'sqlite_master'` masquerade as a real table reference in the
     other direction. Every structural rule here is checked against the parsed
     AST instead.
 
     This is only a partial second line of defence. `execution.py` opens the
     database read-only and installs a write authorizer, which independently
-    blocks writes - but the authorizer does not block reads of SQLite's own
-    schema/statistics tables, so the internals check above is this
+    blocks writes - but the authorizer does not block reads of the engine's
+    own schema/statistics tables, so the internals check above is this
     function's alone to get right.
 
     Args:
         sql_string: The SQL text to validate.
+        engine: The engine to validate against - its `sqlglot_dialect` picks
+            the parser dialect and its `internal_prefixes`/`internal_names`
+            pick the internals blocklist. Defaults to `None`, meaning SQLite,
+            so every pre-engine caller and the notebook keep working
+            unchanged.
 
     Returns:
         True if the query is judged safe to execute read-only. False when
@@ -174,4 +207,12 @@ def is_safe_query(sql_string: str) -> bool:
     s = sql_string.strip().rstrip(";").strip()
     if not _ALLOWED_PREFIX.match(s):
         return False
-    return _is_safe_ast(s)
+    dialect = _DEFAULT_DIALECT if engine is None else engine.sqlglot_dialect
+    internal_prefixes = _DEFAULT_INTERNAL_PREFIXES if engine is None else engine.internal_prefixes
+    internal_names = _DEFAULT_INTERNAL_NAMES if engine is None else engine.internal_names
+    return _is_safe_ast(
+        s,
+        dialect=dialect,
+        internal_prefixes=internal_prefixes,
+        internal_names=internal_names,
+    )

@@ -171,10 +171,10 @@ def test_repaired_sql_is_rechecked_for_safety(customers_db: str) -> None:
     responses = ["SELECT nope FROM customers", "DROP TABLE customers"]
     safety_check_args: list[str] = []
 
-    def spy_is_safe_query(sql: str) -> bool:
+    def spy_is_safe_query(sql: str, **kwargs) -> bool:
         """Wrap the real is_safe_query to record arguments."""
         safety_check_args.append(sql)
-        return real_is_safe_query(sql)
+        return real_is_safe_query(sql, **kwargs)
 
     with (
         patch("text_to_sql_agent.pipeline.generate_sql", side_effect=responses),

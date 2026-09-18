@@ -69,7 +69,9 @@ def evaluate_cases(
                 "case": case["id"],
                 "dataset": case["dataset"],
                 "difficulty": case["difficulty"],
-                "safe_sql": backend.is_safe_query(generated_sql),
+                "safe_sql": backend.is_safe_query(
+                    generated_sql, engine=backend.open_engine(case["db_path"])
+                ),
                 "executed": score.executed,
                 "row_match": score.row_match,
                 "value_match": score.value_match,

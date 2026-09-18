@@ -159,6 +159,49 @@ def test_is_safe_query_treats_double_trailing_semicolon_as_one_statement() -> No
     assert agent.is_safe_query("SELECT 1;;")
 
 
+def test_is_safe_query_uses_the_engine_dialect() -> None:
+    """A dialect-specific construct must parse under its own engine."""
+    from text_to_sql_agent.engines import open_engine
+
+    sqlite_engine = open_engine("data/university_agent.db")
+    assert agent.is_safe_query("SELECT strftime('%Y', d) FROM t", engine=sqlite_engine)
+
+
+def test_is_safe_query_defaults_to_sqlite_when_no_engine_is_given() -> None:
+    assert agent.is_safe_query("SELECT * FROM customers")
+    assert not agent.is_safe_query("SELECT * FROM sqlite_master")
+
+
+class _FakeInternalsEngine:
+    """A minimal stand-in for a second engine's dialect/internals attributes.
+
+    DuckDB's real engine does not exist until Task 6, so this hand-rolls the
+    three attributes `is_safe_query` reads rather than waiting on it.
+    """
+
+    sqlglot_dialect = "sqlite"
+    internal_prefixes: tuple[str, ...] = ()
+    internal_names = frozenset({"widgets"})
+
+
+def test_is_safe_query_internals_list_comes_from_the_engine_not_a_module_constant() -> None:
+    """The same SQL must be safe under one engine's internals rules and blocked under another's.
+
+    "widgets" is an ordinary table under SQLite's internals list (it is not
+    `sqlite_*`, `pragma_*`, or `dbstat`), but `_FakeInternalsEngine` above
+    treats it as internal. If `is_safe_query` still consulted a leftover
+    SQLite module constant instead of the passed-in engine, both assertions
+    would come out the same way - only reading `internal_names` off the
+    engine argument makes them differ.
+    """
+    from text_to_sql_agent.engines import open_engine
+
+    sqlite_engine = open_engine("data/university_agent.db")
+    sql = "SELECT * FROM widgets"
+    assert agent.is_safe_query(sql, engine=sqlite_engine)
+    assert not agent.is_safe_query(sql, engine=_FakeInternalsEngine())
+
+
 def test_is_safe_query_fails_closed_on_non_string_input() -> None:
     """Kills the empty/whitespace guard (`not sql_string or not sql_string.strip()`).
 

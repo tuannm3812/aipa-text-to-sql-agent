@@ -20,6 +20,7 @@ from .config import (
     RAG_SYNONYMS,
 )
 from .data_setup import create_dummy_university_data, write_university_db
+from .engines import Engine, open_engine
 from .env import load_env
 from .evaluation import (
     CaseScore,
@@ -52,6 +53,7 @@ __all__ = [
     "DEFAULT_RAG_TOP_K",
     "DEFAULT_VALUE_HINT_LIMIT",
     "DEFAULT_VALUE_HINT_MAX_CARDINALITY",
+    "Engine",
     "QueryResult",
     "RAG_SYNONYMS",
     "SQL_TRANSLATION_SYSTEM_PROMPT",
@@ -72,6 +74,7 @@ __all__ = [
     "load_env",
     "normalise_rows",
     "normalize_table_name",
+    "open_engine",
     "retrieve_relevant_schema",
     "retrieve_schema_chunks",
     "retrieve_schema_context",

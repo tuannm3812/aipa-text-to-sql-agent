@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .engines import open_engine
 from .execution import execute_query
 from .safety import is_safe_query
 from .types import QueryResult
@@ -142,6 +143,7 @@ def run_gold(case: dict[str, Any]) -> tuple[str, QueryResult]:
         no rows when the reference SQL fails the safety check.
     """
     sql: str = case["gold_sql"]
-    if not is_safe_query(sql):
+    engine = open_engine(case["db_path"])
+    if not is_safe_query(sql, engine=engine):
         return sql, QueryResult(columns=[], rows=[], sql=sql, error="GOLD_SQL_UNSAFE")
     return sql, execute_query(case["db_path"], sql)
