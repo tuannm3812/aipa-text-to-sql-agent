@@ -137,8 +137,44 @@ class DuckDBEngine:
     # internal reference was hidden inside a string literal rather than
     # appearing as its own parsed `Table`/`Func` node.
     #
-    # See Step 5 of the task brief (and its Fix 1 follow-up) for the probe
-    # that swept every table function `duckdb_functions()` reports and
+    # The remaining exact names are administrative functions, Python-bridge
+    # functions, and dev/test scaffolding - `checkpoint`, `force_checkpoint`,
+    # `enable_logging`, `disable_logging`, `enable_profiling`,
+    # `disable_profiling`, `truncate_duckdb_logs`, `arrow_scan`,
+    # `arrow_scan_dumb`, `pandas_scan`, `python_map_function`, `seq_scan`,
+    # `icu_calendar_names`, `test_all_types`, `test_vector_types`. None of
+    # them read the filesystem, but "does not read the filesystem" is the
+    # wrong bar for this list: the bar is whether a legitimate analytical
+    # question could ever need the function, and none of these can - a
+    # text-to-SQL agent answering business questions has no reason to force a
+    # WAL checkpoint, toggle profiling, or call into DuckDB's Arrow/Pandas/
+    # Python interop. Found by probing five of them (`checkpoint`,
+    # `enable_profiling`, `enable_logging`, `disable_logging`,
+    # `truncate_duckdb_logs`) directly against a real `DuckDBEngine` and
+    # confirming they passed `is_safe_query` *and executed* - low impact
+    # today, since `execute` opens a fresh connection each call so any state
+    # change dies with it, but only because nobody had asked whether they
+    # belonged, not because anything stopped them. The other ten were
+    # already blocked in effect (they raised `BinderException`/
+    # `InvalidInputException` against literal arguments a model could
+    # actually write, since they dereference Python objects or catalog
+    # internals no SQL literal can produce) but were unclassified at the
+    # validator level the same way. `repeat`/`repeat_row` (build a table of N
+    # copies of a literal value or row) are here for the same "no legitimate
+    # analytical use" reason, not because they touch the filesystem or state -
+    # they were on the allowlist first, moved after re-reviewing every
+    # allowlist entry against "would a real business question ever need
+    # this", not just "is it safe", and finding no case for either. See
+    # `tests/test_engine_duckdb.py::VERIFIED_SAFE_TABLE_FUNCTIONS` for the
+    # complementary allowlist: the small set of table functions kept
+    # *allowed* because a legitimate analytical question could use them
+    # (`range`, `generate_series`, `unnest`, `json_each`, `json_tree`,
+    # `histogram`, `histogram_values`, `summary`) - everything else
+    # `duckdb_functions()` reports is blocked, one way or another, by this
+    # class's prefixes/names.
+    #
+    # See Step 5 of the task brief (and its Fix 1/Fix 2 follow-ups) for the
+    # probe that swept every table function `duckdb_functions()` reports and
     # verified this list against it;
     # `tests/test_engine_duckdb.py::test_every_duckdb_table_function_is_classified`
     # re-runs that sweep as a regression test so a function DuckDB adds later
@@ -161,6 +197,23 @@ class DuckDBEngine:
             "json_execute_serialized_sql",
             "query",
             "query_table",
+            "checkpoint",
+            "force_checkpoint",
+            "enable_logging",
+            "disable_logging",
+            "enable_profiling",
+            "disable_profiling",
+            "truncate_duckdb_logs",
+            "arrow_scan",
+            "arrow_scan_dumb",
+            "pandas_scan",
+            "python_map_function",
+            "seq_scan",
+            "icu_calendar_names",
+            "test_all_types",
+            "test_vector_types",
+            "repeat",
+            "repeat_row",
         }
     )
     # See SQLiteEngine.schema_header - this is the DuckDB counterpart llm.py's

@@ -107,51 +107,72 @@ def test_file_reading_functions_are_blocked_at_both_layers(secret_and_engine, fu
 
 # Every distinct table-valued and table-macro function `duckdb_functions()`
 # reports in the installed DuckDB version, classified once, here, instead of
-# left implicit in `DuckDBEngine.internal_prefixes`/`internal_names`. Each
-# entry below was checked by hand (see p3a-task-6-report.md, "Fix 1", for the
-# full reasoning) to confirm it cannot read the filesystem, execute opaque
-# SQL/plans, or expose engine internals by any argument expressible as a SQL
-# literal - `arrow_scan`/`pandas_scan` need a live Python object registered
-# on the connection, which nothing in this codebase does; `checkpoint`,
-# `disable_logging`/`enable_logging`, `disable_profiling`/`enable_profiling`
-# and `truncate_duckdb_logs` were probed directly against a read-only
-# connection and confirmed to leave the database file's mtime/size
-# unchanged; `summary`/`json_each`/`json_tree`/histogram* take an in-query
-# subquery, column or JSON value, not a file path or string, so anything
-# internal passed through them is still a normal parsed AST node subject to
-# the checks above; the rest (`generate_series`, `range`, `repeat`,
-# `repeat_row`, `unnest`, `icu_calendar_names`, `test_all_types`,
-# `test_vector_types`, `seq_scan`, `python_map_function`) are pure
-# generators/lookups with no filesystem or catalog argument at all.
+# left implicit in `DuckDBEngine.internal_prefixes`/`internal_names`.
+#
+# The bar for this allowlist is deliberately narrower than "does not touch
+# the filesystem" - that was Fix 1's criterion, and it was wrong: it let 5
+# administrative functions (`checkpoint`, `enable_profiling`,
+# `enable_logging`, `disable_logging`, `truncate_duckdb_logs`) pass
+# `is_safe_query` and *execute* against a real `DuckDBEngine`, confirmed by
+# probing each directly - low impact today only because `execute` opens a
+# fresh connection per call, so any state change dies with it, not because
+# anything meant to stop them. The validator's job is least privilege, not
+# "provably harmless": allow only what a legitimate analytical question could
+# need. Every entry below passed that bar, not just a safety check:
+# - `range`, `generate_series`: generate a numeric/date sequence, e.g. to
+#   left-join against for a gapless daily/monthly report.
+# - `unnest`: expand an array/list column - a common analytical need.
+# - `json_each`, `json_tree`: iterate a JSON column's keys/values - useful
+#   wherever the target schema stores JSON.
+# - `histogram`, `histogram_values`, `summary`: compute distribution/summary
+#   statistics over a table or column - directly analytical.
+# Administrative functions (`checkpoint`, `force_checkpoint`,
+# `enable_logging`/`disable_logging`, `enable_profiling`/`disable_profiling`,
+# `truncate_duckdb_logs`), Python-bridge functions (`arrow_scan`,
+# `arrow_scan_dumb`, `pandas_scan`, `python_map_function` - these dereference
+# a live Python object registered on the connection, which nothing in this
+# codebase does, so they are also unreachable in practice), dev/test
+# scaffolding (`test_all_types`, `test_vector_types`, `icu_calendar_names`,
+# `seq_scan`) and synthetic-data generators with no real analytical use
+# (`repeat`, `repeat_row`) are all in `DuckDBEngine.internal_names` instead -
+# see that class for the full reasoning on each.
 VERIFIED_SAFE_TABLE_FUNCTIONS = frozenset(
     {
-        "arrow_scan",
-        "arrow_scan_dumb",
-        "checkpoint",
-        "disable_logging",
-        "disable_profiling",
-        "enable_logging",
-        "enable_profiling",
-        "force_checkpoint",
+        "range",
         "generate_series",
-        "histogram",
-        "histogram_values",
-        "icu_calendar_names",
+        "unnest",
         "json_each",
         "json_tree",
-        "pandas_scan",
-        "python_map_function",
-        "range",
-        "repeat",
-        "repeat_row",
-        "seq_scan",
+        "histogram",
+        "histogram_values",
         "summary",
-        "test_all_types",
-        "test_vector_types",
-        "truncate_duckdb_logs",
-        "unnest",
     }
 )
+
+# The 5 administrative functions Fix 2's review found passing `is_safe_query`
+# and actually executing against a real `DuckDBEngine`, under Fix 1's "does
+# not touch the filesystem" criterion. Confirmed grep-clean: none of these
+# names appear anywhere in text_to_sql_agent/, ui/, scripts/, or
+# evaluation/cases.json.
+_PREVIOUSLY_EXECUTED_ADMINISTRATIVE_FUNCTIONS = [
+    "checkpoint",
+    "enable_profiling",
+    "enable_logging",
+    "disable_logging",
+    "truncate_duckdb_logs",
+]
+
+
+@pytest.mark.parametrize("function_name", _PREVIOUSLY_EXECUTED_ADMINISTRATIVE_FUNCTIONS)
+def test_administrative_functions_are_refused_by_the_validator(function_name):
+    """Regression pin for Fix 2: these 5 passed `is_safe_query` and executed
+    before `DuckDBEngine.internal_names` grew an explicit administrative-
+    function bucket. A model has no legitimate reason to force a checkpoint
+    or toggle logging/profiling, so the validator must refuse them outright,
+    not merely fail to find a way to abuse them.
+    """
+    engine = DuckDBEngine("unused.duckdb")
+    assert not is_safe_query(f"SELECT * FROM {function_name}()", engine=engine)
 
 
 def test_every_duckdb_table_function_is_classified():
