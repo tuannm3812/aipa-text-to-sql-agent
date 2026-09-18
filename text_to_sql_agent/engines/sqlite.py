@@ -124,6 +124,11 @@ class SQLiteEngine:
     sqlglot_dialect: str = "sqlite"
     internal_prefixes: tuple[str, ...] = ("sqlite_", "pragma_")
     internal_names: frozenset[str] = frozenset({"dbstat"})
+    # Must stay exactly "SQLite schema (DDL)": llm.py's user-prompt header is
+    # f"### {engine.schema_header}\n", and a previous task's reviewer captured
+    # the full SDK payload and proved it byte-identical to before this engine
+    # split existed. `tests/test_llm.py` pins this exact string.
+    schema_header: str = "SQLite schema (DDL)"
     # This block must stay byte-identical to the corresponding lines of
     # SQL_TRANSLATION_SYSTEM_PROMPT in llm.py: a future task assembles the
     # prompt from a shared body plus this per-engine section and pins the

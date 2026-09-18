@@ -22,10 +22,25 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --python ${{ matrix.python-version }}
+        run: uv sync --python ${{ matrix.python-version }} --extra engines
 
       - name: Run tests
         run: uv run --python ${{ matrix.python-version }} pytest
+
+      - name: Fail if any conformance test was skipped
+        # importorskip("duckdb") would otherwise let every DuckDB conformance
+        # test silently skip and this job would go green having tested
+        # nothing - the same failure mode the `engines` extra above exists to
+        # prevent. `-rs` prints a SKIPPED line per skip; grep -q finding one
+        # fails the step. `pytest -m conformance` exits 0 on an all-skipped
+        # run, so this cannot rely on pytest's own exit code.
+        run: |
+          uv run --python ${{ matrix.python-version }} pytest -m conformance -rs \
+            | tee /tmp/conformance.out
+          if grep -q '^SKIPPED' /tmp/conformance.out; then
+            echo "::error::a conformance test was skipped - is the 'engines' extra installed?"
+            exit 1
+          fi
 
   quality:
     runs-on: ubuntu-latest
@@ -38,7 +53,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --extra engines
 
       - name: Lint
         run: uv run ruff check .

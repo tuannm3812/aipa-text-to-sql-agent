@@ -220,8 +220,9 @@ def generate_sql(
         if engine is None
         else _assemble_prompt(engine.prompt_dialect_section)
     )
+    schema_header = SQLiteEngine.schema_header if engine is None else engine.schema_header
     user_prompt = f"""\
-### SQLite schema (DDL)
+### {schema_header}
 {schema_text}
 
 ### User question

@@ -223,6 +223,44 @@ def test_is_safe_query_internal_prefixes_also_come_from_the_engine() -> None:
     assert not agent.is_safe_query(sql, engine=_FakeInternalsEngine())
 
 
+def test_is_safe_query_blocks_a_schema_qualified_internal_reference() -> None:
+    """`information_schema.tables` must be blocked via its schema qualifier.
+
+    Found during Task 6's Step 5 DuckDB probe: `table.name` alone is "tables",
+    which is not itself internal (a table genuinely named "tables" must stay
+    allowed unqualified), so the schema qualifier ("information_schema") has
+    to be checked too, or a schema-qualified reference to it slips through.
+    """
+    pytest.importorskip("duckdb", reason="install the duckdb extra")
+    from text_to_sql_agent.engines.duckdb import DuckDBEngine
+
+    engine = DuckDBEngine("unused.duckdb")
+    assert not agent.is_safe_query("SELECT * FROM information_schema.tables", engine=engine)
+    assert not agent.is_safe_query("SELECT * FROM pg_catalog.pg_tables", engine=engine)
+    # An unqualified table actually named "tables" must stay allowed.
+    assert agent.is_safe_query("SELECT * FROM tables", engine=engine)
+
+
+def test_is_safe_query_blocks_duckdb_filesystem_functions_it_can_name() -> None:
+    """`read_csv`/`read_parquet` parse as sqlglot's own expression classes, not
+    `exp.Anonymous`, so their function name lives behind `.sql_name()` rather
+    than `.name`. Found during Task 6's Step 5 probe: `read_csv(...)` passed
+    `is_safe_query` before that branch existed. `enable_external_access=False`
+    on the connection is still the load-bearing defence either way - this is
+    defence-in-depth on top of it, and cannot cover the bare quoted-path form
+    (`SELECT * FROM '<path>'`), which has no function name to match at all.
+    """
+    pytest.importorskip("duckdb", reason="install the duckdb extra")
+    from text_to_sql_agent.engines.duckdb import DuckDBEngine
+
+    engine = DuckDBEngine("unused.duckdb")
+    assert not agent.is_safe_query("SELECT * FROM read_csv('/etc/hosts')", engine=engine)
+    assert not agent.is_safe_query("SELECT * FROM read_parquet('/etc/x.parquet')", engine=engine)
+    assert not agent.is_safe_query("SELECT * FROM glob('/etc/*')", engine=engine)
+    # Expected gap: no function name exists here for the AST check to match.
+    assert agent.is_safe_query("SELECT * FROM '/etc/hosts'", engine=engine)
+
+
 def test_is_safe_query_fails_closed_on_non_string_input() -> None:
     """Kills the empty/whitespace guard (`not sql_string or not sql_string.strip()`).
 

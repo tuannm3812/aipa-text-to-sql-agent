@@ -46,17 +46,11 @@ def open_engine(dsn: str) -> Engine:
         return SQLiteEngine(rest)
     if scheme == "duckdb":
         try:
-            # `engines/duckdb.py` does not exist until Task 6. Until then this
-            # import always fails, which is exactly the "driver not installed"
-            # case this branch exists to report. The two ignores go with it:
-            # mypy statically resolves the target module regardless of the
-            # runtime try/except, and Task 6 removes both once the real
-            # module (and its return type) exists to check against.
-            from .duckdb import DuckDBEngine  # type: ignore[import-untyped]
+            from .duckdb import DuckDBEngine
         except ImportError as exc:
             raise EngineUnavailableError(
                 "the 'duckdb' extra is required for duckdb:// databases"
             ) from exc
 
-        return DuckDBEngine(rest)  # type: ignore[no-any-return]
+        return DuckDBEngine(rest)
     raise ValueError(f"unrecognised database scheme: {scheme!r}")

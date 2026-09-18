@@ -40,6 +40,7 @@ class Engine(Protocol):
     internal_prefixes: tuple[str, ...]
     internal_names: frozenset[str]
     prompt_dialect_section: str
+    schema_header: str
 
     def check_reachable(self) -> None:
         """Raise `EngineUnreachableError` if the target cannot be opened."""

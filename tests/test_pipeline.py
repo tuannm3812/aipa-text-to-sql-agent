@@ -263,6 +263,7 @@ class _StandInEngine:
     internal_prefixes: tuple[str, ...] = ("sqlite_", "pragma_")
     internal_names: frozenset[str] = frozenset({"dbstat"})
     prompt_dialect_section = "STAND-IN DIALECT (must follow):\n- Definitely not SQLite.\n"
+    schema_header = "Stand-in schema (DDL)"
 
     def check_reachable(self) -> None:
         return None

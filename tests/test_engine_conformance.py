@@ -27,7 +27,7 @@ WRITE_STATEMENTS = [
 ]
 
 
-@pytest.fixture(params=["sqlite"])
+@pytest.fixture(params=["sqlite", "duckdb"])
 def engine(request, tmp_path: Path):
     """One populated database per engine under test."""
     if request.param == "sqlite":
@@ -40,6 +40,18 @@ def engine(request, tmp_path: Path):
             )
             conn.executemany("INSERT INTO customers VALUES (?, ?)", [(1, "Alice"), (2, "Bob")])
         return open_engine(str(db))
+    if request.param == "duckdb":
+        duckdb = pytest.importorskip("duckdb", reason="install the duckdb extra")
+        db = tmp_path / "c.duckdb"
+        con = duckdb.connect(str(db))
+        con.execute("CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, name TEXT)")
+        con.execute(
+            "CREATE TABLE sales (sale_id INTEGER PRIMARY KEY, "
+            "customer_id INTEGER REFERENCES customers(customer_id))"
+        )
+        con.execute("INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob')")
+        con.close()
+        return open_engine(f"duckdb://{db}")
     raise AssertionError(f"no fixture for engine {request.param!r}")
 
 
@@ -54,6 +66,15 @@ def _add_table(engine, name: str) -> None:
     if engine.name == "sqlite":
         with sqlite3.connect(engine.dsn) as conn:
             conn.execute(f"CREATE TABLE {name} (a INTEGER)")
+        return
+    if engine.name == "duckdb":
+        import duckdb as duckdb_module
+
+        con = duckdb_module.connect(engine.dsn)
+        try:
+            con.execute(f"CREATE TABLE {name} (a INTEGER)")
+        finally:
+            con.close()
         return
     raise AssertionError(f"no _add_table branch for engine {engine.name!r}")
 

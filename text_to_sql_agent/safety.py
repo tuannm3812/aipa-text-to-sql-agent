@@ -89,6 +89,19 @@ def _references_internals(
         name = (table.name or "").lower()
         if name in internal_names or name.startswith(internal_prefixes):
             return True
+        # A schema-qualified reference such as `information_schema.tables` or
+        # `pg_catalog.pg_tables` has its internal marker in the schema
+        # qualifier (`.db`), not the bare table name - `.name` alone is
+        # "tables", which is not itself internal and must not be rejected
+        # when unqualified (a table genuinely named "tables" is fine).
+        # Probed 2026-09-18 against DuckDB: `SELECT * FROM
+        # information_schema.tables` passed `is_safe_query` before this
+        # qualifier check was added, because only `.name` was checked.
+        schema_qualifier = (table.db or "").lower()
+        if schema_qualifier and (
+            schema_qualifier in internal_names or schema_qualifier.startswith(internal_prefixes)
+        ):
+            return True
     # Table-valued functions such as pragma_table_info(...) parse as anonymous
     # function calls, not as tables. `.name` (not `.this`) is used here too,
     # since it normalises both the bare form and a quoted name (an Identifier
@@ -100,8 +113,20 @@ def _references_internals(
     # Only functions in a *table source* position count. Applying the name
     # rules to every call also rejected harmless scalars like
     # `SELECT sqlite_version()`, which read no internal table.
-    for function in parsed.find_all(exp.Anonymous):
-        name = (function.name or "").lower()
+    #
+    # Not every table-valued function parses as `exp.Anonymous`: sqlglot gives
+    # some DuckDB functions (`read_csv`, `read_parquet`, ...) their own
+    # dedicated expression classes, where `.name` reads the first argument
+    # (the file path) rather than the function name. `.sql_name()` is what
+    # those classes expose the canonical function name through instead.
+    # Probed 2026-09-18: `SELECT * FROM read_csv('/etc/hosts')` passed
+    # `is_safe_query` before this branch existed, because `exp.Anonymous`
+    # alone never matched sqlglot's `ReadCSV` node.
+    for function in parsed.find_all(exp.Func):
+        if isinstance(function, exp.Anonymous):
+            name = (function.name or "").lower()
+        else:
+            name = function.sql_name().lower()
         if not (name in internal_names or name.startswith(internal_prefixes)):
             continue
         if _is_table_source(function):

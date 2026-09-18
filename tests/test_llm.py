@@ -54,6 +54,7 @@ def test_generate_sql_defaults_to_the_sqlite_prompt_without_an_engine() -> None:
 def test_generate_sql_uses_the_given_engines_dialect_section() -> None:
     class _StandInEngine:
         prompt_dialect_section = "OTHER DIALECT (must follow):\n- Not SQLite.\n"
+        schema_header = "Other schema (DDL)"
 
     seen: dict[str, str] = {}
 
@@ -70,6 +71,43 @@ def test_generate_sql_uses_the_given_engines_dialect_section() -> None:
 
     assert _StandInEngine.prompt_dialect_section in seen["prompt"]
     assert "SQLITE DIALECT" not in seen["prompt"]
+
+
+def test_generate_sql_user_prompt_header_is_sqlite_by_default() -> None:
+    """A previous task's reviewer proved the full SDK payload byte-identical to
+    before the engine split; a changed SQLite header would break that.
+    """
+    seen: dict[str, str] = {}
+
+    def fake_call(_prompt: str, user_prompt: str, *_a: object, **_k: object) -> str:
+        seen["user_prompt"] = user_prompt
+        return "SELECT 1"
+
+    with patch("text_to_sql_agent.llm._call_provider", side_effect=fake_call):
+        generate_sql("how many rows", "CREATE TABLE t (a INTEGER);")
+
+    assert "### SQLite schema (DDL)" in seen["user_prompt"]
+
+
+def test_generate_sql_user_prompt_header_is_engine_aware_for_duckdb() -> None:
+    pytest.importorskip("duckdb", reason="install the duckdb extra")
+    from text_to_sql_agent.engines.duckdb import DuckDBEngine
+
+    seen: dict[str, str] = {}
+
+    def fake_call(_prompt: str, user_prompt: str, *_a: object, **_k: object) -> str:
+        seen["user_prompt"] = user_prompt
+        return "SELECT 1"
+
+    with patch("text_to_sql_agent.llm._call_provider", side_effect=fake_call):
+        generate_sql(
+            "how many rows",
+            "CREATE TABLE t (a INTEGER);",
+            engine=DuckDBEngine("unused.duckdb"),
+        )
+
+    assert "### DuckDB schema (DDL)" in seen["user_prompt"]
+    assert "### SQLite schema (DDL)" not in seen["user_prompt"]
 
 
 def test_call_provider_rejects_an_unsupported_provider() -> None:
