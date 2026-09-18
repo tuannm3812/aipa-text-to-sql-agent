@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_RAG_TOP_K
-from .engines import open_engine
+from .engines import Engine, open_engine
 from .execution import execute_query
 from .ingestion import ingest_csvs_to_db
 from .llm import generate_sql
@@ -50,19 +49,21 @@ def ask_database(
         generation or execution failed.
 
     Raises:
-        FileNotFoundError: If `db_path` does not exist.
+        EngineUnreachableError: If `db_path` cannot be reached by its engine.
+            Also a `FileNotFoundError`, for callers relying on that contract.
     """
-    if not os.path.exists(db_path):
-        raise FileNotFoundError("input database not found")
+    engine = open_engine(db_path)
+    engine.check_reachable()
 
     try:
-        engine = open_engine(db_path)
         schema_text = (
             retrieve_relevant_schema(db_path, question, top_k=rag_top_k)
             if use_rag
             else get_schema(db_path)
         )
-        sql = generate_sql(question, schema_text, model_name=model_name, provider=provider)
+        sql = generate_sql(
+            question, schema_text, model_name=model_name, provider=provider, engine=engine
+        )
 
         if "UNANSWERABLE_WITH_GIVEN_SCHEMA" in sql:
             return QueryResult(columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA")
@@ -79,6 +80,7 @@ def ask_database(
                 model_name=model_name,
                 provider=provider,
                 max_repair_attempts=max_repair_attempts,
+                engine=engine,
             )
             if repaired_sql and is_safe_query(repaired_sql, engine=engine):
                 return execute_query(db_path, repaired_sql)
@@ -117,19 +119,21 @@ def ask_database_with_sql(
         for the `QueryResult.error` values used.
 
     Raises:
-        FileNotFoundError: If `db_path` does not exist.
+        EngineUnreachableError: If `db_path` cannot be reached by its engine.
+            Also a `FileNotFoundError`, for callers relying on that contract.
     """
-    if not os.path.exists(db_path):
-        raise FileNotFoundError("input database not found")
-
     engine = open_engine(db_path)
+    engine.check_reachable()
+
     schema_text = (
         retrieve_relevant_schema(db_path, question, top_k=rag_top_k)
         if use_rag
         else get_schema(db_path)
     )
     try:
-        sql = generate_sql(question, schema_text, model_name=model_name, provider=provider)
+        sql = generate_sql(
+            question, schema_text, model_name=model_name, provider=provider, engine=engine
+        )
     except Exception as e:
         return "", QueryResult(columns=[], rows=[], error=f"{type(e).__name__}: {e}")
 
@@ -152,6 +156,7 @@ def ask_database_with_sql(
             model_name=model_name,
             provider=provider,
             max_repair_attempts=max_repair_attempts,
+            engine=engine,
         )
         if repaired_sql and is_safe_query(repaired_sql, engine=engine):
             try:
@@ -237,6 +242,7 @@ def _repair_sql(
     model_name: str,
     provider: str | None,
     max_repair_attempts: int,
+    engine: Engine,
 ) -> str | None:
     if max_repair_attempts < 1:
         return None
@@ -255,6 +261,8 @@ SQLite error:
 Return only one corrected SQLite SELECT query.
 """
     try:
-        return generate_sql(repair_question, schema_text, model_name=model_name, provider=provider)
+        return generate_sql(
+            repair_question, schema_text, model_name=model_name, provider=provider, engine=engine
+        )
     except Exception:
         return None

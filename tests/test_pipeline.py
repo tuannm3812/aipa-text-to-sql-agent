@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 import text_to_sql_agent as agent
+from text_to_sql_agent.engines import EngineUnreachableError
 
 
 def test_ask_database_uses_retrieved_schema_by_default(customers_courses_db: str) -> None:
@@ -194,3 +195,100 @@ def test_repaired_sql_is_rechecked_for_safety(customers_db: str) -> None:
     with closing(sqlite3.connect(customers_db)) as conn:
         tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     assert ("customers",) in tables, "the table must still exist"
+
+
+def test_ask_database_raises_when_the_database_is_unreachable(tmp_path: Path) -> None:
+    """Both entry points must reach through the engine, not `os.path.exists`."""
+    missing_db = str(tmp_path / "does-not-exist.db")
+
+    with pytest.raises(FileNotFoundError, match="input database not found"):
+        agent.ask_database("list customers", db_path=missing_db)
+
+
+def test_ask_database_with_sql_raises_when_the_database_is_unreachable(tmp_path: Path) -> None:
+    missing_db = str(tmp_path / "does-not-exist.db")
+
+    with pytest.raises(EngineUnreachableError, match="input database not found"):
+        agent.ask_database_with_sql("list customers", db_path=missing_db)
+
+
+def test_generation_receives_the_engine_dialect_section(customers_db: str) -> None:
+    from text_to_sql_agent.engines import open_engine
+
+    engine = open_engine(customers_db)
+    seen: dict[str, str] = {}
+
+    def fake_call(prompt: str, *_a: object, **_k: object) -> str:
+        seen["prompt"] = prompt
+        return "SELECT name FROM customers"
+
+    with patch("text_to_sql_agent.llm._call_provider", side_effect=fake_call):
+        agent.ask_database("list customers", db_path=customers_db)
+
+    assert engine.prompt_dialect_section in seen["prompt"]
+
+
+def test_repair_receives_the_engine_dialect_section(customers_db: str) -> None:
+    """A repair instructed in the wrong dialect is the failure this prevents."""
+    from text_to_sql_agent.engines import open_engine
+
+    engine = open_engine(customers_db)
+    prompts: list[str] = []
+
+    def fake_call(prompt: str, *_a: object, **_k: object) -> str:
+        prompts.append(prompt)
+        return "SELECT nope FROM customers" if len(prompts) == 1 else "SELECT name FROM customers"
+
+    with patch("text_to_sql_agent.llm._call_provider", side_effect=fake_call):
+        agent.ask_database("list customers", db_path=customers_db)
+
+    assert len(prompts) == 2, "one generation plus one repair"
+    assert all(engine.prompt_dialect_section in p for p in prompts)
+
+
+class _StandInEngine:
+    """A non-SQLite dialect section, to prove the repair path is load-bearing.
+
+    `test_repair_receives_the_engine_dialect_section` above uses a real
+    `SQLiteEngine`, whose `prompt_dialect_section` is byte-identical to the
+    default `generate_sql` falls back to when no engine is passed at all - so
+    it cannot tell a forwarded engine apart from a silently dropped one. This
+    stand-in's section differs from SQLite's, so a dropped engine changes what
+    the repair prompt contains instead of leaving it identical. DuckDB does not
+    exist until Task 6, so this is the only way to get a second, differing
+    dialect section today.
+    """
+
+    sqlglot_dialect = "sqlite"
+    internal_prefixes: tuple[str, ...] = ("sqlite_", "pragma_")
+    internal_names: frozenset[str] = frozenset({"dbstat"})
+    prompt_dialect_section = "STAND-IN DIALECT (must follow):\n- Definitely not SQLite.\n"
+
+    def check_reachable(self) -> None:
+        return None
+
+
+def test_repair_receives_a_non_sqlite_engines_dialect_section(customers_db: str) -> None:
+    """Load-bearing: fails if `_repair_sql` stops forwarding its engine.
+
+    Verified by temporarily dropping `engine=engine` from `_repair_sql`'s call
+    to `generate_sql` in `pipeline.py`: with the engine no longer forwarded,
+    `generate_sql` falls back to the SQLite default, this stand-in's section
+    is absent from the second prompt, and this test fails as expected.
+    """
+    engine = _StandInEngine()
+    prompts: list[str] = []
+
+    def fake_call(prompt: str, *_a: object, **_k: object) -> str:
+        prompts.append(prompt)
+        return "SELECT nope FROM customers" if len(prompts) == 1 else "SELECT name FROM customers"
+
+    with (
+        patch("text_to_sql_agent.llm._call_provider", side_effect=fake_call),
+        patch("text_to_sql_agent.pipeline.open_engine", return_value=engine),
+    ):
+        result = agent.ask_database("list customers", db_path=customers_db)
+
+    assert result.ok, result.error
+    assert len(prompts) == 2, "one generation plus one repair"
+    assert all(engine.prompt_dialect_section in p for p in prompts)

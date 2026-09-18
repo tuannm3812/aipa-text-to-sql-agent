@@ -15,8 +15,13 @@ class EngineUnavailableError(EngineError):
     """The engine's driver is not installed."""
 
 
-class EngineUnreachableError(EngineError):
-    """The engine's target does not exist or cannot be connected to."""
+class EngineUnreachableError(EngineError, FileNotFoundError):
+    """The engine's target does not exist or cannot be connected to.
+
+    Also inherits `FileNotFoundError` so pipeline callers that historically
+    raised `FileNotFoundError("input database not found")` keep that
+    documented contract for any caller that still catches it specifically.
+    """
 
 
 @runtime_checkable

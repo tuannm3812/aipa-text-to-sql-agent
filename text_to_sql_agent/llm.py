@@ -7,18 +7,21 @@ import re
 from typing import Any, cast
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_OLLAMA_MODEL, DEFAULT_PROVIDER
+from .engines import Engine
+from .engines.sqlite import SQLiteEngine
 from .env import load_env
 from .gemini_manager import get_default_gemini_manager
 
-SQL_TRANSLATION_SYSTEM_PROMPT = """\
+# Placeholder swapped for one engine's `prompt_dialect_section` by
+# `_assemble_prompt`. Unique within `_PROMPT_BODY`, so `str.replace` cannot
+# touch anything else.
+_DIALECT_PLACEHOLDER = "{{DIALECT_SECTION}}"
+
+_PROMPT_BODY = """\
 You are an expert data analyst and SQL translator.
 Your ONLY job is to translate the user's question into a SINGLE SQLite SELECT query.
 
-SQLITE DIALECT (must follow):
-- Generate SQLite-compatible SQL only.
-- Do NOT use EXTRACT, DATE_TRUNC, ILIKE, INTERVAL, FILTER, DISTINCT ON.
-- For dates/timestamps use SQLite functions like: strftime('%Y', col), strftime('%Y-%m', col), date(col), datetime(col).
-
+{{DIALECT_SECTION}}
 If the question cannot be answered using the schema, output exactly:
 SELECT 'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error;
 
@@ -56,6 +59,17 @@ ADDITONAL RULES - COMPARATIVE QUESTIONS (must follow):
 - If a numeric difference is requested/implicit, you may additionally output (or compute) the difference, but still include both group values.
 - Do NOT answer only one cohort unless the user explicitly asks for only that cohort.
 """
+
+
+def _assemble_prompt(dialect_section: str) -> str:
+    """Build the system prompt for one engine's dialect."""
+    return _PROMPT_BODY.replace(_DIALECT_PLACEHOLDER, dialect_section)
+
+
+# SQLite's assembled prompt, unchanged by the split above: a sha256 test pins
+# this exact value because every evaluation figure this project has reported
+# was produced under this text.
+SQL_TRANSLATION_SYSTEM_PROMPT = _assemble_prompt(SQLiteEngine.prompt_dialect_section)
 
 
 def _load_gemini_sdk() -> tuple[str, Any, Any | None]:
@@ -105,14 +119,77 @@ def _extract_sql_from_text(raw_output: str) -> str:
     return raw_output
 
 
+def _call_provider(prompt: str, user_prompt: str, *, model_name: str, provider: str) -> str:
+    """Send an assembled system prompt and the user prompt to the resolved provider.
+
+    `prompt` is the dialect-aware system prompt from `_assemble_prompt` (SQLite's
+    by default, or one from `generate_sql`'s `engine` argument); `user_prompt`
+    carries the schema and question. Both Gemini and Ollama branches route through
+    here unchanged from their previous inline form in `generate_sql`, so a test can
+    assert which system prompt reached the model without patching a vendor SDK.
+
+    Raises:
+        ValueError: If `provider` is neither `"gemini"` nor `"ollama"`.
+        ModuleNotFoundError: If the SDK required by `provider` is not installed.
+    """
+    if provider == "gemini":
+        sdk_name, genai, genai_types = _load_gemini_sdk()
+        key_manager = get_default_gemini_manager()
+
+        def generate_with_key(api_key: str) -> str:
+            if sdk_name == "google-genai":
+                assert genai_types is not None
+                client = genai.Client(api_key=api_key)
+                response = client.models.generate_content(
+                    model=model_name or DEFAULT_MODEL_NAME,
+                    contents=user_prompt,
+                    config=genai_types.GenerateContentConfig(
+                        temperature=0.0,
+                        max_output_tokens=512,
+                        system_instruction=prompt,
+                    ),
+                )
+            else:
+                genai.configure(api_key=api_key)
+                model = genai.GenerativeModel(
+                    model_name or DEFAULT_MODEL_NAME,
+                    system_instruction=prompt,
+                )
+                response = model.generate_content(
+                    contents=user_prompt,
+                    generation_config={"temperature": 0.0, "max_output_tokens": 512},
+                )
+            return _extract_sql_from_text(str(response.text or ""))
+
+        return key_manager.run(generate_with_key)
+
+    if provider == "ollama":
+        ChatOllama, HumanMessage, SystemMessage = _load_ollama_sdk()
+        model = ChatOllama(
+            model=model_name or DEFAULT_OLLAMA_MODEL,
+            temperature=0.0,
+            num_predict=512,
+        )
+        response = model.invoke(
+            [
+                SystemMessage(content=prompt),
+                HumanMessage(content=user_prompt),
+            ]
+        )
+        return _extract_sql_from_text(str(response.content or ""))
+
+    raise ValueError("Unsupported provider. Use 'gemini' or 'ollama'.")
+
+
 def generate_sql(
     user_question: str,
     schema_text: str,
     *,
     model_name: str = DEFAULT_MODEL_NAME,
     provider: str | None = None,
+    engine: Engine | None = None,
 ) -> str:
-    """Call Gemini or Ollama to generate SQLite SQL from a question and schema.
+    """Call Gemini or Ollama to generate SQL from a question and schema.
 
     Args:
         user_question: The user's natural-language question.
@@ -121,6 +198,9 @@ def generate_sql(
         provider: `"gemini"` or `"ollama"`. Defaults to the
             `TEXT_TO_SQL_PROVIDER` environment variable, then
             `DEFAULT_PROVIDER`.
+        engine: The target database's engine, whose `prompt_dialect_section`
+            is assembled into the system prompt so the model is instructed in
+            the right dialect. Defaults to SQLite's when omitted.
 
     Returns:
         The generated SQL text, extracted from the model's raw response.
@@ -135,7 +215,12 @@ def generate_sql(
     selected_provider = (
         (provider or os.environ.get("TEXT_TO_SQL_PROVIDER") or DEFAULT_PROVIDER).strip().lower()
     )
-    prompt = f"""\
+    system_prompt = (
+        SQL_TRANSLATION_SYSTEM_PROMPT
+        if engine is None
+        else _assemble_prompt(engine.prompt_dialect_section)
+    )
+    user_prompt = f"""\
 ### SQLite schema (DDL)
 {schema_text}
 
@@ -143,50 +228,6 @@ def generate_sql(
 {user_question}
 """
 
-    if selected_provider == "gemini":
-        sdk_name, genai, genai_types = _load_gemini_sdk()
-        key_manager = get_default_gemini_manager()
-
-        def generate_with_key(api_key: str) -> str:
-            if sdk_name == "google-genai":
-                assert genai_types is not None
-                client = genai.Client(api_key=api_key)
-                response = client.models.generate_content(
-                    model=model_name or DEFAULT_MODEL_NAME,
-                    contents=prompt,
-                    config=genai_types.GenerateContentConfig(
-                        temperature=0.0,
-                        max_output_tokens=512,
-                        system_instruction=SQL_TRANSLATION_SYSTEM_PROMPT,
-                    ),
-                )
-            else:
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel(
-                    model_name or DEFAULT_MODEL_NAME,
-                    system_instruction=SQL_TRANSLATION_SYSTEM_PROMPT,
-                )
-                response = model.generate_content(
-                    contents=prompt,
-                    generation_config={"temperature": 0.0, "max_output_tokens": 512},
-                )
-            return _extract_sql_from_text(str(response.text or ""))
-
-        return key_manager.run(generate_with_key)
-
-    if selected_provider == "ollama":
-        ChatOllama, HumanMessage, SystemMessage = _load_ollama_sdk()
-        model = ChatOllama(
-            model=model_name or DEFAULT_OLLAMA_MODEL,
-            temperature=0.0,
-            num_predict=512,
-        )
-        response = model.invoke(
-            [
-                SystemMessage(content=SQL_TRANSLATION_SYSTEM_PROMPT),
-                HumanMessage(content=prompt),
-            ]
-        )
-        return _extract_sql_from_text(str(response.content or ""))
-
-    raise ValueError("Unsupported provider. Use 'gemini' or 'ollama'.")
+    return _call_provider(
+        system_prompt, user_prompt, model_name=model_name, provider=selected_provider
+    )
