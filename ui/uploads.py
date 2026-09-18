@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import uuid
 from pathlib import Path
@@ -12,6 +13,38 @@ from streamlit.runtime.uploaded_file_manager import UploadedFile
 
 import text_to_sql_agent as backend
 from ui.constants import DEMO_DATABASES
+
+# Matches the credentials portion of a `scheme://user:password@host` DSN.
+# `postgresql://user:password@host/db` (Phase 3b) is the motivating case, but
+# this matches any scheme so a `sqlite://`/`duckdb://` DSN with embedded
+# credentials is caught too, and does nothing to a DSN with none.
+_DSN_CREDENTIALS_RE = re.compile(
+    r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)(?P<user>[^:@/\s]+):(?P<password>[^@/\s]+)@"
+)
+
+
+def redact_dsn(text: str) -> str:
+    """Replace the password in any `scheme://user:password@host` substring with `***`.
+
+    Applied wherever a connection string could appear in something shown to
+    the page - a caption for the "Connection string" sidebar field, or an
+    exception message a driver raised that happened to echo the DSN it failed
+    to reach. `text` need not itself be a bare DSN; only the credentials
+    portion of a matching substring is replaced, so passing through an
+    arbitrary error message is safe.
+
+    No PostgreSQL engine exists yet, but its DSN form
+    (`postgresql://user:password@host/db`) is exactly what this guards
+    against, so Phase 3b inherits working redaction instead of adding it
+    under time pressure.
+
+    Args:
+        text: Text that may contain a DSN with embedded credentials.
+
+    Returns:
+        `text` with any embedded password replaced by `***`.
+    """
+    return _DSN_CREDENTIALS_RE.sub(lambda m: f"{m.group('scheme')}{m.group('user')}:***@", text)
 
 
 def write_uploaded_db(uploaded: UploadedFile) -> str:
@@ -61,6 +94,18 @@ def active_db_path() -> str | None:
         if key not in st.session_state:
             st.session_state[key] = write_uploaded_db(uf)
         return st.session_state[key]
+
+    if source == "Connection string":
+        # Read straight from session state each call rather than caching:
+        # the DSN is session-only and must never be written to disk, so
+        # there is no on-disk cache key to build the way the upload
+        # branches above do.
+        dsn = (st.session_state.get("sb_dsn") or "").strip()
+        if not dsn:
+            return None
+        engine = backend.open_engine(dsn)
+        engine.check_reachable()
+        return dsn
 
     # CSV(s)
     files = st.session_state.get("sb_upload_csv")

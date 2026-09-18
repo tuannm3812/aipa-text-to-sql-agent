@@ -12,7 +12,7 @@ from ui.constants import DEMO_DATABASES, GEMINI_MODELS, OLLAMA_MODELS
 from ui.evaluation import evaluate_cases
 from ui.secrets import active_gemini_key, model_name_for_provider
 from ui.settings import Settings
-from ui.uploads import active_db_path
+from ui.uploads import active_db_path, redact_dsn
 
 
 def render_sidebar() -> Settings:
@@ -98,7 +98,13 @@ def render_sidebar() -> Settings:
 
         st.radio(
             "Source",
-            ["Demo database", "Path on disk", "Upload `.db`", "Upload CSV(s)"],
+            [
+                "Demo database",
+                "Path on disk",
+                "Upload `.db`",
+                "Upload CSV(s)",
+                "Connection string",
+            ],
             key="sb_source",
             label_visibility="collapsed",
         )
@@ -130,6 +136,18 @@ def render_sidebar() -> Settings:
             uf = st.session_state.get("sb_upload_db")
             if uf is not None:
                 st.caption(f"Uploaded `{uf.name}`")
+
+        elif st.session_state.get("sb_source") == "Connection string":
+            st.text_input(
+                "Connection string",
+                key="sb_dsn",
+                type="password",
+                placeholder="sqlite:///path.db, duckdb:///path.duckdb",
+                help="Session-only. Never written to disk or persisted between sessions.",
+            )
+            dsn = (st.session_state.get("sb_dsn") or "").strip()
+            if dsn:
+                st.caption(f"Using `{redact_dsn(dsn)}`")
 
         else:
             st.file_uploader(
@@ -189,7 +207,7 @@ def render_sidebar() -> Settings:
     try:
         db_path_to_query = active_db_path()
     except Exception as e:
-        st.sidebar.error(f"Ingestion failed: {e}")
+        st.sidebar.error(f"Ingestion failed: {redact_dsn(str(e))}")
 
     return Settings(
         provider=provider,
