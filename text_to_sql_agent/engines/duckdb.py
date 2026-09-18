@@ -107,19 +107,61 @@ class DuckDBEngine:
     # rejected rather than merely failing to resolve. See Step 5 of the task
     # brief for the probe that verified this list against duckdb_functions().
     #
-    # "read_" and "glob" are here for a different reason: they are
-    # filesystem-access table functions (read_csv, read_parquet, read_json,
-    # glob, ...), not catalogue functions. The connection itself already
-    # refuses all of them via `enable_external_access=False` - see the module
-    # docstring - so this is defence-in-depth, not the load-bearing guard.
-    # It also cannot be complete: `SELECT * FROM '<path>'`, a bare quoted
-    # path, has no function name at all for this AST check to match, which is
-    # exactly why the connection setting, not this list, is what actually
-    # stops it. Probed 2026-09-18: before "read_" was added here,
-    # `SELECT * FROM read_csv('/etc/hosts')` passed `is_safe_query`.
-    internal_prefixes: tuple[str, ...] = ("duckdb_", "pg_", "sqlite_", "read_")
+    # "read_", "parquet_" and "pragma_" are here for a different reason: they
+    # are filesystem-access or internals-exposing table functions
+    # (read_csv, read_parquet, parquet_metadata, pragma_table_info, ...), not
+    # catalogue functions in the sense of the paragraph above. The connection
+    # itself already refuses every filesystem one via
+    # `enable_external_access=False` - see the module docstring - so this is
+    # defence-in-depth, not the load-bearing guard. It also cannot be
+    # complete: `SELECT * FROM '<path>'`, a bare quoted path, has no function
+    # name at all for this AST check to match, which is exactly why the
+    # connection setting, not this list, is what actually stops it.
+    # "pragma_" mirrors SQLiteEngine's own "pragma_" prefix: these expose
+    # engine internals (pragma_table_info, pragma_storage_info, ...), not
+    # files, and nothing in this codebase calls them.
+    #
+    # `glob`, `sniff_csv`, `which_secret`, `query`, `query_table` and
+    # `json_execute_serialized_sql` are named exactly rather than by prefix
+    # because each is a one-off: `glob`/`sniff_csv` read the filesystem
+    # directly; `which_secret` probes DuckDB's credential/secrets store;
+    # `json_execute_serialized_sql` executes an opaque serialized query plan
+    # that this AST check cannot see inside; `query`/`query_table` execute an
+    # arbitrary SQL string or reference an arbitrary catalog table by string
+    # argument, which is invisible to sqlglot's table/function-name walk the
+    # same way a serialized plan is - probed 2026-09-19:
+    # `SELECT * FROM query('SELECT * FROM duckdb_settings()')` and
+    # `SELECT * FROM query_table('information_schema.tables')` both returned
+    # real internal data through a read-only, external-access-disabled
+    # connection, entirely bypassing the internals checks above, because the
+    # internal reference was hidden inside a string literal rather than
+    # appearing as its own parsed `Table`/`Func` node.
+    #
+    # See Step 5 of the task brief (and its Fix 1 follow-up) for the probe
+    # that swept every table function `duckdb_functions()` reports and
+    # verified this list against it;
+    # `tests/test_engine_duckdb.py::test_every_duckdb_table_function_is_classified`
+    # re-runs that sweep as a regression test so a function DuckDB adds later
+    # fails closed instead of silently passing.
+    internal_prefixes: tuple[str, ...] = (
+        "duckdb_",
+        "pg_",
+        "sqlite_",
+        "read_",
+        "parquet_",
+        "pragma_",
+    )
     internal_names: frozenset[str] = frozenset(
-        {"information_schema", "sqlite_master", "glob", "parquet_scan"}
+        {
+            "information_schema",
+            "sqlite_master",
+            "glob",
+            "sniff_csv",
+            "which_secret",
+            "json_execute_serialized_sql",
+            "query",
+            "query_table",
+        }
     )
     # See SQLiteEngine.schema_header - this is the DuckDB counterpart llm.py's
     # user-prompt header uses when the target engine is DuckDB.
