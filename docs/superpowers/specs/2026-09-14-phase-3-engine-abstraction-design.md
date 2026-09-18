@@ -181,6 +181,32 @@ Each must be probed the way SQLite's was — by enumerating the engine's own
 catalogue and trying to reach it — before the phase closes. Phase 2 shipped an
 internals rule that looked complete and had a `dbstat('main')` bypass in it.
 
+**Revised 2026-09-19 — DuckDB validates by default-deny, not by blocklist.**
+Owner's decision, after a name-based blocklist leaked in four successive review
+rounds against DuckDB's ~960 functions: `sniff_csv`; then `query()` /
+`query_table()`, which hide SQL inside a string argument the AST never enters;
+then administrative functions such as `enable_logging` and `checkpoint` that
+executed on a read-only connection; then `current_setting()`, a **scalar**
+returning live configuration including `secret_directory` and — wherever one is
+set — `http_proxy_password`, and the `histogram` / `histogram_values` macros
+whose bodies call `query_table(source)` and read `information_schema.tables`
+through an allowlisted name.
+
+The scalar case is what makes a blocklist structurally unfit here rather than
+merely incomplete: the internals check deliberately fires only in a table-source
+position, so that `SELECT sqlite_version()` stays legal, which means no name
+added to a list can ever block a function used as a value.
+
+An engine may therefore declare `allowed_functions: frozenset[str] | None`.
+`None` keeps today's blocklist behaviour, and SQLite stays there — its surface is
+small and its list has held. A set switches `is_safe_query` to default-deny:
+**every function call, in any position — scalar, aggregate, window or table —
+must name a function in the set, or the query is rejected.** Unknown means no.
+A new DuckDB release that adds a function changes nothing until someone
+deliberately approves it. Macros are excluded from the set unless their body has
+been read and shown not to reach `query`, `query_table` or catalogue objects,
+since a macro can hide an internals read behind an innocent name.
+
 **`is_safe_query`'s signature changes.** It is exported in `__all__` and called
 from `pipeline.py`, `ui/evaluation.py` and the evaluation module. The engine
 parameter gets a default of the SQLite engine so existing callers keep working,
@@ -333,7 +359,9 @@ access is mandatory, is pinned by a test that bypasses `is_safe_query`, and is
 proven load-bearing by removing it.
 
 **The internals blocklists are incomplete.** Assume they are, because SQLite's
-was. Each engine's list must be probed against its own catalogue before the phase
+was. For DuckDB this is no longer an assumption to mitigate but a demonstrated
+fact, which is why DuckDB moved to a default-deny function allowlist (§4.4). A
+false rejection costs one unanswerable question; a false allowance is a leak. Each engine's list must be probed against its own catalogue before the phase
 closes, and the probe recorded.
 
 **PostgreSQL tests are flaky or unavailable.** Docker exists locally and CI

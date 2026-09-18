@@ -980,6 +980,80 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 ---
 
+### Task 6b: Default-deny function allowlist for DuckDB
+
+Added 2026-09-19 by owner decision, after Task 6's name-based blocklist leaked in
+four successive review rounds. See spec §4.4, "Revised 2026-09-19".
+
+**Files:**
+- Modify: `text_to_sql_agent/safety.py`, `text_to_sql_agent/engines/base.py`, `text_to_sql_agent/engines/duckdb.py`, `text_to_sql_agent/engines/sqlite.py`
+- Test: `tests/test_engine_duckdb.py`, `tests/test_safety.py`
+
+**Interfaces:**
+- Consumes: the `Engine` protocol, `is_safe_query(sql, *, engine=None)`.
+- Produces: `Engine.allowed_functions: frozenset[str] | None`. `None` = blocklist mode (SQLite, unchanged). A set = default-deny.
+
+**Proven leaks this task must close** (all verified against the live engine,
+validator ALLOW and connection EXECUTED):
+- `SELECT current_setting('secret_directory')` → returned a real path; would return
+  `http_proxy_password` wherever one is configured. It is a **scalar**, so no
+  table-source rule can reach it.
+- `SELECT * FROM histogram_values('information_schema.tables', 'table_name', 20, 'auto')`
+  → returned catalogue rows. `histogram_values` is a macro whose body calls
+  `query_table(source)`; `histogram` calls it. Both were on the allowlist.
+
+- [ ] **Step 1: Add the protocol attribute.** `Engine` gains
+  `allowed_functions: frozenset[str] | None`. `SQLiteEngine.allowed_functions = None`.
+
+- [ ] **Step 2: Default-deny in `is_safe_query`.** When the engine's
+  `allowed_functions` is a set, walk **every** function node in the parsed
+  statement, in every position, and reject the query if any function's name is
+  not in the set. The existing structural rules and internals checks still run
+  as well — this is an additional gate, not a replacement.
+
+  Name resolution is the hard part and must be tested, not assumed. sqlglot
+  parses many functions into typed classes (`exp.Count`, `exp.Upper`,
+  `exp.ReadCSV`, ...) whose canonical `.sql_name()` may differ from the name the
+  user wrote or the name DuckDB registers. Resolve each node to the name DuckDB
+  itself would call, compare case-insensitively, and prove the mapping for every
+  entry in the allowlist.
+
+  A string-literal table reference — `FROM '<path>'` — is also rejected in
+  default-deny mode. The connection guard already refuses it; this makes the
+  validator agree rather than relying on the second layer alone.
+
+- [ ] **Step 3: Curate `DuckDBEngine.allowed_functions`.** Only functions an
+  analytical question could need: aggregates, window functions, string, date and
+  time, numeric, conditional and list/JSON-access functions, plus the table
+  functions `range`, `generate_series`, `unnest`, `json_each`, `json_tree`.
+  **No macros** unless its body is read and shown not to reach `query`,
+  `query_table` or catalogue objects. `histogram`, `histogram_values` and
+  `summary` are **out**. `current_setting` and every other configuration or
+  session-introspection function is **out**. When unsure, leave it out.
+
+- [ ] **Step 4: Prove default-deny, not a list.** Sweep `duckdb_functions()` for
+  **every** function type and assert every name **not** in the allowlist is
+  rejected by `is_safe_query` in a scalar position (`SELECT name(...)`) and, where
+  it parses, in a table position (`SELECT * FROM name(...)`). This test is the
+  property; the allowlist is only data.
+
+- [ ] **Step 5: Prove no false rejection of real analytics.** A parametrised
+  corpus of at least 40 DuckDB analytical queries — grouping, aggregation, window
+  functions, date bucketing with `date_trunc`, string cleaning, `CASE`, CTEs,
+  `COALESCE`, list and JSON access — must all pass `is_safe_query` **and**
+  execute on a real DuckDB fixture. A false rejection costs a user an
+  unanswerable question, so this corpus matters as much as the attack corpus.
+
+- [ ] **Step 6: Pin both proven leaks.** `current_setting(...)` in scalar
+  position, and `histogram` / `histogram_values` with a catalogue source, are
+  rejected by `is_safe_query`.
+
+- [ ] **Step 7: SQLite unchanged.** Re-run a differential of the pre-task
+  `safety.py` against the new one under `SQLiteEngine` over a corpus of 150+
+  queries. Zero disagreements, since SQLite's `allowed_functions` is `None`.
+
+- [ ] **Step 8: Gates, conformance with no skips, and commit.**
+
 ### Task 7: End-to-end tests and the UI connection option
 
 Conformance cannot catch a failure that happens *before* the engine is reached.
