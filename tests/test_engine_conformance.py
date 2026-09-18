@@ -43,6 +43,21 @@ def engine(request, tmp_path: Path):
     raise AssertionError(f"no fixture for engine {request.param!r}")
 
 
+def _add_table(engine, name: str) -> None:
+    """Mutate the schema underneath `engine` via a separate writable connection.
+
+    `engine`'s own connection is read-only by design, so it cannot be the one
+    that runs the DDL. Dispatches on `engine.name`, exactly like the `engine`
+    fixture dispatches on `request.param` — extending either to a new engine
+    means adding one branch here and one there.
+    """
+    if engine.name == "sqlite":
+        with sqlite3.connect(engine.dsn) as conn:
+            conn.execute(f"CREATE TABLE {name} (a INTEGER)")
+        return
+    raise AssertionError(f"no _add_table branch for engine {engine.name!r}")
+
+
 def test_a_select_returns_rows_and_columns(engine) -> None:
     result = engine.execute(
         "SELECT name FROM customers ORDER BY customer_id", max_rows=10, work_limit=0
@@ -89,6 +104,12 @@ def test_raw_schema_mentions_every_table(engine) -> None:
     assert "sales" in schema
 
 
-def test_the_fingerprint_changes_when_the_schema_changes(engine) -> None:
+def test_the_fingerprint_is_stable_when_nothing_changes(engine) -> None:
     before = engine.schema_fingerprint()
     assert engine.schema_fingerprint() == before, "must be stable when nothing changes"
+
+
+def test_the_fingerprint_changes_when_the_schema_changes(engine) -> None:
+    before = engine.schema_fingerprint()
+    _add_table(engine, "brand_new_table")
+    assert engine.schema_fingerprint() != before, "must change when the schema changes"
