@@ -245,6 +245,94 @@ def _references_disallowed_function(
     return False
 
 
+def _visible_cte_names(table: sqlglot_exp.Table) -> frozenset[str]:
+    """The CTE aliases actually visible at `table`'s position, per DuckDB's own scoping.
+
+    Fix 2 (2026-09-19 review round): a CTE is a real SQL scope, not a flat
+    namespace over the whole statement. The previous implementation collected
+    every `exp.CTE` alias in the parsed tree unscoped, which let an *inner*
+    CTE's name leak into an *outer* sibling reference it can never actually
+    resolve to - reproduced live against DuckDB:
+    `SELECT * FROM (WITH "leak.csv" AS (SELECT 1) SELECT * FROM "leak.csv")
+    x, "leak.csv"` - the outer `"leak.csv"` is not the inner query's CTE as
+    far as DuckDB is concerned, so DuckDB attempts a replacement scan (a file
+    read) on it, while the old unscoped check treated it as a known name and
+    approved the query.
+
+    This walks upward from `table` through its ancestors instead, admitting a
+    `WITH`'s CTE names only at the points DuckDB itself would resolve them -
+    each rule below was verified against a real DuckDB connection, not
+    assumed from the SQL standard alone (see `tests/test_engine_duckdb.py`):
+
+    - A CTE is visible in the `WITH`'s own main query, including inside any
+      subquery nested in that main query. Modelled by the `else` branch
+      below: whenever the walk rises into a node that carries a `with` arg
+      from anywhere other than that same `with` arg, every name in it is
+      admitted - true at any nesting depth, since the walk keeps climbing.
+    - It is NOT visible outside the query that owns the `WITH`. Once the walk
+      climbs past that query without re-entering through its `with` arg, that
+      `WITH`'s names are never admitted again - which is exactly what makes
+      the outer `"leak.csv"` above correctly unrecognised: its ancestor chain
+      never passes through the inner `WITH` at all.
+    - Within one `WITH` list, a CTE is visible only to CTEs defined *after*
+      it, not before. Verified live: `WITH a AS (SELECT * FROM b), b AS
+      (SELECT 1) SELECT * FROM a` does not resolve `b` against the second
+      CTE - DuckDB attempts a replacement scan on `b` there (the forward
+      reference is invisible) - while swapping the definition order so `b`
+      comes first resolves it correctly. Modelled by the `exp.CTE` branch
+      below, which only admits names at a smaller list index than the CTE
+      whose body `table` sits in.
+    - A `WITH RECURSIVE` CTE is visible inside its own body - modelled by
+      also admitting its own index when the `with` node's `recursive` flag is
+      set.
+    - Shadowing (an inner CTE reusing an outer CTE's name) needs no special
+      case: this function only answers "is this name visible as *some* CTE
+      here", never "which one" - both the inner and outer definitions are
+      legitimate CTEs, so finding either is correct regardless of which one
+      DuckDB would actually bind to.
+
+    Args:
+        table: A parsed `exp.Table` node to compute CTE visibility for.
+
+    Returns:
+        The lowercased CTE aliases visible at `table`'s position.
+    """
+    if exp is None:
+        return frozenset()
+    visible: set[str] = set()
+    child: sqlglot_exp.Expression = table
+    parent = child.parent
+    while parent is not None:
+        if isinstance(parent, exp.CTE):
+            with_node = parent.parent
+            if isinstance(with_node, exp.With):
+                ctes = with_node.expressions
+                is_recursive = bool(with_node.args.get("recursive"))
+                # Identity, not `list.index` (`==`), since `exp.Expression`
+                # overrides equality structurally - two CTEs with
+                # coincidentally identical bodies must not be confused with
+                # each other here.
+                own_index = next((i for i, c in enumerate(ctes) if c is parent), -1)
+                for i, cte in enumerate(ctes):
+                    if i < own_index or (is_recursive and i == own_index):
+                        name = (cte.alias or "").lower()
+                        if name:
+                            visible.add(name)
+                child = with_node
+                parent = with_node.parent
+                continue
+        else:
+            with_arg = parent.args.get("with")
+            if isinstance(with_arg, exp.With) and with_arg is not child:
+                for cte in with_arg.expressions:
+                    name = (cte.alias or "").lower()
+                    if name:
+                        visible.add(name)
+        child = parent
+        parent = parent.parent
+    return frozenset(visible)
+
+
 def _references_unknown_table(
     parsed: sqlglot_exp.Expression, *, get_real_table_names: Callable[[], frozenset[str]]
 ) -> bool:
@@ -284,11 +372,10 @@ def _references_unknown_table(
     "not a real table" here would reject `range(5)` even though it is
     correctly allowed.
 
-    A CTE alias defined anywhere in the statement counts as a real table for
-    this purpose (`WITH totals AS (...) SELECT * FROM totals`) - collected
-    across the whole parsed tree rather than scoped precisely to where each
-    CTE is visible, which only widens what counts as a known name, never
-    narrows it below what SQL scoping would allow.
+    A CTE alias counts as a real table for this purpose (`WITH totals AS
+    (...) SELECT * FROM totals`) only where DuckDB itself would actually
+    resolve it to that CTE - see `_visible_cte_names` for the scoping rules
+    and the live-DuckDB proof that unscoped collection is wrong.
 
     `get_real_table_names` is a zero-argument callable rather than an
     already-computed set: it is only invoked once at least one table
@@ -320,17 +407,14 @@ def _references_unknown_table(
         schema = (table.db or "").lower()
         if schema and schema != "main":
             return True
-        candidates.append((table.name or "").lower())
+        name = (table.name or "").lower()
+        if name in _visible_cte_names(table):
+            continue
+        candidates.append(name)
     if not candidates:
         return False
-    cte_names = {(cte.alias or "").lower() for cte in parsed.find_all(exp.CTE)}
     real_table_names = get_real_table_names()
-    for name in candidates:
-        if name in cte_names:
-            continue
-        if name not in real_table_names:
-            return True
-    return False
+    return any(name not in real_table_names for name in candidates)
 
 
 def _is_table_source(node: sqlglot_exp.Expression) -> bool:

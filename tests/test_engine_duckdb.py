@@ -970,3 +970,204 @@ def test_analytics_corpus_passes_validation_and_executes(analytics_db, sql):
     assert is_safe_query(sql, engine=analytics_db), f"wrongly rejected: {sql!r}"
     result = analytics_db.execute(sql, max_rows=1000, work_limit=0)
     assert result.ok, f"{sql!r} failed to execute: {result.error}"
+
+
+# Fix 2 (2026-09-19 review round): `_references_unknown_table` used to collect
+# every `exp.CTE` alias across the whole parsed tree, unscoped. DuckDB scopes
+# CTEs like any other SQL engine, so an inner `WITH`'s alias leaking into an
+# outer sibling reference let a query like the one below sail through the
+# validator while DuckDB itself performs a real replacement scan (file read)
+# on the outer reference. `_visible_cte_names` now walks the AST ancestor
+# chain instead, admitting a CTE's alias only where DuckDB would actually
+# resolve a reference to it. Every test below was checked against a real,
+# live DuckDB connection - either through the app's own engine (`is_safe_query`
+# plus `engine.execute`) or, where the point is specifically to show what an
+# *unscoped* reference resolves to, a bare `duckdb.connect` with external
+# access left at its default (enabled), reading a real file from `tmp_path`.
+
+
+def test_reviewer_reproduction_is_rejected(engine_with_table_t):
+    """The exact reproduction from the task brief: an inner CTE named like a
+    file path must not leak into the outer, sibling table reference of the
+    same name - `_references_unknown_table` must reject this regardless of
+    `enable_external_access`, which is a second, independent defence and must
+    not be the only thing standing between this query and a real file read.
+    """
+    sql = """
+        SELECT * FROM (
+          WITH "/tmp/x/leak.csv" AS (SELECT 1 AS a) SELECT * FROM "/tmp/x/leak.csv"
+        ) x, "/tmp/x/leak.csv"
+    """
+    assert not is_safe_query(sql, engine=engine_with_table_t)
+
+
+@pytest.fixture
+def leaking_csv_pair(tmp_path):
+    """Two real CSV files, each with content distinguishable from the other
+    and from any CTE body used in the tests below, plus their absolute paths
+    quoted for direct use in SQL. Backs the raw-`duckdb.connect` probes that
+    show what DuckDB does with a table reference that does *not* resolve to
+    a CTE: with external access left enabled (unlike the app's own engine),
+    DuckDB's replacement scan actually reads the file, and the returned rows
+    prove it rather than merely asserting it.
+    """
+    leak = tmp_path / "leak.csv"
+    leak.write_text("k,v\nleaked,secret\n", encoding="utf-8")
+    later = tmp_path / "later.csv"
+    later.write_text("k,v\nlater,fromfile\n", encoding="utf-8")
+    return leak, later
+
+
+def test_cte_not_visible_outside_owning_query(leaking_csv_pair, engine_with_table_t):
+    """Rule 2: a CTE is visible in the `WITH`'s own main query, but NOT
+    outside the query that owns the `WITH` - the reviewer's case, generalised
+    to a real file so the "what does DuckDB actually do" half is provable
+    rather than assumed.
+
+    Real DuckDB (external access enabled) resolves the *inner* reference
+    against the CTE (the file's real content, `('leaked', 'secret')`, never
+    appears) but performs a genuine replacement scan for the *outer* one,
+    returning the file's real row. `is_safe_query` must reject the query
+    outright - it cannot approve a query on the strength of the inner
+    resolution while the outer one silently reads a file.
+    """
+    leak, _later = leaking_csv_pair
+    sql = f"""
+        SELECT * FROM (
+          WITH '{leak}' AS (SELECT 1 AS a) SELECT * FROM '{leak}'
+        ) x, '{leak}'
+    """
+    con = duckdb.connect(":memory:")
+    try:
+        rows = con.execute(sql).fetchall()
+    finally:
+        con.close()
+    assert rows == [(1, "leaked", "secret")], (
+        "sanity check: DuckDB must actually perform a replacement scan for the outer "
+        f"reference, proving the inner CTE's name does not leak outward; got {rows!r}"
+    )
+    assert not is_safe_query(sql, engine=engine_with_table_t)
+
+
+def test_cte_forward_reference_is_not_visible(leaking_csv_pair, engine_with_table_t):
+    """Rule 3: within one `WITH` list, a CTE is visible only to CTEs defined
+    *after* it, not before. Checked against real DuckDB rather than assumed:
+    the first CTE here (aliased to the `leak.csv` path) references the
+    second CTE's alias (the `later.csv` path) before it is defined.
+
+    Real DuckDB does not resolve the forward reference against the sibling
+    CTE at all - it falls straight through to a replacement scan on the
+    path, returning `later.csv`'s real file content
+    (`('later', 'fromfile')`). `is_safe_query` must agree and reject.
+    """
+    leak, later = leaking_csv_pair
+    sql = f"""
+        WITH '{leak}' AS (SELECT * FROM '{later}'), '{later}' AS (SELECT 1 AS x)
+        SELECT * FROM '{leak}'
+    """
+    con = duckdb.connect(":memory:")
+    try:
+        rows = con.execute(sql).fetchall()
+    finally:
+        con.close()
+    assert rows == [("later", "fromfile")], (
+        "sanity check: DuckDB must treat the forward reference as unresolved and read "
+        f"the file instead; got {rows!r}"
+    )
+    assert not is_safe_query(sql, engine=engine_with_table_t)
+
+
+def test_cte_backward_reference_is_visible_and_executes(engine_with_table_t):
+    """Rule 3, the legitimate half: a CTE defined *after* an earlier one may
+    still reference that earlier one - ordinary, common SQL
+    (`WITH a AS (...), b AS (SELECT * FROM a) SELECT * FROM b`) that the
+    scoped visibility check must not start rejecting.
+    """
+    sql = "WITH later AS (SELECT 1 AS x), leak AS (SELECT * FROM later) SELECT * FROM leak"
+    assert is_safe_query(sql, engine=engine_with_table_t)
+    result = engine_with_table_t.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok and result.rows == [(1,)], result.error
+
+
+def test_cte_visible_in_nested_subquery_of_main_query(engine_with_table_t):
+    """Rule 1: a CTE is visible in its `WITH`'s main query, including inside
+    a subquery nested in that main query - not just a direct
+    `FROM <cte alias>` at the top level of the main query.
+    """
+    sql = "WITH totals AS (SELECT 1 AS a) SELECT * FROM (SELECT * FROM totals) x"
+    assert is_safe_query(sql, engine=engine_with_table_t)
+    result = engine_with_table_t.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok and result.rows == [(1,)], result.error
+
+
+def test_recursive_cte_is_visible_in_its_own_body(engine_with_table_t):
+    """Rule 4: a `WITH RECURSIVE` CTE is visible inside its own body - the
+    self-reference that makes recursion possible at all must not be rejected
+    as an unknown table.
+    """
+    sql = (
+        "WITH RECURSIVE counter AS ("
+        "SELECT 1 AS n UNION ALL SELECT n + 1 FROM counter WHERE n < 5"
+        ") SELECT * FROM counter ORDER BY n"
+    )
+    assert is_safe_query(sql, engine=engine_with_table_t)
+    result = engine_with_table_t.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok and result.rows == [(1,), (2,), (3,), (4,), (5,)], result.error
+
+
+def test_inner_cte_shadows_outer_of_the_same_name(engine_with_table_t):
+    """Rule 5: an inner CTE with the same name as an outer one shadows it
+    within the inner scope - checked against real DuckDB's own resolution
+    (the inner definition's value, 2, not the outer's, 1) so the test proves
+    shadowing rather than merely a name being "some" visible CTE.
+    """
+    sql = "WITH x AS (SELECT 1 AS a) SELECT * FROM (WITH x AS (SELECT 2 AS a) SELECT * FROM x) y"
+    con = duckdb.connect(":memory:")
+    try:
+        rows = con.execute(sql).fetchall()
+    finally:
+        con.close()
+    assert rows == [(2,)], f"sanity check: the inner CTE must shadow the outer one; got {rows!r}"
+    assert is_safe_query(sql, engine=engine_with_table_t)
+    result = engine_with_table_t.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok and result.rows == [(2,)], result.error
+
+
+def test_cte_referenced_directly_from_main_query_executes(engine_with_table_t):
+    """The baseline legitimate case every rule above is a variation on: a CTE
+    referenced straight from its own `WITH`'s main query, over a real table.
+    """
+    sql = "WITH c AS (SELECT a FROM t) SELECT * FROM c"
+    assert is_safe_query(sql, engine=engine_with_table_t)
+    result = engine_with_table_t.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok, result.error
+
+
+def test_cte_scoping_fix_is_load_bearing(monkeypatch, engine_with_table_t):
+    """Proves Fix 2 actually matters: monkeypatches `_visible_cte_names` back
+    to the pre-fix behaviour (every CTE alias in the whole parsed tree,
+    unscoped) and confirms the reviewer's reproduction is then wrongly
+    approved - then leaves the monkeypatch to be undone automatically at
+    teardown, restoring the real, scoped implementation.
+    """
+
+    def _unscoped_cte_names(table: exp.Table) -> frozenset[str]:
+        parsed = table
+        while parsed.parent is not None:
+            parsed = parsed.parent
+        return frozenset((cte.alias or "").lower() for cte in parsed.find_all(exp.CTE))
+
+    sql = """
+        SELECT * FROM (
+          WITH "/tmp/x/leak.csv" AS (SELECT 1 AS a) SELECT * FROM "/tmp/x/leak.csv"
+        ) x, "/tmp/x/leak.csv"
+    """
+    # Sanity check first: the real, fixed implementation rejects this.
+    assert not is_safe_query(sql, engine=engine_with_table_t)
+
+    monkeypatch.setattr(_safety, "_visible_cte_names", _unscoped_cte_names)
+    assert is_safe_query(sql, engine=engine_with_table_t), (
+        "the pre-fix, unscoped CTE collection was expected to wrongly approve the "
+        "reviewer's reproduction - if this fails, the fix may no longer be load-bearing "
+        "for this case"
+    )
