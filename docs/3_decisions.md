@@ -2,6 +2,240 @@
 
 Newest first. Each entry states what was chosen and what it ruled out.
 
+## 2026-09-19 — per-engine read-only enforcement, no shared mechanism
+
+**Chosen:** Each `Engine` implementation proves its own read-only guarantee
+its own way — SQLite via a `PRAGMA query_only` connection plus a 28-constant
+authorizer, DuckDB via `read_only=True` plus `enable_external_access=False`
+on connect. `tests/test_engine_conformance.py`, parametrised over every
+available engine with no per-engine special-casing in the test bodies, is
+the thing that proves the guarantee actually holds for each one.
+
+**Ruled out:** A shared read-only enforcement layer in `Engine`/`base.py`.
+
+**Why:** SQLite's URI flag plus authorizer, DuckDB's connect-time flags and
+(from Phase 3b) PostgreSQL's read-only transaction share nothing but the
+outcome — there is no common mechanism to factor out without inventing an
+abstraction none of the three drivers actually has. Making the conformance
+suite the shared proof, rather than the implementation, is what lets each
+engine use its native mechanism while still being held to the same
+guarantee: `tests/test_engine_conformance.py::test_writes_are_refused_by_the_connection_itself`
+and its siblings run unmodified against `[sqlite]` and `[duckdb]` alike.
+
+## 2026-09-19 — `enable_external_access=False` is DuckDB's load-bearing filesystem guard, not `read_only=True`
+
+**Chosen:** `DuckDBEngine`'s connection is opened with both
+`read_only=True` and `config={"enable_external_access": False}`.
+
+**Ruled out:** `read_only=True` alone, on the assumption that "read-only"
+already implies "can't touch the filesystem."
+
+**Why:** `read_only=True` stops writes to the database file; it does nothing
+about DuckDB reading arbitrary files through the query language itself.
+Verified directly (Task 6): with `enable_external_access=False` removed and
+only `read_only=True` kept, `read_csv('<path>')`, `SELECT * FROM '<path>'`
+(both quoted and unquoted, via DuckDB's replacement scan), `glob('<path>')`,
+and `COPY ... TO '<path>'` all succeeded against files outside the target
+database — every one of the 4 filesystem-access probes in
+`tests/test_engine_duckdb.py` failed (`DID NOT RAISE Exception`) with the
+setting removed and passed with it restored. `enable_external_access=False`
+is therefore the actual defence; `is_safe_query`'s DuckDB internals list and
+default-deny function/table checks are defence-in-depth on top of it, not a
+substitute for it — the bare quoted-path form (`FROM '<path>'`) has no
+function name for an AST check to catch at all, which is exactly why the
+connection-level setting has to hold on its own.
+
+## 2026-09-19 — default-deny validation for DuckDB, chosen after the name blocklist leaked four times
+
+**Chosen:** For any engine whose `allowed_functions` is not `None`
+(currently only `DuckDBEngine`), `safety.is_safe_query` switches from a
+blocklist (name a few internal things, reject them) to default-deny (name
+everything that's allowed, reject anything else). Concretely, four gates:
+
+- **A function allowlist checked in every position** — scalar, aggregate,
+  window, and table — not just the table-source position the old blocklist
+  checked. `_resolve_function_name` maps a parsed call back to the real
+  DuckDB name it invokes (sqlglot's own `.sql_name()` sometimes diverges,
+  e.g. `date_trunc(...)` parses to `TimestampTrunc` whose `.sql_name()` is
+  `TIMESTAMP_TRUNC`), and the result must be one of 127 allowlisted names.
+- **A table default-deny** — every `FROM`/`JOIN` target must name either a
+  real table (`Engine.table_names()`) or a CTE visible at that point in the
+  statement, or the query is rejected. This is what closes the replacement-scan
+  path a bare `FROM '<path>'` or `FROM path` (no quotes) takes, which no
+  function-name check can see.
+- **`list_aggregate`'s (and its four synonyms') string-dispatch argument**
+  must be a literal naming an allowed function — `list_aggregate(col,
+  'histogram')` genuinely runs `histogram` at the SQL level even though
+  `histogram` is itself rejected everywhere else, so the dispatch argument
+  needs its own check.
+- **Scope-correct CTE visibility** — a CTE name is only "real" where DuckDB
+  itself would resolve it: visible in the query that owns its `WITH` clause
+  and nested subqueries of that query, not in a sibling or outer query, and
+  (within one `WITH` list) only to CTEs defined after it, unless the list is
+  `RECURSIVE`. A forward reference or an outer-sibling reference to a CTE
+  name falls through to a real replacement scan in DuckDB, so the validator's
+  visibility rule has to match that exactly rather than treating every CTE
+  alias in the parsed tree as globally visible.
+
+**Ruled out:** Continuing to patch the blocklist (`internal_prefixes`/
+`internal_names`) as new gaps were found.
+
+**Why:** Four rounds of blocklist fixes in Task 6/6b each closed the exact
+case that prompted them and opened a new one: `information_schema.tables`
+(schema-qualifier gap) and `read_csv`/`glob` (checked `exp.Anonymous` only,
+missed sqlglot's typed `exp.Func` subclasses) in Task 6's first pass;
+`sniff_csv`/`query`/`query_table` (a function-name sweep found more DuckDB
+table functions than the hand-picked list covered) and administrative
+functions like `checkpoint`/`enable_logging` executing despite passing
+validation (the allowlist bar was "doesn't touch the filesystem," not least
+privilege) in Task 6's post-review fixes; a comma-join and an unquoted
+filename escaping the table-source string check, plus `EXTRACT(... FROM
+...)` being falsely rejected by that same check, in Task 6b's review round.
+Each fix was correct for the case in front of it and wrong one level out —
+the same pattern already named in the 2026-09-14 agent log entry for the
+SQLite safety fixes in Phase 2. Against DuckDB's much larger function
+surface (945 distinct catalogue names swept in Task 6b, versus SQLite's
+much smaller surface), a name blocklist is structurally unfit: it can only
+be as complete as the last person to think of a name. Default-deny inverts
+the burden — an unclassified future DuckDB function fails closed by
+construction, pinned by
+`tests/test_engine_duckdb.py::test_every_unlisted_duckdb_function_is_rejected_by_default_deny`,
+which re-sweeps the live catalogue (945 names, 127 allowlisted, 0
+mismatches across 1,836 scalar/table-position checks) rather than asserting
+against a frozen list. `SQLiteEngine.allowed_functions` stays `None` — its
+much smaller function surface and years of the existing blocklist holding
+made the stronger guarantee not worth the added complexity there; the two
+engines are allowed to make different calls for the same reason Phase 3's
+governing constraint says the read-only model itself doesn't share a
+mechanism.
+
+## 2026-09-19 — abort-code family shares the `QUERY_ABORTED_AFTER_` prefix, diverges on unit
+
+**Chosen:** `QUERY_ABORTED_AFTER_<n>_VM_STEPS` for SQLite (unchanged from
+Phase 2), `QUERY_ABORTED_AFTER_<n>_MS` for DuckDB.
+
+**Ruled out:** A single shared unit (e.g. forcing DuckDB's wall-clock budget
+into a step count, or SQLite's step count into milliseconds).
+
+**Why:** SQLite's abort mechanism is a VM-instruction-count progress
+handler; DuckDB has no equivalent step counter exposed to a read-only
+connection, so its budget is wall-clock. Sharing the `QUERY_ABORTED_AFTER_`
+prefix keeps both codes recognisable as the same *family* of outcome (per
+`docs/0_coding_standards.md` §3, every error code is
+`SCREAMING_SNAKE_CASE` and the app/evaluation harness branch on the prefix
+where they need to), while the differing suffix (`_VM_STEPS` vs. `_MS`)
+keeps each engine honest about what it actually measured rather than
+converting one unit into a fictitious equivalent of the other.
+`ui/results.py`'s `describe_error` renders each with its own unit; a review
+fix (commit `13b28ba`) closed a bug where the `_MS` suffix wasn't
+recognised and rendered as "5000_MS database steps" verbatim.
+
+## 2026-09-19 — schema fingerprint replaces a filesystem stat; cache keyed on `(dsn, fingerprint)`
+
+**Chosen:** `Engine.schema_fingerprint() -> tuple[object, ...]` replaces the
+old SQLite-specific `_db_cache_key` (which statted the file for `(mtime_ns,
+size)`). `schema.py`'s `_cached_schema_chunks` is an `lru_cache` keyed on
+`(dsn, fingerprint)`, with `fingerprint` computed by calling
+`open_engine(db_path).schema_fingerprint()` before every lookup.
+
+**Ruled out:** Keeping a filesystem-stat-only cache key, which has no
+meaning for a DSN that isn't a plain file path.
+
+**Why:** A filesystem `stat()` is meaningless for an engine whose target
+isn't a bare file — DuckDB's own file still has `(mtime_ns, size)`, but a
+future PostgreSQL DSN has no local file to stat at all. Each engine now
+produces whatever fingerprint fits its own target (SQLite and DuckDB both
+still use `(str(path), mtime_ns, size)` today, since both are file-backed);
+the cache only needs the fingerprint to change whenever the schema does, not
+to mean anything outside that engine. Verified for DuckDB specifically
+(Task 6): a `CREATE TABLE` through a second writable connection changes the
+file's `mtime_ns` even though DuckDB buffers writes, and `schema_fingerprint()`
+picks that up, which is what
+`tests/test_engine_conformance.py::test_the_fingerprint_changes_when_the_schema_changes[duckdb]`
+pins.
+
+## 2026-09-19 — `duckdb` is an optional extra, kept out of `requirements.txt`
+
+**Chosen:** `duckdb>=1.0,<2` is declared under
+`[project.optional-dependencies]` as both a `duckdb` extra and (bundled with
+whatever else Phase 3b adds) an `engines` extra. `requirements.txt`, generated
+by `uv export --no-hashes --no-dev --no-emit-project`, does not include it —
+confirmed with `grep -c duckdb requirements.txt` returning `0`.
+
+**Ruled out:** Making `duckdb` an unconditional dependency now that a second
+engine exists.
+
+**Why:** Per the phase's own global constraint, `requirements.txt` is what
+Streamlit Community Cloud actually installs from for the hosted demo, and
+the hosted demo only ever opens the bundled SQLite databases — a driver it
+never loads would be dead weight on every cold start. CI installs the
+`engines` extra explicitly (`uv sync --extra engines`) so DuckDB's tests
+still run in the matrix; `open_engine`'s `duckdb://` branch wraps the import
+in `try/except ImportError`, converting a missing driver into
+`EngineUnavailableError` naming the extra to install, so a local install
+without the extra fails with an actionable message instead of a bare
+`ModuleNotFoundError`.
+
+## 2026-09-19 — `EngineUnreachableError` inherits `FileNotFoundError`, raised before the pipeline's `try`
+
+**Chosen:** `EngineUnreachableError(EngineError, FileNotFoundError)` in
+`text_to_sql_agent/engines/base.py`. Both `ask_database` and
+`ask_database_with_sql` call `engine = open_engine(db_path);
+engine.check_reachable()` before entering their own `try` block, so an
+unreachable DSN propagates as a raised exception rather than being caught
+and folded into a returned `QueryResult.error`.
+
+**Ruled out:** A new, unrelated exception type for unreachable engines;
+catching the reachability check inside the existing `try` and returning it
+as an error code like every other pipeline failure.
+
+**Why:** Both pipeline entry points used to do `os.path.exists(db_path)`
+directly and let a missing file surface as a plain `FileNotFoundError` to
+any caller that checked for one specifically. Making the new engine-aware
+check also satisfy `isinstance(.., FileNotFoundError)` keeps that documented
+contract for existing callers without requiring them to learn a new type.
+Raising before the `try` (rather than inside it, where every other pipeline
+failure is caught and turned into `QueryResult.error`) is deliberate: a
+database that cannot be reached at all is a caller error, not a query
+outcome, and Task 7's `tests/test_end_to_end_engines.py` pins this with
+`pytest.raises` rather than asserting on `result.error` — the two are not
+interchangeable. Verified: `str(EngineUnreachableError("input database not
+found"))` is `"input database not found"`, `.errno` is `None`, and it is
+simultaneously `isinstance(.., FileNotFoundError)` and `isinstance(..,
+EngineError)`.
+
+## 2026-09-19 — the UI connection string is session-only; redaction happens at three points
+
+**Chosen:** The new "Connection string" sidebar option stores its DSN only
+in `st.session_state["sb_dsn"]` (a `type="password"` text input), read fresh
+on every call to `ui/uploads.py`'s `active_db_path` and never written to
+disk or to any cache key beyond the DSN string itself. `ui/uploads.py`'s
+`redact_dsn` masks the credentials portion of any `scheme://user:password@`
+substring, applied at three points: the sidebar's "Using `<dsn>`" caption,
+the sidebar's ingestion-error handler (`st.sidebar.error`), and
+`ui/results.py`'s `describe_error` for any unrecognised error code (since
+the backend also puts raw exception text in that field, and a future
+PostgreSQL driver error commonly echoes the DSN it failed to reach).
+
+**Ruled out:** Never displaying the DSN at all, even redacted (the other
+Database-source options all echo back a confirmation of what was selected,
+so silence here would be inconsistent); persisting the DSN across sessions.
+
+**Why:** A DSN may carry a password (the phase's own global constraint), and
+this is the first UI path where one can be typed in directly. Session-only
+storage means the password never reaches disk. Redacting at the point of
+display, rather than trying to avoid ever displaying the DSN, is what lets
+the sidebar keep the same "confirm what's active" pattern the other four
+options already use. A review round (commit `13b28ba`) found `redact_dsn`
+itself was incomplete — it required a non-empty username and stopped the
+password at the first `/` or `@`, so `postgresql://:pw@host`,
+`u:pa/ss@host`, and `u:p@ss@host` each leaked all or part of the password —
+and fixed it to match greedily to the last `@` before whitespace with an
+optional username, accepting over-masking as the safe failure mode. The same
+round found `describe_error` was passing unrecognised error text to the page
+unredacted, which is exactly the path a Phase 3b PostgreSQL driver error
+would take.
+
 ## 2026-09-14 — share case *scoring*, not case *running*
 
 **Chosen:** `text_to_sql_agent.evaluation.score_case` returns a `CaseScore`

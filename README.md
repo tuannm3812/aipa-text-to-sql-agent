@@ -254,9 +254,14 @@ python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemi
 |-- text_to_sql_agent/              # Backend package
 |   |-- config.py                   # Defaults, model names, RAG constants
 |   |-- data_setup.py               # Demo university database generation
+|   |-- engines/                    # Engine protocol + per-backend implementations
+|   |   |-- __init__.py              # open_engine(dsn) scheme dispatch
+|   |   |-- base.py                  # Engine protocol, EngineError family
+|   |   |-- sqlite.py                # SQLite implementation
+|   |   `-- duckdb.py                # DuckDB implementation (optional `duckdb` extra)
 |   |-- env.py                      # Environment loading
 |   |-- evaluation.py               # Gold-vs-generated comparison (shared by app and CLI)
-|   |-- execution.py                # Read-only SQLite execution
+|   |-- execution.py                # Read-only query execution (dispatches to the engine)
 |   |-- ingestion.py                # CSV ingestion
 |   |-- llm.py                      # Gemini/Ollama SQL generation
 |   |-- gemini_manager.py           # Gemini API key loading and quota failover

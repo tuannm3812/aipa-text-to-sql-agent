@@ -600,3 +600,125 @@ not the shape next to it. For Phase 3 the spec already says to assume each
 engine's internals list is incomplete; the same assumption should apply to the
 *position* rules, and the per-engine probes should enumerate nesting positions,
 not just names.
+
+## 2026-09-19 — Phase 3a: engine protocol, SQLite port, and DuckDB, closed out
+
+Tasks 1-8 of `docs/superpowers/plans/2026-09-14-phase-3a-engine-protocol-and-duckdb.md`.
+Per-task reports are in `.superpowers/sdd/p3a-task-1-report.md` through
+`p3a-task-7-report.md`, plus `p3a-task-6b-report.md` and
+`p3a-task-6b-cte-report.md` (both landed inside Task 6b's scope, after the
+plan's own Step 5 had already been written). This entry is Task 8's
+documentation/verification close-out; it does not repeat every fix already
+narrated in those reports, only what changed at the phase level and what
+this task itself re-verified.
+
+**Changed, phase level:**
+
+- New `text_to_sql_agent/engines/` package: `base.py` (the `Engine`
+  protocol and `EngineError`/`EngineUnavailableError`/`EngineUnreachableError`),
+  `sqlite.py` (SQLite ported, no behaviour change — the assembled prompt's
+  sha256 digest was pinned before and after and matched), `duckdb.py` (new,
+  behind an optional `duckdb` extra).
+- `execution.py`, `schema.py`, `safety.py`, `llm.py`, `pipeline.py` all now
+  dispatch through `open_engine`/`Engine` instead of hard-coding SQLite.
+- DuckDB's safety story went through three rounds before landing: a
+  blocklist extension (Task 6), then a full default-deny function allowlist
+  (Task 6b, chosen after the blocklist kept leaking), then a table
+  default-deny plus `list_aggregate` dispatch-argument check and CTE-scope
+  correction (Task 6b's review round) after a Codex-style review found a
+  comma-join/unquoted-filename table-source gap and an unscoped CTE leak.
+  All of it is recorded with dates in `docs/3_decisions.md`.
+- UI gained a "Connection string" sidebar option (`ui/sidebar.py`,
+  `ui/uploads.py`), session-only, with `redact_dsn` masking credentials at
+  the caption, the sidebar error, and `describe_error`. A same-day review of
+  that work (commit `13b28ba`) found and fixed three gaps: `redact_dsn`
+  leaking passwords for an empty user or one containing `/`/`@`,
+  `describe_error` passing raw exception text unredacted, and DuckDB's
+  `_MS` abort code rendering as "5000_MS database steps" instead of its own
+  message.
+- Docs: this task added eight dated 2026-09-19 entries to
+  `docs/3_decisions.md` (the per-engine read-only model, the
+  `enable_external_access=False` finding, default-deny DuckDB validation,
+  the abort-code family, the schema-fingerprint cache, `duckdb` as an
+  optional extra, `EngineUnreachableError`'s dual inheritance, and the UI
+  DSN redaction points); updated `docs/0_coding_standards.md` §3 with the
+  `_MS` abort code and the engines-package naming convention;
+  `docs/2_architecture.md`'s "Current Implementation" section to describe
+  the engine-dispatched flow instead of a SQLite-only one; `docs/4_next_steps.md`
+  to lead with Phase 3b (PostgreSQL) and carry forward three open items (the
+  `ui/chat.py` uncaught-exception gap, the raw-DSN cache key, and the
+  pre-existing value-hint staleness note); and `AGENTS.md`'s "Current state".
+
+**The Task 6 Step 5 internals probe, reproduced here per the plan's Step 6
+requirement** (from `.superpowers/sdd/p3a-task-6-report.md`; not re-run
+today since it probes the DuckDB engine as first written, before Task 6b
+replaced the mechanism it was testing — re-running it now would test the
+wrong code path):
+
+```
+Iteration 1 (module as first written):
+ALLOWED internals reads: ['SELECT * FROM information_schema.tables',
+                           "SELECT * FROM read_csv('/etc/hosts')",
+                           "SELECT * FROM '/etc/hosts'",
+                           "SELECT * FROM glob('/etc/*')"]
+
+Iteration 2 (after adding the schema-qualifier check and read_/glob/parquet_scan names):
+ALLOWED internals reads: ["SELECT * FROM read_csv('/etc/hosts')",
+                           "SELECT * FROM '/etc/hosts'"]
+
+Iteration 3 — final:
+ALLOWED internals reads: ["SELECT * FROM '/etc/hosts'"]
+```
+
+Only the bare quoted-path form remained after Task 6's fixes, exactly as the
+brief predicted — it names no function for any AST check to catch, which is
+why `enable_external_access=False` at the connection layer (not
+`is_safe_query`) is this defence's load-bearing layer. Task 6b's later
+default-deny table check (`_references_unknown_table`) closed this specific
+form too, at the validator level — pinned by
+`tests/test_safety.py::test_is_safe_query_rejects_unknown_table_references`.
+
+**Verified today, with real command output** (`uv sync --extra engines`
+run first):
+
+```
+$ uv run pytest 2>&1 | tail -1
+439 passed in 2.71s
+
+$ uv run pytest -m conformance -vv 2>&1 | tail -3
+====================== 24 passed, 415 deselected in 0.41s ======================
+(12 [sqlite] + 12 [duckdb], 0 skipped, 0 SKIPPED lines under -rs)
+
+$ ls text_to_sql_agent/engines/*.py | wc -l
+4
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+71 files already formatted
+
+$ uv run mypy
+Success: no issues found in 30 source files
+
+$ uv run python -c "import app; print('ok')"
+ok
+
+$ uv run python scripts/evaluate_text_to_sql.py --mode gold 2>&1 | tail -2
+Evaluated 12 cases. Exact result match: 12/12
+Wrote evaluation/results/evaluation_gold.csv and evaluation/results/evaluation_gold.md
+```
+
+`git checkout evaluation/results/` run immediately after, confirmed clean
+with `git status --short`.
+
+**Not verified in this task, and why:** The per-task internals/analytics
+probes (the 945-name DuckDB catalogue sweep, the 53/58-query analytics
+corpus, the 257-query SQLite differential, the CTE-visibility rules against
+a live DuckDB connection) were not re-run here — they are already pinned as
+regression tests in `tests/test_engine_duckdb.py` and `tests/test_safety.py`,
+and re-deriving them from scratch is what those per-task reports already
+did with load-bearing proof (each one shows the assertion failing against
+the pre-fix code). This entry's own verification is the full four-gate run
+plus conformance plus gold above, not a re-run of every probe that produced
+the numbers quoted from those reports.

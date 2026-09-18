@@ -17,22 +17,24 @@ All three describe the identical flow (same boxes, same non-crossing two-row lay
 
 ## Current Implementation
 
-The current project is an end-to-end Text-to-SQL decision support prototype. A user selects a SQLite database or uploads CSV files in Streamlit, asks a natural-language question, and receives generated SQL plus a local query result table.
+The current project is an end-to-end Text-to-SQL decision support prototype. A user selects a demo database, points at a SQLite or DuckDB file, enters a connection string, or uploads CSV files in Streamlit, asks a natural-language question, and receives generated SQL plus a local query result table.
 
 The implemented backend flow is:
 
-1. Extract SQLite schema metadata and foreign-key relationships.
-2. Build table-level schema chunks with columns, DDL, relationship data, and low-cardinality value hints.
-3. Retrieve relevant schema using hybrid lexical, synonym, character n-gram, hashed embedding, value-hint, and graph-neighbour signals.
-4. Generate one SQLite query with Gemini or a local Ollama model.
-5. Validate that the query is read-only: it must be a single statement, start with `SELECT`/`WITH`, reference no SQLite internals, and contain no data-modifying node. Enforced by `sqlglot` AST parsing, which is required rather than optional — if `sqlglot` is unavailable the check fails closed and refuses the query.
-6. Execute through a read-only SQLite connection with `PRAGMA query_only` and an authorizer.
-7. Display generated SQL, result rows, selected schema context, and retrieval diagnostics in Streamlit, with an automatic bar chart when the result is a two-column category + number shape.
+1. Resolve the database's DSN to an `Engine` (`text_to_sql_agent/engines/` — SQLite or DuckDB today, PostgreSQL planned for Phase 3b) via `open_engine`, and confirm it is reachable before doing anything else.
+2. Extract that engine's schema metadata and foreign-key relationships through `Engine.raw_schema()`/`schema_chunks()`, cached in `schema.py` by `(dsn, engine.schema_fingerprint())` rather than a SQLite-specific filesystem stat.
+3. Build table-level schema chunks with columns, DDL, relationship data, and low-cardinality value hints.
+4. Retrieve relevant schema using hybrid lexical, synonym, character n-gram, hashed embedding, value-hint, and graph-neighbour signals.
+5. Generate one query with Gemini or a local Ollama model, using a dialect-aware system prompt assembled from a shared body plus the engine's own `prompt_dialect_section` (SQLite's stays byte-identical to the pre-Phase-3 prompt).
+6. Validate that the query is read-only: it must be a single statement, start with `SELECT`/`WITH`, reference no engine internals, and contain no data-modifying node. Enforced by `sqlglot` AST parsing, which is required rather than optional — if `sqlglot` is unavailable the check fails closed and refuses the query. SQLite keeps a blocklist-only check; DuckDB's much larger function surface additionally uses a default-deny function and table allowlist (see `docs/3_decisions.md`), because DuckDB's own connection-level guard (`enable_external_access=False`) stops filesystem access but not a catalogue-internals read.
+7. Execute through the engine's own read-only connection — SQLite's `PRAGMA query_only` plus an authorizer, DuckDB's `read_only=True` plus `enable_external_access=False` — with no shared enforcement mechanism between them; `tests/test_engine_conformance.py` is what proves both meet the same guarantee.
+8. Display generated SQL, result rows, selected schema context, and retrieval diagnostics in Streamlit, with an automatic bar chart when the result is a two-column category + number shape.
 
-The local verification status as of this documentation pass is:
+The local verification status as of this documentation pass (2026-09-19) is:
 
-- Unit tests: `107` tests passing with `uv run pytest`.
-- Gold evaluation: `12/12` safe, executed, value-matched, row-matched, and exact-matched cases with `python3 scripts/evaluate_text_to_sql.py --mode gold`.
+- Unit tests: `439` tests passing with `uv run pytest` (`uv sync --extra engines`).
+- Engine conformance: `24` tests passing (12 per engine, SQLite and DuckDB), `0` skipped, with `uv run pytest -m conformance -v`.
+- Gold evaluation: `12/12` safe, executed, value-matched, row-matched, and exact-matched cases with `uv run python scripts/evaluate_text_to_sql.py --mode gold`.
 - Gemini evaluation: `gemini-2.5-flash` completed all `12` cases with multi-key quota failover, reaching `11/12` value match.
 - Local LLM evaluation: Ollama `llama3:latest` reached `8/12` value match with `12/12` safe/executed queries; `gemma4:latest` reached `8/12` value match overall and `8/10` among executed queries.
 

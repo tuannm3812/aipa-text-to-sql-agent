@@ -40,6 +40,13 @@ Project-specific rules and deliberate overrides: @docs/0_coding_standards.md
   20 passing tests. CI has two jobs: `test` runs `pytest` on a 3.11-3.13
   matrix; `quality` runs ruff, mypy, and the packaging drift guard once,
   unmatrixed. Phases 2-5 are specced in `docs/4_next_steps.md`.
+- 2026-09-19: Phase 3a (engine protocol, SQLite port, DuckDB) complete. `439`
+  tests pass with `uv run pytest` (`uv sync --extra engines` first); the
+  engine conformance suite (`uv run pytest -m conformance -v`) runs `24`
+  tests, `12` per engine (SQLite, DuckDB), `0` skipped. Both CI jobs now
+  `uv sync --extra engines` and `test` fails the build if any conformance
+  test is skipped. `duckdb` stays out of `requirements.txt` — it is an
+  optional extra. Phase 3b (PostgreSQL) is next; see `docs/4_next_steps.md`.
 
 ## Open risks
 

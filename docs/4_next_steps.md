@@ -1,25 +1,40 @@
 # Next Steps
 
-Phases 1 and 2 are complete. Phases 3-5 are specced in
+Phases 1, 2, and 3a are complete. Phases 3b-5 are specced in
 `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`; this file is the
 prioritised working view.
 
-## Phase 3 — Engine abstraction (next)
+## Phase 3b — PostgreSQL (next)
 
-Dialect/engine protocol behind `schema.py` and `execution.py`; SQLite becomes one
-implementation, DuckDB the second, PostgreSQL third. Must precede Phase 4 —
+Third `Engine` implementation, added to the `text_to_sql_agent/engines/`
+package Phase 3a built. It inherits the reachability, schema-dispatch, and
+dialect-prompt plumbing Phase 3a landed ahead of DuckDB for exactly this
+reason, and must pass the same `tests/test_engine_conformance.py` suite with
+no changes to the suite's assertions. Per `docs/3_decisions.md`, there is no
+shared read-only mechanism to reuse from SQLite or DuckDB — PostgreSQL proves
+its own guarantee, most likely via a read-only transaction, and the
+conformance suite is what holds it to the same bar. Must precede Phase 4 —
 schema chunking is engine-specific.
 
-Phase 2 left two seams this will build on. First, `execution.py` has a **mixed**
-contract that a second engine must reproduce exactly: resource limits are
-*returned* as typed codes (`QUERY_ABORTED_AFTER_<n>_VM_STEPS`,
-`RESULT_TRUNCATED_TO_<n>_ROWS`), while genuine SQL errors — a missing table, a
-bad column — still **raise**, because `pipeline.py` relies on the exception to
-trigger its repair attempt. An engine that returned errors for both would
-silently disable repair; one that raised for both would resurrect the wasted
-LLM call on an aborted query. Second, `is_safe_query` is SQLite-specific
-today (its internals check keys off `sqlite_`/`pragma_` names), so the safety
-layer needs a per-dialect story before a second engine lands.
+Carried over from Phase 3a, closed out or newly found:
+
+1. **`ui/chat.py` does not catch an exception from `ask_database_with_sql`.**
+   If a database becomes unreachable between the sidebar's check and the
+   question being asked, Streamlit renders the raw traceback and
+   `redact_dsn` never sees that text. Harmless today — no current engine's
+   error text contains a password — but it must be closed before a
+   PostgreSQL driver error (which commonly echoes the DSN it failed to
+   reach) can land on the page unredacted. **New in Phase 3a, important for
+   3b.**
+2. **The schema cache keys on the raw DSN, not a normalised one.** A
+   relative and an absolute path to the same SQLite/DuckDB file produce two
+   separate `lru_cache` entries under `(dsn, fingerprint)` keying (see
+   `docs/3_decisions.md`), since nothing canonicalises the DSN string before
+   it becomes half the cache key. Low impact today; worth resolving before a
+   PostgreSQL DSN's equivalent aliasing (e.g. host vs. `127.0.0.1`) makes it
+   worse.
+3. **Value hints can go stale on a coarse-mtime filesystem.** Predates Phase
+   3a.
 
 ## Phase 4 — Real RAG
 

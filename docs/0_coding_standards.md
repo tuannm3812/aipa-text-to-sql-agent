@@ -120,10 +120,30 @@ reworked anyway" — see `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`
   constants (`BLOCKED_UNSAFE_SQL`, `UNANSWERABLE_WITH_GIVEN_SCHEMA`), never
   free-form prose, because `app.py` and the evaluation harness branch on them.
   The full set is `BLOCKED_UNSAFE_SQL`, `UNANSWERABLE_WITH_GIVEN_SCHEMA`,
-  `RESULT_TRUNCATED_TO_<n>_ROWS` and `QUERY_ABORTED_AFTER_<n>_VM_STEPS`.
-  `ui/results.py`'s `describe_error` maps each to a message a non-technical
-  reader can act on; anything unrecognised passes through unchanged, because
-  the backend also puts raw exception text in that field.
+  `RESULT_TRUNCATED_TO_<n>_ROWS`, and an abort-code family sharing the
+  `QUERY_ABORTED_AFTER_` prefix: `QUERY_ABORTED_AFTER_<n>_VM_STEPS` for
+  SQLite's VM-instruction budget, `QUERY_ABORTED_AFTER_<n>_MS` for DuckDB's
+  wall-clock budget (Phase 3a; see `docs/3_decisions.md`). `ui/results.py`'s
+  `describe_error` maps each to a message a non-technical reader can act on;
+  anything else is passed through `ui/uploads.py`'s `redact_dsn` before
+  display, because the backend also puts raw exception text in that field
+  and a driver error can echo a DSN's password.
+
+- **`text_to_sql_agent/engines/` — one module per backend, dispatched by DSN
+  scheme.** Each engine implements the `Engine` protocol
+  (`engines/base.py`) in its own module, named for the DSN scheme it
+  handles, not the vendor (`sqlite.py`, `duckdb.py` — matching the existing
+  `gemini_manager.py` convention of naming for what the module addresses,
+  not a marketing name). `engines/__init__.py`'s `open_engine(dsn)` is the
+  only place that maps a scheme to an implementation; a bare filesystem path
+  with no `scheme://` prefix means SQLite, so every pre-Phase-3 caller keeps
+  working unchanged. A missing driver (e.g. `duckdb` not installed) raises
+  `EngineUnavailableError` naming the extra to install, never a bare
+  `ImportError`. Every implementation is held to the same guarantees by
+  `tests/test_engine_conformance.py`, parametrised over every available
+  engine with no per-engine assertions — see `docs/3_decisions.md` for why
+  there is deliberately no shared read-only mechanism to factor out
+  alongside it.
 
 ## 4. Safety Conventions
 
