@@ -177,10 +177,13 @@ class _FakeInternalsEngine:
 
     DuckDB's real engine does not exist until Task 6, so this hand-rolls the
     three attributes `is_safe_query` reads rather than waiting on it.
+    `internal_prefixes` is non-empty (unlike an earlier version of this
+    fixture that left it `()`) so a test using this fixture can exercise the
+    prefix branch of the internals check, not just the exact-name branch.
     """
 
     sqlglot_dialect = "sqlite"
-    internal_prefixes: tuple[str, ...] = ()
+    internal_prefixes: tuple[str, ...] = ("widget_",)
     internal_names = frozenset({"widgets"})
 
 
@@ -189,15 +192,33 @@ def test_is_safe_query_internals_list_comes_from_the_engine_not_a_module_constan
 
     "widgets" is an ordinary table under SQLite's internals list (it is not
     `sqlite_*`, `pragma_*`, or `dbstat`), but `_FakeInternalsEngine` above
-    treats it as internal. If `is_safe_query` still consulted a leftover
-    SQLite module constant instead of the passed-in engine, both assertions
-    would come out the same way - only reading `internal_names` off the
-    engine argument makes them differ.
+    treats it as internal via an exact name match. If `is_safe_query` still
+    consulted a leftover SQLite module constant instead of the passed-in
+    engine, both assertions would come out the same way - only reading
+    `internal_names` off the engine argument makes them differ.
     """
     from text_to_sql_agent.engines import open_engine
 
     sqlite_engine = open_engine("data/university_agent.db")
     sql = "SELECT * FROM widgets"
+    assert agent.is_safe_query(sql, engine=sqlite_engine)
+    assert not agent.is_safe_query(sql, engine=_FakeInternalsEngine())
+
+
+def test_is_safe_query_internal_prefixes_also_come_from_the_engine() -> None:
+    """Same proof as above, but for `internal_prefixes` rather than `internal_names`.
+
+    The previous test alone leaves `internal_prefixes` unexercised on the
+    engine-argument path, since `_FakeInternalsEngine.internal_prefixes` used
+    to be empty. "widget_log" matches no SQLite prefix (`sqlite_`, `pragma_`)
+    but does match `_FakeInternalsEngine`'s `widget_` prefix, so this fails
+    the same way the name-based test does if `is_safe_query` ever stopped
+    reading `internal_prefixes` off the engine argument.
+    """
+    from text_to_sql_agent.engines import open_engine
+
+    sqlite_engine = open_engine("data/university_agent.db")
+    sql = "SELECT * FROM widget_log"
     assert agent.is_safe_query(sql, engine=sqlite_engine)
     assert not agent.is_safe_query(sql, engine=_FakeInternalsEngine())
 

@@ -22,17 +22,6 @@ except ModuleNotFoundError:  # pragma: no cover
 
 _ALLOWED_PREFIX = re.compile(r"(?is)^(select|with)\b")
 
-# Used only when `is_safe_query` is called with no engine, which keeps the
-# notebook and every pre-engine caller working exactly as before. These are
-# deliberately module constants rather than a `SQLiteEngine` instance, so
-# resolving the default never imports the engines package or performs I/O -
-# they must stay byte-identical to `SQLiteEngine.sqlglot_dialect`,
-# `SQLiteEngine.internal_prefixes` and `SQLiteEngine.internal_names` in
-# `engines/sqlite.py`.
-_DEFAULT_DIALECT = "sqlite"
-_DEFAULT_INTERNAL_PREFIXES = ("sqlite_", "pragma_")
-_DEFAULT_INTERNAL_NAMES = frozenset({"dbstat"})
-
 
 def _is_table_source(node: sqlglot_exp.Expression) -> bool:
     """True if `node` sits where a table would, rather than in a value position.
@@ -194,9 +183,11 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         sql_string: The SQL text to validate.
         engine: The engine to validate against - its `sqlglot_dialect` picks
             the parser dialect and its `internal_prefixes`/`internal_names`
-            pick the internals blocklist. Defaults to `None`, meaning SQLite,
-            so every pre-engine caller and the notebook keep working
-            unchanged.
+            pick the internals blocklist. Defaults to `None`, meaning
+            SQLite - resolved from `SQLiteEngine`'s own class attributes, so
+            this stays a single source rather than a second, driftable copy
+            of its blocklist. Every pre-engine caller and the notebook keep
+            working unchanged.
 
     Returns:
         True if the query is judged safe to execute read-only. False when
@@ -207,9 +198,22 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
     s = sql_string.strip().rstrip(";").strip()
     if not _ALLOWED_PREFIX.match(s):
         return False
-    dialect = _DEFAULT_DIALECT if engine is None else engine.sqlglot_dialect
-    internal_prefixes = _DEFAULT_INTERNAL_PREFIXES if engine is None else engine.internal_prefixes
-    internal_names = _DEFAULT_INTERNAL_NAMES if engine is None else engine.internal_names
+    if engine is None:
+        # Deferred import, not a module-level one: it keeps `SQLiteEngine`'s
+        # own class attributes as the single source for the default, rather
+        # than a second, driftable copy of its blocklist living in this
+        # module - while still never risking a circular import at module
+        # load time, since this only runs inside a call with no engine.
+        # Class attribute access instantiates nothing and performs no I/O.
+        from .engines.sqlite import SQLiteEngine
+
+        dialect: str = SQLiteEngine.sqlglot_dialect
+        internal_prefixes: tuple[str, ...] = SQLiteEngine.internal_prefixes
+        internal_names: frozenset[str] = SQLiteEngine.internal_names
+    else:
+        dialect = engine.sqlglot_dialect
+        internal_prefixes = engine.internal_prefixes
+        internal_names = engine.internal_names
     return _is_safe_ast(
         s,
         dialect=dialect,
