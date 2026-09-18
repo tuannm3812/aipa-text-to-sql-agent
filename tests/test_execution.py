@@ -72,3 +72,50 @@ def test_execute_query_still_raises_real_operational_errors(tmp_path: Path) -> N
 
     with pytest.raises(sqlite3.OperationalError):
         agent.execute_query(str(db_path), "SELECT * FROM table_that_does_not_exist")
+
+
+# The three tests below are SQLite-specific, unlike test_engine_conformance.py's
+# suite: they pin exactly what `_sqlite_read_only_authorizer` uniquely refuses,
+# where `mode=ro` and `PRAGMA query_only` do not. All three call
+# `agent.execute_query` directly, which bypasses `is_safe_query` (see
+# `execution.py`), for the same reason the conformance suite's write-refusal
+# tests do: `is_safe_query` blocking a statement upstream proves nothing about
+# whether the connection itself would also refuse it.
+
+
+def test_execute_query_refuses_attach(tmp_path: Path) -> None:
+    """ATTACH would otherwise let a query read any other SQLite file on disk."""
+    db_path = tmp_path / "main.db"
+    other_path = tmp_path / "other.db"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("CREATE TABLE numbers (n INTEGER)")
+        conn.commit()
+    with closing(sqlite3.connect(other_path)) as conn:
+        conn.execute("CREATE TABLE secrets (v TEXT)")
+        conn.execute("INSERT INTO secrets VALUES ('shh')")
+        conn.commit()
+
+    with pytest.raises(sqlite3.DatabaseError):
+        agent.execute_query(str(db_path), f"ATTACH DATABASE '{other_path}' AS o")
+
+
+def test_execute_query_refuses_pragma_table_info(tmp_path: Path) -> None:
+    """PRAGMA reads are refused too, not only PRAGMA statements that write."""
+    db_path = tmp_path / "test.db"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("CREATE TABLE numbers (n INTEGER)")
+        conn.commit()
+
+    with pytest.raises(sqlite3.DatabaseError):
+        agent.execute_query(str(db_path), "PRAGMA table_info(numbers)")
+
+
+def test_execute_query_refuses_pragma_query_only_off(tmp_path: Path) -> None:
+    """A query must not be able to switch the read-only pragma off on itself."""
+    db_path = tmp_path / "test.db"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("CREATE TABLE numbers (n INTEGER)")
+        conn.commit()
+
+    with pytest.raises(sqlite3.DatabaseError):
+        agent.execute_query(str(db_path), "PRAGMA query_only = OFF")
