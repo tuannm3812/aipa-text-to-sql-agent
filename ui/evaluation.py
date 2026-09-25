@@ -82,7 +82,11 @@ def evaluate_cases(
                 "expected_tables": ", ".join(sorted(expected_tables)),
                 "retrieved_tables": ", ".join(sorted(retrieved_tables)),
                 "latency_ms": latency_ms,
-                "error": result.error or "",
+                # `result.error` may echo the DSN a driver failed to reach,
+                # including its password (Phase 3b, PostgreSQL); this row
+                # feeds `render_evaluation`'s `st.dataframe`, so the value
+                # must already be safe to display by the time it lands here.
+                "error": backend.redact_dsn(result.error or ""),
             }
         )
     return pd.DataFrame(rows)

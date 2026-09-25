@@ -120,7 +120,12 @@ def evaluate_case(
         "expected_tables": ", ".join(sorted(expected_tables)),
         "retrieved_tables": ", ".join(sorted(retrieved_tables)),
         "latency_ms": latency_ms,
-        "error": result.error or "",
+        # `result.error` may echo the DSN a driver failed to reach, including
+        # its password (Phase 3b, PostgreSQL); this row is written straight
+        # to a CSV under `--out-dir` (default `evaluation/results`, which is
+        # git-tracked), so the value must already be safe to persist by the
+        # time it lands here.
+        "error": agent.redact_dsn(result.error or ""),
         "generated_sql": generated_sql,
         "gold_sql": gold_sql,
     }

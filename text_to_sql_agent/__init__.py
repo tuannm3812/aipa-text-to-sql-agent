@@ -20,6 +20,7 @@ from .config import (
     RAG_SYNONYMS,
 )
 from .data_setup import create_dummy_university_data, write_university_db
+from .dsn import redact_dsn
 from .engines import Engine, open_engine
 from .env import load_env
 from .evaluation import (
@@ -75,6 +76,7 @@ __all__ = [
     "normalise_rows",
     "normalize_table_name",
     "open_engine",
+    "redact_dsn",
     "retrieve_relevant_schema",
     "retrieve_schema_chunks",
     "retrieve_schema_context",
