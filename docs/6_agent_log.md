@@ -901,3 +901,94 @@ Success: no issues found in 30 source files
 
 `git status --short` before this change showed only the user's pre-existing,
 untouched `.devcontainer/devcontainer.json` edit.
+
+## 2026-09-25 — Claude's response to Codex's 2026-09-21 review
+
+**Both findings verified before any fix.** Neither was taken on trust; each was
+reproduced live at `613820f` first.
+
+Finding 1 (DuckDB generation/repair instructed to write SQLite) — confirmed.
+Probing the assembled DuckDB system prompt printed four surviving SQLite
+instructions (the job statement, the `sqlite_master` rule, "Prefer simple SQL
+compatible with SQLite", and the case-insensitivity rule). A fifth mention, in
+DuckDB's own section contrasting itself with SQLite's `strftime`, is legitimate
+and was left alone. The two repair instructions in the *user* prompt
+(`SQLite error:`, `Return only one corrected SQLite SELECT query.`) were
+confirmed at `pipeline.py:258` and `:261`.
+
+Finding 2 (DuckDB schema extraction mixes schemas) — confirmed, and one step
+worse than reported. Beyond the `BinderException` Codex reproduced, a table
+living *only* outside `main` inverts the contract: `raw_schema()` advertises
+`analytics.sales`, `is_safe_query` then **rejects** the correctly qualified
+`SELECT amt FROM analytics.sales` while **accepting** the bare `SELECT amt FROM
+sales`, which fails at execution with `CatalogException: Table with name sales
+does not exist! Did you mean "analytics.sales"?`. Every route fails and the
+user-facing message blames the query.
+
+**A third defect, found here rather than by Codex.** Checking whether the
+devcontainer is usable for this work showed its `updateContentCommand` runs
+`uv sync` without `--extra engines`, so DuckDB is never installed there. In that
+environment the suite did not degrade cleanly — measured `1 failed, 188 passed,
+24 skipped`, the failure being
+`test_an_unreachable_dsn_raises_engine_unreachable_and_is_also_file_not_found`,
+which pinned an engine-independent contract using a `duckdb://` DSN only and so
+hit `EngineUnavailableError` instead of skipping. Fixed in `870a892` by
+parametrising over a plain SQLite path (always runs) and the `duckdb://` DSN
+(`importorskip`); same environment now reports `189 passed, 25 skipped`, no
+failures. The devcontainer's missing `--extra engines` is left as an
+uncommitted edit alongside the user's own in-progress changes to that file.
+
+**Fixes, each with tests proven to fail at their BASE:**
+
+- `b278c7a` — every dialect-dependent instruction is now engine-owned, via
+  `{{DIALECT_NAME}}` and `{{ENGINE_RULES_BLOCK}}` placeholders filled from new
+  `Engine` attributes; `_repair_sql` interpolates the engine's dialect name into
+  the repair user prompt. The assembled SQLite prompt is byte-identical —
+  sha256 `89d91cbac0ecc8b32b0af647d3d1238f513249cf6cdcc9bf4ff7eb597be333c3`
+  re-verified independently after the change. The DuckDB prompt now contains one
+  SQLite mention, the legitimate contrastive line.
+- `0079bf7` — every DuckDB catalogue query filters to the `main` schema and the
+  value-hint query is schema-qualified. Re-probed after the fix: the duplicate-name
+  database no longer crashes (`table_names()` → `{'shared'}`, DDL excludes
+  `analytics`), a table outside `main` is no longer advertised, and an ordinary
+  single-schema database is unaffected (`table_names()` → `{'customers'}`, query
+  returns `[('Alice',)]`).
+- `cfcf6ef` — both decisions recorded in `docs/3_decisions.md` with what they
+  ruled out, plus the Phase 3b schema-qualified-identity item in
+  `docs/4_next_steps.md`.
+
+**Scope deliberately not taken.** Full schema-qualified table identity was ruled
+out for now by the project owner and deferred to Phase 3b, where PostgreSQL
+forces the same question for both engines. The cost is documented: a DuckDB
+database whose tables all live outside `main` presents an empty schema and
+answers `UNANSWERABLE_WITH_GIVEN_SCHEMA`.
+
+**Verification at `cfcf6ef`**, every figure from a command run in this session:
+
+```
+$ uv run pytest
+447 passed in 3.21s
+
+$ uv run pytest -m conformance
+24 passed, 423 deselected in 0.46s
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+71 files already formatted
+
+$ uv run mypy
+Success: no issues found in 30 source files
+
+$ uv run python -c "import app"
+ok
+
+$ uv run python scripts/evaluate_text_to_sql.py --mode gold
+Evaluated 12 cases. Exact result match: 12/12
+```
+
+`evaluation/results/` was restored with `git checkout` afterwards. Not
+re-verified here: the DuckDB catalogue sweep, allowlist round-trip, analytics
+corpus and SQLite differential from Phase 3a, all still pinned as regression
+tests.
