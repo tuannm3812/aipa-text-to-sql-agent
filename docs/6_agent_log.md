@@ -722,3 +722,108 @@ did with load-bearing proof (each one shows the assertion failing against
 the pre-fix code). This entry's own verification is the full four-gate run
 plus conformance plus gold above, not a re-run of every probe that produced
 the numbers quoted from those reports.
+
+## 2026-09-21 — Codex review of Claude's Phase 3a work
+
+**Scope:** Reviewed the complete Phase 3a range `ae8e64e..613820f` against
+`docs/superpowers/specs/2026-09-14-phase-3-engine-abstraction-design.md`, the
+implementation plan, the engine contract, and the current tests. The checkout
+was clean on `tuannm3812/main-refinement` before this review. This entry records
+review findings only; it does not change the implementation, tests, or prior
+log entries.
+
+**Findings for Claude, in priority order:**
+
+1. **High — DuckDB generation and repair are still instructed to write
+   SQLite.** `_assemble_prompt` replaces only the `{{DIALECT_SECTION}}`
+   placeholder, but the supposedly shared `_PROMPT_BODY` still says "a SINGLE
+   SQLite SELECT query", "Do NOT reference sqlite_master or any internal
+   SQLite tables", and "Prefer simple SQL compatible with SQLite". It also
+   labels the case-insensitive text rule as SQLite-specific. The inserted
+   DuckDB block therefore contradicts the surrounding system prompt instead
+   of making it dialect-aware. `_repair_sql` adds two more contradictory
+   instructions in the user message: "SQLite error" and "corrected SQLite
+   SELECT query". This affects every DuckDB generation and every DuckDB repair,
+   which is the core path Phase 3a claims to have made engine-aware.
+
+   The tests explain how this escaped: `tests/test_llm.py` checks that the
+   selected dialect *section* is present and that the literal heading
+   `SQLITE DIALECT` is absent, but never asserts that non-target dialect
+   instructions are absent from the complete prompt. The repair tests inspect
+   only the system prompt passed to `_call_provider`; they do not inspect the
+   repair question in the user prompt. A direct provider-stub probe against
+   `DuckDBEngine` printed all five remaining SQLite system-prompt lines and
+   both SQLite repair lines.
+
+   **Requested follow-up:** make every dialect-dependent instruction
+   engine-owned or parameterised while preserving the byte-identical SQLite
+   prompt, make the repair message engine-aware, and add tests over the full
+   DuckDB system and user prompts. The negative assertion needs to cover all
+   incompatible SQLite directives, not only the `SQLITE DIALECT` heading.
+
+2. **Medium — DuckDB schema extraction mixes schemas by bare table name and
+   can fail before a question reaches the model.** `schema_chunks()` selects
+   rows from `duckdb_tables()`, `information_schema.columns`, and
+   `duckdb_constraints()` without retaining `schema_name`; it keys columns and
+   foreign keys only by `table_name`, then reads value hints through an
+   unqualified quoted table name. `raw_schema()` simultaneously returns DDL
+   from every schema, while the validator accepts only absent/`main` schema
+   qualifiers. The three pieces therefore disagree about what the supported
+   database surface is.
+
+   A live probe created `main.shared(main_only INTEGER)` and
+   `analytics.shared(analytics_only VARCHAR)`. `raw_schema()` returned both
+   tables, then `schema_chunks()` merged the two column lists and raised a
+   DuckDB `BinderException` while querying `analytics_only` from the
+   unqualified `shared`, which resolved to `main.shared`. Even without a
+   duplicate name, a table in a non-default schema is advertised to the model
+   but rejected by `_references_unknown_table`. The conformance fixture creates
+   tables only in `main`, so it cannot expose either failure.
+
+   **Requested follow-up:** decide and document the supported scope. The small
+   fix is to filter every DuckDB schema query consistently to `main` and add a
+   database-with-an-extra-schema regression test. Full DuckDB schema support
+   instead requires a schema-qualified table identity through DDL, chunks,
+   value hints, foreign keys, `table_names()`, and safety validation; changing
+   only one layer will leave the contract inconsistent.
+
+**What the review did not find:** No write escape or filesystem-read escape was
+found in the reviewed paths. This was a bounded code review plus the existing
+security/conformance tests, not an exhaustive proof over DuckDB's SQL surface.
+The two findings above are functional/correctness gaps; the connection-level
+`read_only=True` plus `enable_external_access=False` defence remains present and
+covered by the existing tests.
+
+**Fresh verification at `613820f`** used
+`UV_CACHE_DIR=/private/tmp/aipa-review-uv` because the default uv cache is not
+writable in this environment:
+
+```
+$ uv run pytest
+439 passed in 3.20s
+
+$ uv run pytest -m conformance -rs
+24 passed, 415 deselected in 0.46s
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+71 files already formatted
+
+$ uv run mypy
+Success: no issues found in 30 source files
+
+$ uv run python -c "import app; print('ok')"
+ok
+
+$ uv run python scripts/evaluate_text_to_sql.py --mode gold \
+    --out-dir /private/tmp/aipa-phase3a-review-gold
+Evaluated 12 cases. Exact result match: 12/12
+```
+
+The first gold command used the wrong option name (`--output-dir`) and exited
+with argparse status 2 before running; it was rerun with the script's actual
+`--out-dir` option as shown above. Outputs went to `/private/tmp`, so no tracked
+evaluation result needed restoration. `git status --short` was empty immediately
+before this log-only edit.
