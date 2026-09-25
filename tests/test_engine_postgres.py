@@ -462,22 +462,31 @@ def _round_trip_snippet(name: str) -> str:
         return "current_timestamp"
     if name == "mode":
         return "mode() within group (order by a)"
+    if name == "collate":
+        return 'a COLLATE "C"'
     return f"{name}{_SCALAR_FUNCTION_ARGS[name]}"
 
 
 @pytest.mark.parametrize("name", sorted(PostgresEngine.allowed_functions))
 def test_allowed_function_round_trip(name, engine_with_table_t):
-    """The task brief's Step 3, proven directly: for every one of the 73
+    """The task brief's Step 3, proven directly: for every one of the 74
     names in `PostgresEngine.allowed_functions`, a realistic call using that
     name parses under the `postgres` dialect, and `safety._resolve_function_
-    name` resolves the parsed node back to a name that is itself in
-    `allowed_functions` - not necessarily the same literal spelling
-    (`generate_series(1, 10)` in a `FROM` clause parses to `exp.
-    ExplodingGenerateSeries`, resolved via the override added in `safety.py`
-    back to `"generate_series"` - see `_FUNCTION_NAME_OVERRIDES`), but always
-    a member of the set, which is what makes `is_safe_query` accept it.
-    `is_safe_query` itself is asserted too, on the full statement, so this is
-    the real path the validator runs, not just the resolver in isolation.
+    name` resolves at least one parsed node in the statement back to `name`
+    itself - not necessarily every node the statement contains
+    (`case`/`if`'s snippet also produces a sibling `exp.If`/`exp.Case` node
+    for the other of the pair, since every `CASE ... WHEN` branch parses to
+    its own child `exp.If` node - see `_FUNCTION_NAME_OVERRIDES`'s module
+    comment), but `name` itself must be among the resolved set - not merely
+    *some* allowed name (Task 4, 2026-09-26: the original assertion checked
+    `resolved_names & engine.allowed_functions`, which is satisfied by any
+    other allowed name appearing anywhere in the statement and would stay
+    green even if `name`'s own snippet resolved to nothing in
+    `allowed_functions` at all, as long as some other node did - it asserts
+    non-emptiness of an intersection, not that the name under test actually
+    round-trips). `is_safe_query` itself is asserted too, on the full
+    statement, so this is the real path the validator runs, not just the
+    resolver in isolation.
 
     A mismatch here fails in one of two directions: a legitimate function
     wrongly rejected (caught by the `is_safe_query` assertion below), or a
@@ -497,9 +506,9 @@ def test_allowed_function_round_trip(name, engine_with_table_t):
     funcs = list(parsed.find_all(exp.Func))
     assert funcs, f"{sql!r} produced no exp.Func node to resolve"
     resolved_names = {_safety._resolve_function_name(f) for f in funcs}
-    assert resolved_names & engine.allowed_functions, (
-        f"{name!r} (SQL: {sql!r}) resolved to {resolved_names}, none of which "
-        "are in PostgresEngine.allowed_functions"
+    assert name in resolved_names, (
+        f"{name!r} (SQL: {sql!r}) resolved to {resolved_names}, which does not "
+        f"contain {name!r} itself"
     )
     assert is_safe_query(sql, engine=engine), f"{sql!r} should have been allowed"
 
@@ -537,6 +546,134 @@ def test_dangerous_functions_are_rejected(engine_with_table_t, label: str, sql: 
     `internal_names`) could never reach.
     """
     assert not is_safe_query(sql, engine=engine_with_table_t), f"should have rejected: {sql!r}"
+
+
+# Task 4 (2026-09-26 review round), Bypass 1: PostgreSQL's `(expr).name` is
+# grammar sugar for `name(expr)` - a single-argument function call - for any
+# `name` `expr`'s type has no field called that. sqlglot parses this into
+# `exp.Dot(this=<expr>, expression=exp.Identifier(name))`, never an
+# `exp.Func`, so the pre-fix `_references_disallowed_function`'s
+# `find_all(exp.Func)` walk never saw it. Reproduced live against
+# `postgresql://aipa_ro:...@127.0.0.1:55432/aipa` (2026-09-26):
+# `SELECT ('port').current_setting` returned `['5432']`,
+# `SELECT ('/etc/passwd').pg_read_file` raised `InsufficientPrivilege` (the
+# connection's own defence, not the validator's - `is_safe_query` still
+# wrongly said yes), and `SELECT ('customers'::regclass).pg_relation_
+# filepath` returned `['base/16384/16387']`. Every variant below reproduces
+# a distinct shape the review confirmed working: doubled parens, a quoted
+# right-hand identifier, inside `WHERE`, inside a scalar subquery, inside
+# `CAST`, inside another function call, and chained.
+_DOT_CALL_BYPASS_PROBES: list[tuple[str, str]] = [
+    ("simple", "SELECT ('port').current_setting"),
+    ("pg_read_file", "SELECT ('/etc/passwd').pg_read_file"),
+    ("pg_relation_filepath", "SELECT ('customers'::regclass).pg_relation_filepath"),
+    ("doubled_parens", "SELECT (('port')).current_setting"),
+    ("quoted_identifier", "SELECT ('port').\"current_setting\""),
+    ("in_where", "SELECT * FROM sales WHERE ('port').current_setting = '5432'"),
+    ("scalar_subquery", "SELECT (SELECT ('port').current_setting)"),
+    ("inside_cast", "SELECT CAST(('port').current_setting AS text)"),
+    ("inside_another_function", "SELECT upper(('port').current_setting)"),
+    ("chained", "SELECT (('port').current_setting).upper"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,sql", _DOT_CALL_BYPASS_PROBES, ids=[label for label, _ in _DOT_CALL_BYPASS_PROBES]
+)
+def test_dot_call_bypass_is_rejected(engine_with_table_t, label: str, sql: str) -> None:
+    """Every variant of Bypass 1 must be refused post-fix - each one passed
+    `is_safe_query` at BASE (commit 20dd3e9), before `safety._references_
+    disallowed_dot_call` existed.
+    """
+    assert not is_safe_query(sql, engine=engine_with_table_t), f"should have rejected: {sql!r}"
+
+
+def test_dot_call_with_its_own_arguments_was_already_covered(engine_with_table_t) -> None:
+    """Not a new gap: `(expr).name(more, args)` - as opposed to the bare
+    `(expr).name` form above - parses `.expression` as `exp.Anonymous`
+    (itself an `exp.Func` subclass), which `_references_disallowed_function`
+    already walks via `find_all(exp.Func)`. Pinned here so a future change
+    cannot silently narrow that coverage without a test noticing: a
+    disallowed name called this way must still be rejected, and an allowed
+    one must still validate.
+    """
+    assert not is_safe_query("SELECT ('/etc/passwd').pg_read_file()", engine=engine_with_table_t)
+    assert is_safe_query("SELECT ('a,b,c').split_part(',', 1)", engine=engine_with_table_t)
+
+
+# Task 4, Bypass 2: a cast to a PostgreSQL object-identifier ("OID") type -
+# `regclass`, `regrole`, `regproc`, `regnamespace`, `regtype`, `regoper`,
+# `regoperator`, `regconfig`, `regdictionary`, `regcollation`,
+# `regprocedure` - resolves a string or integer against exactly the
+# catalogue (`pg_class`, `pg_authid`, `pg_proc`, `pg_namespace`, ...) the
+# `pg_` internals rule exists to block, with no function call and no table
+# reference for the pre-fix validator to see. Reproduced live (2026-09-26):
+# `SELECT g::regclass AS rel FROM generate_series(16380, 16400) AS g`
+# executed and returned real relation names - `is_safe_query` said yes.
+# Every one of the eleven type names is probed under both the `::` and
+# `CAST(... AS ...)` spellings.
+_OID_CAST_TYPES: tuple[str, ...] = (
+    "regclass",
+    "regrole",
+    "regproc",
+    "regnamespace",
+    "regtype",
+    "regoper",
+    "regoperator",
+    "regconfig",
+    "regdictionary",
+    "regcollation",
+    "regprocedure",
+)
+_OID_CAST_BYPASS_PROBES: list[tuple[str, str]] = (
+    [(f"{type_name}_coloncolon", f"SELECT 'x'::{type_name}") for type_name in _OID_CAST_TYPES]
+    + [(f"{type_name}_cast", f"SELECT CAST('x' AS {type_name})") for type_name in _OID_CAST_TYPES]
+    + [
+        (
+            "regclass_generate_series_loop",
+            "SELECT g::regclass AS rel FROM generate_series(16380, 16400) AS g",
+        ),
+        (
+            "regrole_generate_series_loop",
+            "SELECT CAST(g AS regrole) AS rel FROM generate_series(1, 20) AS g",
+        ),
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "label,sql", _OID_CAST_BYPASS_PROBES, ids=[label for label, _ in _OID_CAST_BYPASS_PROBES]
+)
+def test_oid_cast_bypass_is_rejected(engine_with_table_t, label: str, sql: str) -> None:
+    """Every variant of Bypass 2 must be refused post-fix - each one passed
+    `is_safe_query` at BASE (commit 20dd3e9), before `safety._casts_to_
+    object_identifier_type` existed.
+    """
+    assert not is_safe_query(sql, engine=engine_with_table_t), f"should have rejected: {sql!r}"
+
+
+def test_ordinary_casts_still_validate(engine_with_table_t) -> None:
+    """The Bypass 2 fix must not reject an everyday cast to a real SQL type -
+    only `exp.ObjectIdentifier` targets (PostgreSQL's OID types) are
+    checked; `exp.DataType` targets (`text`, `integer`, ...) are untouched.
+    """
+    assert is_safe_query("SELECT CAST(a AS TEXT) FROM t", engine=engine_with_table_t)
+    assert is_safe_query("SELECT a::TEXT FROM t", engine=engine_with_table_t)
+
+
+def test_collate_is_allowed(postgres_dsn: str) -> None:
+    """`COLLATE` is ordinary SQL grammar, not a `pg_proc` call, but sqlglot's
+    `exp.Collate` is an `exp.Func` subclass, so it went through default-deny
+    the same as a real function name and was wrongly rejected before
+    `"collate"` was added to `PostgresEngine.allowed_functions`. Validated
+    and executed against the real `customers` table, matching the exact
+    query the task brief flagged.
+    """
+    engine = open_engine(postgres_dsn)
+    sql = 'SELECT name COLLATE "C" FROM customers'
+    assert is_safe_query(sql, engine=engine), f"wrongly rejected: {sql!r}"
+    result = engine.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok, f"{sql!r} failed to execute: {result.error}"
 
 
 # The task brief's Step 5: PostgreSQL's internals surface (`pg_*`,

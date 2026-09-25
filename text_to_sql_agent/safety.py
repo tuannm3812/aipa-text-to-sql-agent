@@ -267,6 +267,166 @@ def _references_disallowed_function(
     return False
 
 
+# Task 4 bypass 1 (2026-09-26 review round): PostgreSQL's grammar treats
+# `(expr).name` as sugar for `name(expr)` - a single-argument function call -
+# whenever `expr`'s type has no field called `name`. sqlglot parses this
+# postfix form into `exp.Dot(this=<expr>, expression=exp.Identifier(name))`,
+# never into an `exp.Func` subclass, so `_references_disallowed_function`'s
+# `parsed.find_all(exp.Func)` walk cannot see it - confirmed live:
+# `SELECT ('port').current_setting` parsed and re-validated as safe before
+# this fix, and the same shape reaches every single-argument function in the
+# catalogue (`pg_read_file`, `pg_relation_filepath`, chained/nested/quoted
+# variants - see `tests/test_engine_postgres.py`).
+#
+# A dot-call that supplies its own parenthesised arguments
+# (`('a,b').split_part(',', 1)`) parses `.expression` as `exp.Anonymous`
+# instead - itself an `exp.Func` subclass `_references_disallowed_function`
+# already walks (verified 2026-09-26) - so only the bare-identifier form (no
+# trailing parens at all) is invisible to that check and needs a dedicated
+# one here.
+#
+# This is deliberately gated on `dialect`, not applied to every engine that
+# opts into default-deny: DuckDB parses the identical `exp.Dot` shape for its
+# own, unrelated struct/map/JSON field-extraction syntax
+# (`(struct_col).field_name`), which is legitimate and already exercised by
+# `test_engine_duckdb.py`'s analytics corpus. Verified directly against a
+# live DuckDB connection (2026-09-26) that DuckDB has no reading under which
+# `(expr).name` ever means "call the function named `name`":
+# `SELECT ('hello').upper` raises `Binder Error: Cannot extract field
+# 'upper' from expression "'hello'" because it is not a struct, union, map,
+# or json` - DuckDB never falls back to a function-call interpretation the
+# way PostgreSQL does. A struct field name is arbitrary user data, not drawn
+# from `allowed_functions`, so blanket-applying this check to DuckDB would
+# reject nearly every real struct access rather than close a bypass that
+# does not exist there. Restricting it to dialects where the dual reading is
+# real is what keeps DuckDB's legitimate queries validating while closing
+# the actual PostgreSQL gap.
+_DOT_CALL_DIALECTS: frozenset[str] = frozenset({"postgres"})
+
+
+def _references_disallowed_dot_call(
+    parsed: sqlglot_exp.Expression,
+    *,
+    dialect: str,
+    allowed_functions: frozenset[str],
+    internal_prefixes: tuple[str, ...],
+    internal_names: frozenset[str],
+) -> bool:
+    """True if a PostgreSQL `(expr).name` dot-call resolves to a disallowed name.
+
+    Only runs for `dialect` in `_DOT_CALL_DIALECTS` - see that constant for
+    why DuckDB's structurally identical `exp.Dot` nodes must not be checked
+    the same way.
+
+    Checked against both `allowed_functions` (the same default-deny gate
+    `_references_disallowed_function` applies to an ordinary call) and
+    `internal_prefixes`/`internal_names` (the same name rule
+    `_references_internals` applies) - belt and suspenders: every `pg_`-
+    prefixed name is already absent from `allowed_functions`, so the two
+    checks agree today, but a future internals name that is ever
+    accidentally allowlisted should still be caught here independently,
+    the same way `is_safe_query`'s docstring insists neither of its two
+    defences alone is sufficient.
+
+    Args:
+        parsed: The parsed statement.
+        dialect: The dialect the statement was parsed under.
+        allowed_functions: The engine's function allowlist.
+        internal_prefixes: The engine's internal table/function name prefixes.
+        internal_names: The engine's internal table/function names.
+
+    Returns:
+        True if the statement must be rejected.
+    """
+    if exp is None:
+        return True
+    if dialect not in _DOT_CALL_DIALECTS:
+        return False
+    for dot in parsed.find_all(exp.Dot):
+        rhs = dot.expression
+        if not isinstance(rhs, exp.Identifier):
+            # `.expression` is an `exp.Func` subclass (own parenthesised
+            # arguments were supplied) - `_references_disallowed_function`
+            # already walks it via `find_all(exp.Func)`.
+            continue
+        name = (rhs.name or "").lower()
+        if name in internal_names or name.startswith(internal_prefixes):
+            return True
+        if name not in allowed_functions:
+            return True
+    return False
+
+
+# Task 4 bypass 2 (2026-09-26 review round): `"cast"` is allowlisted for
+# every engine that opts into default-deny, but nothing previously inspected
+# a cast's *target type*. PostgreSQL's object-identifier ("OID") types -
+# `regclass`, `regrole`, `regproc`, `regnamespace`, `regtype`, `regoper`,
+# `regoperator`, `regconfig`, `regdictionary`, `regcollation`,
+# `regprocedure` - each resolve a string to a row in exactly the catalogue
+# `internal_prefixes`'s `pg_` rule exists to block (`pg_class`, `pg_authid`,
+# `pg_proc`, `pg_namespace`, ...): `('customers'::regclass)::oid` and
+# `'16384'::regclass::text` round-trip a name through `pg_class` with no
+# function call and no table reference for `_references_internals` or
+# `_references_disallowed_function` to see. Combined with `generate_series`
+# supplying a loop of OIDs to cast, this is how the review enumerated every
+# relation and role name in the database.
+#
+# Verified live (2026-09-26) that all eleven names above parse, under both
+# `'x'::<type>` and `CAST('x' AS <type>)` spellings, to the identical shape:
+# `exp.Cast(to=exp.ObjectIdentifier(this="<TYPE_NAME_UPPERCASE>"))` - not the
+# `exp.DataType` node an ordinary cast target (`text`, `integer`, ...)
+# produces. This is a different sqlglot node class specifically because
+# PostgreSQL's object-identifier types are not part of the ordinary SQL type
+# system, so no per-type-name special-casing is needed: the class itself
+# already sorts every OID-type cast into one place to check.
+#
+# Confirmed inert for DuckDB (which has no `reg*` types at all): parsed under
+# the `duckdb` dialect, `'x'::regclass` produces
+# `exp.Cast(to=exp.DataType(this=Type.USERDEFINED, kind="regclass"))` -
+# `exp.DataType`, never `exp.ObjectIdentifier` - so `isinstance(to,
+# exp.ObjectIdentifier)` below is always `False` for a DuckDB-parsed
+# statement and this check never fires there, without needing a dialect
+# gate the way `_references_disallowed_dot_call` does.
+_POSTGRES_OID_CAST_TYPES: frozenset[str] = frozenset(
+    {
+        "REGCLASS",
+        "REGROLE",
+        "REGPROC",
+        "REGNAMESPACE",
+        "REGTYPE",
+        "REGOPER",
+        "REGOPERATOR",
+        "REGCONFIG",
+        "REGDICTIONARY",
+        "REGCOLLATION",
+        "REGPROCEDURE",
+    }
+)
+
+
+def _casts_to_object_identifier_type(parsed: sqlglot_exp.Expression) -> bool:
+    """True if any `CAST`/`::` in the statement targets a PostgreSQL OID type.
+
+    See `_POSTGRES_OID_CAST_TYPES` for which types and why, and for the
+    live-verified proof this is a no-op for a DuckDB-parsed statement.
+
+    Args:
+        parsed: The parsed statement.
+
+    Returns:
+        True if the statement must be rejected.
+    """
+    if exp is None:
+        return True
+    for cast in parsed.find_all(exp.Cast):
+        to = cast.args.get("to")
+        if isinstance(to, exp.ObjectIdentifier) and str(to.this or "").upper() in (
+            _POSTGRES_OID_CAST_TYPES
+        ):
+            return True
+    return False
+
+
 def _visible_cte_names(table: sqlglot_exp.Table) -> frozenset[str]:
     """The CTE aliases actually visible at `table`'s position, per DuckDB's own scoping.
 
@@ -601,6 +761,16 @@ def _is_safe_ast(
     # database backing every `FROM` clause they write.
     if allowed_functions is not None:
         if _references_disallowed_function(parsed, allowed_functions=allowed_functions):
+            return False
+        if _references_disallowed_dot_call(
+            parsed,
+            dialect=dialect,
+            allowed_functions=allowed_functions,
+            internal_prefixes=internal_prefixes,
+            internal_names=internal_names,
+        ):
+            return False
+        if _casts_to_object_identifier_type(parsed):
             return False
         if _references_unknown_table(parsed, get_real_table_names=get_real_table_names):
             return False

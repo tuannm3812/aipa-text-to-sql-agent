@@ -738,6 +738,60 @@ def test_pinned_leaks_are_also_refused_by_the_connection(tmp_path):
     )
 
 
+def test_dot_struct_field_access_on_a_real_column_is_not_rejected(tmp_path) -> None:
+    """Task 4 (2026-09-26), cross-engine regression proof: the PostgreSQL
+    `(expr).name` dot-call bypass fix (`safety._references_disallowed_dot_
+    call`) is gated on dialect (`_DOT_CALL_DIALECTS = {"postgres"}`) rather
+    than applied to every default-deny engine, precisely because DuckDB
+    parses the identical `exp.Dot` node shape for its own, unrelated
+    struct-field-extraction syntax: `(s).x` on a `STRUCT`-typed column - the
+    shape a genuine analytics question over a struct column would actually
+    produce - must keep validating and executing under DuckDB's
+    `allowed_functions`, even though `"x"` (the field name) is nowhere in
+    that allowlist, which is exactly what a dialect-blind version of the fix
+    would have wrongly rejected.
+
+    (An inline struct *literal* receiver, e.g. `({'x': 1}).x`, is not used
+    here: sqlglot's `exp.Struct` is itself an `exp.Func` subclass whose
+    resolved name - `"struct"` - is not in `DuckDBEngine.allowed_functions`,
+    so a struct literal is independently rejected by the pre-existing
+    function-name gate regardless of this fix. That is unrelated,
+    pre-existing behaviour, not a regression this task introduced, so it is
+    not what this test is proving.)
+    """
+    db = tmp_path / "struct.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE t (s STRUCT(x INTEGER, y INTEGER))")
+    con.execute("INSERT INTO t VALUES ({'x': 1, 'y': 2})")
+    con.close()
+    engine = open_engine(f"duckdb://{db}")
+
+    sql = "SELECT (s).x FROM t"
+    assert is_safe_query(sql, engine=engine), f"wrongly rejected: {sql!r}"
+    result = engine.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok, f"{sql!r} failed to execute: {result.error}"
+    assert result.rows == [(1,)]
+
+
+def test_oid_cast_check_is_inert_for_duckdb(engine_with_table_t) -> None:
+    """Task 4 (2026-09-26) Bypass 2's fix (`safety._casts_to_object_
+    identifier_type`) rejects a cast whose target parses to `exp.
+    ObjectIdentifier` - PostgreSQL's `regclass`/`regrole`/etc. Verified live
+    (2026-09-19 dialect probe, re-confirmed 2026-09-26) that DuckDB has no
+    such types and parses the identical spelling as an ordinary
+    `exp.DataType(this=Type.USERDEFINED, kind="regclass")` instead, so this
+    check can never fire for a DuckDB-parsed statement. `CAST('x' AS
+    regclass)` is still correctly rejected here, but for an unrelated
+    reason - `"regclass"` naming no real DuckDB type keeps this from
+    executing regardless - which this test does not depend on; it only
+    proves `is_safe_query`'s verdict is unaffected by the new check's
+    presence by comparing behaviour is unchanged for an ordinary, harmless
+    cast DuckDB does support.
+    """
+    sql = "SELECT CAST(a AS BIGINT) FROM t"
+    assert is_safe_query(sql, engine=engine_with_table_t), f"wrongly rejected: {sql!r}"
+
+
 @pytest.fixture
 def analytics_db(tmp_path):
     """A richer DuckDB fixture for Step 5's analytics corpus: dated orders

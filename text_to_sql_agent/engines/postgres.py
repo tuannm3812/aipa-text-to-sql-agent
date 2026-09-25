@@ -348,6 +348,19 @@ class PostgresEngine:
             "if",
             "case",
             "cast",
+            # `COLLATE "C"` (`SELECT name COLLATE "C" FROM customers`) is
+            # ordinary SQL grammar, not a call to any `pg_proc` entry, but
+            # sqlglot's `exp.Collate` is an `exp.Func` subclass for parsing
+            # convenience the same way `case`/`if`/`extract` are - its own
+            # `.sql_name()` resolves to `"collate"` (verified 2026-09-26:
+            # `find_all(exp.Func)` reaches it, so it was wrongly rejected by
+            # default-deny before this entry existed). Safe to allow: the
+            # right-hand identifier only ever names a collation PostgreSQL
+            # resolves against `pg_collation`, exposing at most whether a
+            # given collation name exists, never row data or catalogue
+            # contents - nothing like the OID-cast/dot-call bypasses this
+            # entry sits beside in the same review round.
+            "collate",
             # -- Table functions --
             "generate_series",
         }
