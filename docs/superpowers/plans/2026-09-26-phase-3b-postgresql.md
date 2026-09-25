@@ -408,9 +408,13 @@ proves each is load-bearing by removing it.
 message must never contain the DSN** — say `cannot connect to PostgreSQL` plus the exception
 class name, never the connection string.
 
-Leave `raw_schema`, `schema_chunks`, `schema_fingerprint` and `table_names` raising
-`NotImplementedError` for now; Task 5 fills them. Conformance's read-only cases exercise
-`execute` only.
+**Implement every protocol method, simply.** The conformance suite is not execute-only — it calls
+`schema_chunks()`, `raw_schema()` and `schema_fingerprint()` too (`test_schema_chunks_expose_...`,
+`test_raw_schema_mentions_every_table`, and the two fingerprint cases), so leaving them raising
+`NotImplementedError` would leave the suite red. Write the straightforward version of each now:
+DDL synthesised from `information_schema.columns`, chunks carrying columns and foreign keys, and a
+fingerprint hashing a catalogue query. Task 5 hardens them — value hints, `(schema, table)` keying
+and the fingerprint's exact semantics — rather than writing them from scratch.
 
 - [ ] **Step 6: Route the scheme**
 
@@ -623,7 +627,11 @@ Commit subject: `feat(safety): default-deny function and table validation for Po
 
 ---
 
-## Task 5: PostgreSQL's schema layer
+## Task 5: Harden PostgreSQL's schema layer
+
+Task 2 wrote the straightforward version of each method to get conformance green. This task makes
+it correct under the conditions conformance does not reach: low-cardinality value hints, tables
+that share a name across schemas, and a fingerprint that must move on DDL and stay put on data.
 
 **Files:**
 - Modify: `text_to_sql_agent/engines/postgres.py`
@@ -633,14 +641,14 @@ Commit subject: `feat(safety): default-deny function and table validation for Po
 - Produces: `raw_schema() -> str`, `schema_chunks() -> list[SchemaChunk]`,
   `schema_fingerprint() -> tuple[object, ...]`, `table_names() -> frozenset[str]`.
 
-- [ ] **Step 1: `raw_schema()` — synthesise DDL**
+- [ ] **Step 1: `raw_schema()` — make the synthesised DDL read like DDL**
 
-PostgreSQL has no `sqlite_master.sql` equivalent, so build `CREATE TABLE` text from
-`information_schema.columns` plus `information_schema.table_constraints`. It feeds the LLM, so it
-must read like DDL, not like a catalogue dump. Match the shape `SQLiteEngine.raw_schema()`
-returns.
+Task 2's version satisfies conformance's "mentions every table" assertion. Check it against what
+the LLM actually needs: column types, primary keys and foreign keys present, formatted like the
+`CREATE TABLE` text `SQLiteEngine.raw_schema()` returns rather than like a catalogue dump. The
+prompt shows this text to the model, so its shape is a correctness concern, not cosmetics.
 
-- [ ] **Step 2: `schema_chunks()` — columns, foreign keys, value hints**
+- [ ] **Step 2: `schema_chunks()` — add value hints, and fix the keying**
 
 Mirror `DuckDBEngine.schema_chunks()`. Two rules carried from the 2026-09-25 fix:
 
@@ -651,11 +659,12 @@ Mirror `DuckDBEngine.schema_chunks()`. Two rules carried from the 2026-09-25 fix
 
 Value hints stay low-cardinality only — the standard's §4 row-data rule applies.
 
-- [ ] **Step 3: `schema_fingerprint()` — a catalogue hash, not a stat**
+- [ ] **Step 3: `schema_fingerprint()` — confirm what it hashes**
 
 Per the design's §4.8: a hash over table names, column names and types, and foreign keys, for the
-connection's visible schemas. One catalogue query per cache check is the honest cost of a server
-engine.
+connection's visible schemas — and nothing else. One catalogue query per cache check is the honest
+cost of a server engine. If Task 2's version hashes anything row-derived, fix it here; Step 4 is
+the test that catches it.
 
 - [ ] **Step 4: Test that the fingerprint moves on DDL change and not otherwise**
 
@@ -664,10 +673,11 @@ Then `INSERT` a row and fingerprint again — must **not** differ, or every inse
 schema cache. Both assertions matter; the second is the one that catches a fingerprint built over
 row counts.
 
-- [ ] **Step 5: `table_names()`**
+- [ ] **Step 5: `table_names()` must use the cache**
 
-Reuse `schema.py`'s fingerprint-keyed chunk cache rather than issuing a fresh catalogue query, as
-`base.py`'s docstring requires. Task 6 changes what this returns; implement the simple form now.
+`base.py`'s docstring requires reusing `schema.py`'s fingerprint-keyed chunk cache rather than
+issuing a fresh catalogue query per call — which matters far more for a server engine than for a
+file one. Confirm Task 2's version does; fix it if not. Task 6 changes what this returns.
 
 - [ ] **Step 6: Gates and commit**
 
