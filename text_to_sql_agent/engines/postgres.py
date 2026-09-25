@@ -15,10 +15,10 @@ read-only role holding no write grant, means a write is refused twice over:
 it, `InsufficientPrivilege` when only the role's grants would have.
 
 `prompt_dialect_section`, `prompt_dialect_name` and `prompt_engine_rules_block`
-are placeholders - Task 7 writes PostgreSQL's real prompt fragments. Likewise
-`allowed_functions` is `None` (the blocklist path `internal_prefixes`/
-`internal_names` still enforces) until Task 4 builds PostgreSQL's allowlist,
-matching `DuckDBEngine`'s Task 6b work. Every schema method below is the
+are placeholders - Task 7 writes PostgreSQL's real prompt fragments.
+`allowed_functions` (Task 4, 2026-09-26) is PostgreSQL's own default-deny
+allowlist, matching `DuckDBEngine`'s Task 6b work - see that attribute's own
+comment for how it was built and verified. Every schema method below is the
 straightforward version Step 5 of the task brief asked for - DDL synthesised
 from `information_schema.columns`, chunks carrying columns and foreign keys
 read from `pg_constraint`, and a fingerprint hashing a catalogue query - not
@@ -191,10 +191,167 @@ class PostgresEngine:
     # DuckDB has.
     internal_prefixes: tuple[str, ...] = ("pg_",)
     internal_names: frozenset[str] = frozenset({"information_schema"})
-    # `None` keeps `is_safe_query`'s blocklist-only behaviour, same as
-    # SQLite - see `Engine.allowed_functions`. Task 4 is where PostgreSQL
-    # gets its own default-deny allowlist; not built here.
-    allowed_functions: frozenset[str] | None = None
+    # Task 4 (2026-09-26) default-deny allowlist - see `DuckDBEngine.
+    # allowed_functions` for the general mechanism (`safety.
+    # _references_disallowed_function`: every function call anywhere in the
+    # query, not just in a table-source position, must resolve to a name
+    # here) and `_FUNCTION_NAME_OVERRIDES` in `safety.py` for the round-trip
+    # trap this list hit in the same shape DuckDB did.
+    #
+    # Built from `DuckDBEngine.allowed_functions` (127 names) as a starting
+    # point per the task brief, kept only where PostgreSQL genuinely
+    # registers a function under that name (verified against a live
+    # `pg_proc` sweep, 2026-09-26 - see `docs/superpowers/sdd/
+    # task-4-report.md` for the full list of names checked and dropped) or
+    # provides its own equivalent spelling. Every entry below was confirmed
+    # to exist in `pg_proc` (`pg_catalog`/`public`), *except* the six SQL
+    # syntax forms sqlglot represents as `exp.Func` subclasses for parsing
+    # convenience but PostgreSQL implements as grammar, not a callable in
+    # `pg_proc`: `case`, `if` (every `CASE ... WHEN` branch parses to a
+    # child `exp.If` node, so both must be listed together or no `CASE`
+    # expression validates - verified live, matching why DuckDB's own list
+    # carries both), `cast`, `extract`, `coalesce`, `nullif`, `greatest`,
+    # `least`, `trim` - these were instead verified by direct execution (see
+    # `ANALYTICS_CORPUS` below).
+    #
+    # Dropped rather than mapped, because PostgreSQL has no function (built-in
+    # or otherwise) a caller could reach under that name or any real
+    # equivalent: `median`, `first`, `last`, `approx_count_distinct`,
+    # `arg_min`, `arg_max`, `count_if`, `quantile`/`quantile_cont`/
+    # `quantile_disc` (PostgreSQL's own `percentile_cont`/`percentile_disc`
+    # are ordered-set aggregates verified to exist, but were left off anyway -
+    # not needed for a realistic analytics question and not worth adding a
+    # second, DuckDB-authored override token, `"quantile_cont"`/
+    # `"quantile_disc"`, that no PostgreSQL catalogue entry matches),
+    # `string_split` (`string_to_array` is the real equivalent, also left
+    # off - no query in the corpus needs it), `regexp_extract`,
+    # `regexp_full_match`, `contains`, `ends_with`, `datepart`, `date_diff`,
+    # `date_add`, `date_sub` (interval arithmetic covers this: `d + INTERVAL
+    # '1 day'` is a plain `exp.Add`/`exp.Sub` node, not a function call, so
+    # it is never even subject to this gate), `strftime`/`strptime`/`now`/
+    # `to_char`/`to_timestamp` (PostgreSQL's real equivalents exist and were
+    # verified - `to_char`, `now` - but every one of them either round-trips
+    # through an *existing* DuckDB-authored override token
+    # (`exp.TimeToStr`/`exp.StrToTime` already resolve to `"strftime"`/
+    # `"strptime"`) or adds a second date/time spelling
+    # (`current_timestamp`, listed below, already covers `now()`) with no
+    # query in the corpus needing the extra one), `epoch`/`epoch_ms`
+    # (`extract(epoch FROM ...)`, using `extract` below, covers this),
+    # `last_day` and the standalone `year`/`month`/`day`/`hour`/`minute`/
+    # `second`/`dayofweek`/`dayofyear`/`week`/`isodow`/`quarter` wrappers
+    # (none exist as PostgreSQL functions; `extract`, listed below, covers
+    # every one of them), `try_cast` (no PostgreSQL equivalent - `CAST`
+    # raises rather than returning `NULL`), `range`, `json_each`, `json_tree`
+    # and every `list_*`/`json_*` DuckDB entry (PostgreSQL's array/JSON
+    # accessor surface is a different set of names entirely, and nothing in
+    # the sample schema or a plausible business question over it needs
+    # them - left off per the task brief's "when in doubt, leave a function
+    # off the list"). `unnest` was dropped for the same reason even though
+    # it is a real PostgreSQL function (verified in `pg_proc`): nothing in
+    # this schema has an array column, and the only way to exercise it
+    # without one - a bare `ARRAY[...]` literal - parses to `exp.Array`,
+    # which already round-trips through the DuckDB-authored `"list_value"`
+    # override token, not a name in this list. Adding `"list_value"` here
+    # just to admit a function this schema has no legitimate use for was
+    # not worth it.
+    #
+    # `date_part` is genuinely real (verified in `pg_proc`) but is not its
+    # own entry: PostgreSQL's dialect parser normalises `DATE_PART(...)` into
+    # the same `exp.Extract` node `EXTRACT(... FROM ...)` produces (verified
+    # 2026-09-26), so `"extract"` alone already covers both spellings, the
+    # same way `"lpad"` alone covers `lpad`/`rpad` via the existing
+    # `exp.Pad` override. `rpad` is the same case: it round-trips through
+    # that existing `exp.Pad` -> `"lpad"` override rather than needing a
+    # second entry.
+    #
+    # `tests/test_engine_postgres.py::test_allowed_function_round_trip`
+    # proves every entry below round-trips: parsed under the `postgres`
+    # dialect, resolved via `safety._resolve_function_name`, and found back
+    # in this set.
+    allowed_functions: frozenset[str] | None = frozenset(
+        {
+            # -- Aggregates --
+            "count",
+            "sum",
+            "avg",
+            "min",
+            "max",
+            "mode",
+            "stddev",
+            "stddev_pop",
+            "stddev_samp",
+            "variance",
+            "var_pop",
+            "string_agg",
+            "array_agg",
+            "bool_and",
+            "bool_or",
+            "corr",
+            "covar_pop",
+            "covar_samp",
+            # -- Window functions --
+            "row_number",
+            "rank",
+            "dense_rank",
+            "percent_rank",
+            "cume_dist",
+            "ntile",
+            "lag",
+            "lead",
+            "first_value",
+            "last_value",
+            "nth_value",
+            # -- String functions --
+            "upper",
+            "lower",
+            "concat",
+            "concat_ws",
+            "length",
+            "trim",
+            "substring",
+            "replace",
+            "split_part",
+            "lpad",
+            "position",
+            "regexp_replace",
+            "regexp_matches",
+            "starts_with",
+            "reverse",
+            "left",
+            "right",
+            "repeat",
+            "initcap",
+            # -- Date and time functions --
+            "date_trunc",
+            "extract",
+            "age",
+            "current_date",
+            "current_timestamp",
+            "make_date",
+            # -- Numeric functions --
+            "round",
+            "ceil",
+            "floor",
+            "abs",
+            "power",
+            "sqrt",
+            "sign",
+            "exp",
+            "ln",
+            "log",
+            "cbrt",
+            "greatest",
+            "least",
+            # -- Conditional / type functions --
+            "coalesce",
+            "nullif",
+            "if",
+            "case",
+            "cast",
+            # -- Table functions --
+            "generate_series",
+        }
+    )
     schema_header: str = "PostgreSQL schema (DDL)"
     # Placeholder. Task 7 writes PostgreSQL's real prompt fragments
     # (`prompt_dialect_section`, `prompt_dialect_name`,

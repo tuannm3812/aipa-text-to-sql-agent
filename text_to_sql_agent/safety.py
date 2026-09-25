@@ -64,6 +64,14 @@ def _no_table_names() -> frozenset[str]:
 # `GroupConcat`). Resolving all of them to one canonical token is deliberate:
 # the allowlist only needs to contain that one token, not every alias, and a
 # caller who writes any alias gets the same, correctly-gated behaviour.
+#
+# This table is shared by every engine, not keyed per-dialect: a class such
+# as `exp.GroupConcat` maps to the same `"string_agg"` token whether the
+# statement was parsed under the `duckdb` or `postgres` dialect, because both
+# engines register a real function under that name. `PostgresEngine.
+# allowed_functions` (Task 4, 2026-09-26) reuses several of these entries
+# unchanged for exactly that reason and adds exactly one PostgreSQL-only
+# entry - `exp.ExplodingGenerateSeries` - documented at that entry.
 _FUNCTION_NAME_OVERRIDES: dict[type[sqlglot_exp.Expression], str] = {}
 if exp is not None:
     _FUNCTION_NAME_OVERRIDES = {
@@ -98,6 +106,20 @@ if exp is not None:
         # in place, without a `FROM unnest(...)` at all). Verified 2026-09-19
         # that `Explode` has no other DuckDB name mapped to it.
         exp.Explode: "unnest",
+        # PostgreSQL-only entry (Task 4, 2026-09-26): sqlglot's `postgres`
+        # dialect parses *every* `generate_series(...)` call - table position
+        # or scalar/select-list position alike - into `exp.
+        # ExplodingGenerateSeries`, never the plain `exp.GenerateSeries` node
+        # its own `.sql_name()` would resolve to `"generate_series"` for
+        # unaided. Verified 2026-09-26: `SELECT * FROM generate_series(1,5)`,
+        # `SELECT generate_series(1,5)` and a table-aliased form all produce
+        # this one class under `read="postgres"`, whose own `.sql_name()` is
+        # `EXPLODING_GENERATE_SERIES` - a token PostgreSQL does not register
+        # any function under. Mapped to `"generate_series"`, PostgreSQL's own
+        # real name and already `PostgresEngine.allowed_functions`'s only
+        # table-function entry, rather than adding a second, misleading token
+        # to that allowlist for the same function.
+        exp.ExplodingGenerateSeries: "generate_series",
     }
 
 
