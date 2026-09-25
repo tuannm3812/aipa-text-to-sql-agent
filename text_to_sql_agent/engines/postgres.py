@@ -729,7 +729,8 @@ POSTGRESQL DIALECT (must follow):
 - Generate PostgreSQL-compatible SQL only.
 - For dates/timestamps use EXTRACT(field FROM col), DATE_TRUNC('unit', col), and INTERVAL arithmetic (col + INTERVAL '1 day'); do NOT use strftime, date(), or datetime() - those are SQLite functions and do not exist in PostgreSQL.
 - For case-insensitive text matching, prefer `column ILIKE '%value%'` over LOWER(column) = LOWER('value'). ILIKE is PostgreSQL's own case-insensitive operator, not a function call, so it works regardless of the allowed-function list, and it is the idiomatic PostgreSQL spelling.
-- Double-quote an identifier only when the schema below shows it quoted, and copy that casing exactly - PostgreSQL folds an unquoted identifier to lowercase but matches a quoted one case-sensitively.
+- The schema below shows every identifier double-quoted; copy each name with that exact casing, quoted. PostgreSQL folds an unquoted identifier to lowercase but matches a quoted one case-sensitively, so copying the shown spelling is what makes a mixed-case name resolve.
+- To collect several values into one row use string_agg(col, ', ') or array_agg(col); GROUP_CONCAT and LISTAGG do not exist in PostgreSQL.
 """  # noqa: E501
     # See `SQLiteEngine.prompt_dialect_name` for what this substitutes into
     # and why it is a per-engine value. Already correct before this task -

@@ -362,6 +362,7 @@ def test_repair_user_prompt_names_duckdbs_dialect(tmp_path: Path) -> None:
     assert "DuckDB error:" in repair_user_prompt
     assert "corrected DuckDB SELECT query" in repair_user_prompt
     assert "SQLite error:" not in repair_user_prompt
+    assert "corrected SQLite SELECT query" not in repair_user_prompt
 
 
 def test_repair_user_prompt_names_postgresqls_dialect(postgres_dsn: str) -> None:
