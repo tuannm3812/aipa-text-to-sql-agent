@@ -16,7 +16,8 @@ dependencies = [
 
 [project.optional-dependencies]
 duckdb = ["duckdb>=1.0,<2"]
-engines = ["duckdb>=1.0,<2"]
+postgres = ["psycopg[binary]>=3.1,<4"]
+engines = ["duckdb>=1.0,<2", "psycopg[binary]>=3.1,<4"]
 
 [build-system]
 requires = ["hatchling"]

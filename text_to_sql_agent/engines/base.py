@@ -60,6 +60,13 @@ class Engine(Protocol):
 
     name: str
     sqlglot_dialect: str
+    # The schema/catalogue a bare, unqualified table name resolves against for
+    # this engine - SQLite's and DuckDB's is "main", PostgreSQL's is "public".
+    # Not yet consumed here (Phase 3b Task 6 wires it into `table_names()`'s
+    # qualified identity and `safety.py`'s schema-qualifier check); declared
+    # on the protocol now so every implementation states its own value rather
+    # than one being added later with no engine actually holding it.
+    default_schema: str
     internal_prefixes: tuple[str, ...]
     internal_names: frozenset[str]
     allowed_functions: frozenset[str] | None

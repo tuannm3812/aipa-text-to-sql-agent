@@ -17,6 +17,24 @@ def test_a_bare_path_and_a_sqlite_scheme_both_resolve_to_sqlite(dsn: str) -> Non
     assert engine.sqlglot_dialect == "sqlite"
 
 
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "postgresql://user:pw@localhost:5432/db",
+        "postgres://user:pw@localhost:5432/db",
+    ],
+)
+def test_both_postgres_spellings_resolve_and_keep_the_full_dsn(dsn: str) -> None:
+    """Unlike the file-path engines, PostgreSQL needs the whole URL: libpq
+    parses its own scheme out of the connection string, so `open_engine`
+    must not strip it the way it strips `sqlite://`/`duckdb://`.
+    """
+    engine = open_engine(dsn)
+    assert engine.name == "postgres"
+    assert engine.sqlglot_dialect == "postgres"
+    assert engine.dsn == dsn
+
+
 def test_an_unrecognised_scheme_is_rejected() -> None:
     with pytest.raises(ValueError, match="unrecognised database scheme"):
         open_engine("mysql://localhost/x")
@@ -43,3 +61,15 @@ def test_a_missing_driver_names_the_extra_to_install(monkeypatch) -> None:
 
     with pytest.raises(EngineUnavailableError, match="duckdb"):
         open_engine("duckdb:///tmp/x.duckdb")
+
+
+def test_a_missing_postgres_driver_names_the_extra_to_install(monkeypatch) -> None:
+    """Same proof as `test_a_missing_driver_names_the_extra_to_install`, for the
+    registry's newest entry - the `_ENGINES`/`importlib` refactor must not have
+    quietly dropped this per-engine guarantee for the engine it added.
+    """
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    monkeypatch.delitem(sys.modules, "text_to_sql_agent.engines.postgres", raising=False)
+
+    with pytest.raises(EngineUnavailableError, match="postgres"):
+        open_engine("postgresql://user:pw@localhost:5432/db")

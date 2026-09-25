@@ -128,6 +128,10 @@ class DuckDBEngine:
 
     name: str = "duckdb"
     sqlglot_dialect: str = "duckdb"
+    # See `Engine.default_schema`. Same value as `_MAIN_SCHEMA` above - kept
+    # as a separate protocol-facing attribute rather than aliased to it, so
+    # this class's public surface doesn't depend on a module-private name.
+    default_schema: str = _MAIN_SCHEMA
     # DuckDB's own catalogue functions (duckdb_tables(), duckdb_constraints(),
     # ...) and its Postgres-compatibility views (pg_catalog etc.) are both
     # readable from a read-only connection, unlike sqlite_master's write-only

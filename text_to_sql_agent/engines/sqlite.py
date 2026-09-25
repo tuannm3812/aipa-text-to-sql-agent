@@ -122,6 +122,10 @@ class SQLiteEngine:
 
     name: str = "sqlite"
     sqlglot_dialect: str = "sqlite"
+    # See `Engine.default_schema`. SQLite's implicit catalogue is "main" -
+    # what an unqualified table name resolves against, and the only schema
+    # `safety.py`'s qualifier check accepts today.
+    default_schema: str = "main"
     internal_prefixes: tuple[str, ...] = ("sqlite_", "pragma_")
     internal_names: frozenset[str] = frozenset({"dbstat"})
     # `None` keeps `is_safe_query`'s original blocklist-only behaviour for
