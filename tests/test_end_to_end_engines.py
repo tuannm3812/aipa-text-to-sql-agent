@@ -77,7 +77,10 @@ def test_a_question_reaches_the_engine(engine_dsn: str, entry: str, use_rag: boo
     assert "customers" in seen["schema"], "the schema must come from this engine"
 
 
-def test_an_unreachable_dsn_raises_engine_unreachable_and_is_also_file_not_found() -> None:
+@pytest.mark.parametrize("dsn", ["/nonexistent/path.db", "duckdb:///nonexistent/path.duckdb"])
+def test_an_unreachable_dsn_raises_engine_unreachable_and_is_also_file_not_found(
+    dsn: str,
+) -> None:
     """Reachability is checked before the pipeline's own try block, so it raises.
 
     Verified directly: `ask_database('q', db_path='duckdb:///nonexistent/path.duckdb')`
@@ -85,9 +88,17 @@ def test_an_unreachable_dsn_raises_engine_unreachable_and_is_also_file_not_found
     which is deliberately also a `FileNotFoundError` so callers that
     historically caught that exception keep working. Both halves of that
     dual contract are pinned here.
+
+    The SQLite case carries the contract when the `engines` extra is absent:
+    resolving a `duckdb://` DSN without the driver raises
+    `EngineUnavailableError`, which is a different contract and would fail
+    this test rather than skip it.
     """
+    if dsn.startswith("duckdb://"):
+        pytest.importorskip("duckdb", reason="install the duckdb extra")
+
     with pytest.raises(EngineUnreachableError) as excinfo:
-        agent.ask_database("q", db_path="duckdb:///nonexistent/path.duckdb")
+        agent.ask_database("q", db_path=dsn)
 
     assert isinstance(excinfo.value, FileNotFoundError)
     assert "not found" in str(excinfo.value)
