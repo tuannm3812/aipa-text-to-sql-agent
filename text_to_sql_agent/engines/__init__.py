@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import cast
 
 from .base import (
+    AmbiguousTableIdentityError,
     Engine,
     EngineError,
     EngineForbiddenError,
@@ -15,6 +16,7 @@ from .base import (
 )
 
 __all__ = [
+    "AmbiguousTableIdentityError",
     "Engine",
     "EngineError",
     "EngineForbiddenError",

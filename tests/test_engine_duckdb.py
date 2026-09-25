@@ -27,6 +27,7 @@ duckdb = pytest.importorskip("duckdb", reason="install the duckdb extra")
 
 from text_to_sql_agent import is_safe_query  # noqa: E402
 from text_to_sql_agent import safety as _safety  # noqa: E402
+from text_to_sql_agent.engines import duckdb as _duckdb_engine_module  # noqa: E402
 from text_to_sql_agent.engines import open_engine  # noqa: E402
 from text_to_sql_agent.engines.duckdb import DuckDBEngine  # noqa: E402
 from text_to_sql_agent.execution import execute_query  # noqa: E402
@@ -1491,6 +1492,32 @@ def test_duckdb_schema_fingerprint_changes_when_the_opted_in_set_changes(tmp_pat
     after = open_engine(f"duckdb://{db}").schema_fingerprint()
 
     assert after != before
+
+
+def test_internal_schema_filter_arity_tracks_internal_schemas_length(tmp_path, monkeypatch):
+    """Review finding (2026-09-26): `raw_schema()`/`schema_chunks()` used to
+    spell `"schema_name NOT IN (?, ?)"` literally - a placeholder count that
+    only happened to match `_INTERNAL_SCHEMAS`'s length of two. Growing that
+    tuple to three without touching either SQL string would raise
+    `duckdb.Error` (a bind parameter/placeholder count mismatch) at query
+    time, with every other test in this suite still green, because nothing
+    else exercises a three-entry `_INTERNAL_SCHEMAS`. This monkeypatches it
+    to three and proves both call sites still run.
+    """
+    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    db = tmp_path / "arity.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE customers (id INTEGER)")
+    con.close()
+
+    monkeypatch.setattr(
+        _duckdb_engine_module,
+        "_INTERNAL_SCHEMAS",
+        ("information_schema", "pg_catalog", "a_third_internal_schema"),
+    )
+    engine = open_engine(f"duckdb://{db}")
+    assert "customers" in engine.raw_schema()
+    assert {c.table_name for c in engine.schema_chunks()} == {"customers"}
 
 
 def test_duckdb_default_work_limit_is_5000_ms() -> None:

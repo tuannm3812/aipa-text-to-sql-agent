@@ -34,6 +34,7 @@ from ..types import QueryResult, SchemaChunk
 from .base import (
     EngineUnreachableError,
     extra_schemas_from_env,
+    is_internal_schema_name,
     table_column_spellings,
     table_name_spellings,
 )
@@ -69,6 +70,25 @@ _DEFAULT_SCHEMA = "main"
 # reference into either is refused by `safety._references_internals` on its
 # name, whatever this module reads.
 _INTERNAL_SCHEMAS = ("information_schema", "pg_catalog")
+
+
+def _internal_schema_placeholders() -> str:
+    """One `?` per entry in `_INTERNAL_SCHEMAS`, computed from its length.
+
+    Review finding (2026-09-26): `raw_schema()`/`schema_chunks()` used to
+    spell `"schema_name NOT IN (?, ?)"` literally in both SQL strings, a
+    count that only happened to match `_INTERNAL_SCHEMAS`'s length of two.
+    Growing that tuple by one entry without also editing both SQL strings
+    would fail at query time with a parameter-count mismatch - not caught by
+    any test, mypy or ruff, since it is a runtime property of the SQL text,
+    not the Python. Called fresh at each call site (rather than cached in a
+    module-level constant computed once at import) so it is derived from
+    `_INTERNAL_SCHEMAS` as it actually is at call time, not as it was when
+    the module first loaded - see
+    `tests/test_engine_duckdb.py::test_internal_schema_filter_arity_tracks_internal_schemas_length`,
+    which proves this by growing the tuple after import.
+    """
+    return ", ".join("?" for _ in _INTERNAL_SCHEMAS)
 
 
 def _connect_read_only(db_path: str) -> duckdb.DuckDBPyConnection:
@@ -521,8 +541,28 @@ DUCKDB DIALECT (must follow):
         not load-bearing for correctness (DuckDB's `IN` doesn't care about
         parameter order), but it keeps the three query call sites trivially
         comparable.
+
+        Review finding 1 (2026-09-26, see `engines/base.py::
+        is_internal_schema_name`'s own docstring for the full story):
+        `AIPA_EXTRA_SCHEMAS` is operator-supplied text, and nothing used to
+        stop an operator from opting into a schema spelled `PG_evil` or
+        `Information_Schema` - `safety._references_internals` would then
+        refuse every reference into it anyway (it lowercases before
+        comparing against `internal_prefixes`/`internal_names`), but only
+        after this engine had already advertised it via `raw_schema()`/
+        `table_names()`. `extra_schemas` is filtered through the identical
+        case-insensitive comparison here, before it ever reaches a query, so
+        a schema `safety.py` would refuse to let a reference resolve into is
+        never read at all - matching `PostgresEngine._user_schema_names`.
         """
-        return (self.default_schema, *sorted(self.extra_schemas))
+        extras = sorted(
+            name
+            for name in self.extra_schemas
+            if not is_internal_schema_name(
+                name, internal_prefixes=self.internal_prefixes, internal_names=self.internal_names
+            )
+        )
+        return (self.default_schema, *extras)
 
     def check_reachable(self) -> None:
         """Raise `EngineUnreachableError` if the database file does not exist."""
@@ -621,7 +661,7 @@ DUCKDB DIALECT (must follow):
             rows = conn.execute(
                 "SELECT schema_name, table_name, sql FROM duckdb_tables() "
                 "WHERE database_name = current_database() "
-                "AND schema_name NOT IN (?, ?) "
+                f"AND schema_name NOT IN ({_internal_schema_placeholders()}) "
                 f"AND schema_name IN ({placeholders}) "
                 "ORDER BY schema_name, table_name",
                 [*_INTERNAL_SCHEMAS, *allowed],
@@ -657,7 +697,7 @@ DUCKDB DIALECT (must follow):
             table_rows = conn.execute(
                 "SELECT schema_name, table_name, sql FROM duckdb_tables() "
                 "WHERE database_name = current_database() "
-                "AND schema_name NOT IN (?, ?) "
+                f"AND schema_name NOT IN ({_internal_schema_placeholders()}) "
                 f"AND schema_name IN ({placeholders}) "
                 "ORDER BY schema_name, table_name",
                 [*_INTERNAL_SCHEMAS, *allowed],

@@ -50,6 +50,26 @@ connecting role was provisioned, unlike DuckDB's engine-enforced
 `enable_external_access=False`, so this engine now checks that at connect
 time and refuses with `EngineForbiddenError` rather than trusting every
 deployment to have provisioned its role correctly.
+
+A 2026-09-26 review of the schema-identity boundary found three further gaps,
+all one root cause: this engine's own schema filtering was case-sensitive
+while `safety.py`'s rules are case-insensitive. `_user_schema_names` now runs
+every candidate through `engines/base.py`'s `is_internal_schema_name` - the
+same comparison `safety._references_internals` applies - before it is ever
+queried, so a schema spelled `PG_evil` or `Information_Schema` is refused at
+the source instead of being advertised and then rejected (finding 1).
+`default_schema` is no longer the constant `_PUBLIC_SCHEMA`: it is now a
+cached property that asks the server's own `current_schema()`, because
+`search_path`'s stock value is `"$user", public` and a schema named after the
+connecting role resolves a bare table name differently from what the constant
+asserted (finding 3) - see that property's own docstring. `engines/base.py`'s
+`table_name_spellings`/`table_column_spellings` now refuse (rather than
+silently merge) two distinct real tables that would share one lowercased
+spelling - PostgreSQL's quoted identifiers are case-sensitive, so `public`
+and `"Public"` are two different schemas that fold together only once
+lowercased (finding 2), and the flat, unescaped qualified-name string has the
+same shape of collision between a dotted table name and a qualified one
+(finding 4). See `AmbiguousTableIdentityError`.
 """
 
 from __future__ import annotations
@@ -72,6 +92,7 @@ from .base import (
     EngineForbiddenError,
     EngineUnreachableError,
     extra_schemas_from_env,
+    is_internal_schema_name,
     table_column_spellings,
     table_name_spellings,
 )
@@ -188,6 +209,8 @@ def _user_schema_names(
     *,
     default_schema: str,
     extra_schemas: frozenset[str],
+    internal_prefixes: tuple[str, ...],
+    internal_names: frozenset[str],
 ) -> list[str]:
     """This role's `default_schema` plus its opted-in, privileged extras.
 
@@ -203,13 +226,21 @@ def _user_schema_names(
     re-read per catalogue query.
 
     `pg_catalog`, `pg_toast`, any `pg_temp_*`/`pg_toast_temp_*` and
-    `information_schema` are PostgreSQL's internals, not the user's data, and
-    were never reachable through this function even before this change - the
-    candidate list this filters is `default_schema` plus `extra_schemas`
-    alone, never "every `nspname`", so there is no separate exclusion left to
-    state; `safety.py` refuses a reference into them by name regardless
-    (`internal_prefixes = ("pg_",)`, `internal_names = {"information_
-    schema"}`).
+    `information_schema` are PostgreSQL's internals, not the user's data.
+    Review finding 1 (2026-09-26): the candidate list used to be filtered by
+    nothing beyond membership in `[default_schema, *extra_schemas]` - the
+    assumption recorded here until this fix was that neither could ever
+    *spell* an internal schema, so there was "no separate exclusion left to
+    state". That assumption was wrong the moment an operator's
+    `AIPA_EXTRA_SCHEMAS` (or the database itself) named a schema like
+    `PG_evil` or `Information_Schema`: nothing here rejected it, so it was
+    read into `raw_schema()`/`table_names()` and then permanently refused by
+    `safety._references_internals`, which lowercases before comparing -
+    advertised, then rejected, the layer-disagreement `docs/3_decisions.md`'s
+    2026-09-25 entry closed in the opposite direction. `is_internal_schema_
+    name` now applies the identical case-insensitive comparison here, before
+    a candidate ever reaches the privilege check below, so a schema
+    `safety.py` would refuse to let a query reference is never read at all.
 
     `has_schema_privilege` is still what keeps the rest honest: `aipa_ro` is
     a least-privilege role, and a schema it holds no `USAGE` on is one whose
@@ -218,7 +249,15 @@ def _user_schema_names(
     is opted in but not granted, or granted but not opted in, is absent
     either way; only the intersection is read.
     """
-    candidates = [default_schema, *sorted(extra_schemas)]
+    candidates = [
+        name
+        for name in [default_schema, *sorted(extra_schemas)]
+        if not is_internal_schema_name(
+            name, internal_prefixes=internal_prefixes, internal_names=internal_names
+        )
+    ]
+    if not candidates:
+        return []
     rows = conn.execute(
         "SELECT nspname FROM pg_namespace "
         "WHERE nspname = ANY(%s) AND has_schema_privilege(nspname, 'USAGE') "
@@ -237,9 +276,10 @@ def _fetch_columns(
     (see `duckdb.py`'s module docstring) is what a bare-name key does the
     moment a query result spans two schemas holding a same-named table:
     their columns land in the same list, silently merged. Every caller in
-    this module passes a single-element `schema_names` today (see the
-    module docstring for why), but the keying holds regardless of how many
-    schemas are asked for - proven directly, with more than one, by
+    this module now passes `default_schema` plus every opted-in
+    `AIPA_EXTRA_SCHEMAS` entry (`_user_schema_names`), so `schema_names` is
+    routinely more than one element - the keying holds regardless of how
+    many schemas are asked for, proven directly, with more than one, by
     `tests/test_engine_postgres.py::
     test_fetch_columns_keys_by_schema_and_table_not_bare_name`.
     """
@@ -465,7 +505,6 @@ class PostgresEngine:
 
     name: str = "postgres"
     sqlglot_dialect: str = "postgres"
-    default_schema: str = _PUBLIC_SCHEMA
     # `pg_` covers pg_catalog's own tables (pg_class, pg_constraint, ...) and
     # PostgreSQL's `pg_*` administrative views alike; `information_schema` is
     # the standard SQL catalogue view. Both are readable from a read-only
@@ -682,6 +721,92 @@ class PostgresEngine:
         # names` above - read once here so this instance's scope is fixed
         # for its whole lifetime.
         self.extra_schemas: frozenset[str] = extra_schemas_from_env()
+        # See the `default_schema` property below - `None` means "not yet
+        # asked the server."
+        self._default_schema: str | None = None
+
+    @property
+    def default_schema(self) -> str:
+        """This role's actual default schema, per PostgreSQL's own `current_schema()`.
+
+        Decision (2026-09-26, review finding 3). This used to be the class
+        constant `"public"` (`_PUBLIC_SCHEMA`). PostgreSQL does not resolve a
+        bare table name against a fixed schema - it resolves it against
+        `search_path`, whose stock value is `"$user", public`: the schema
+        named after the connecting role, if one exists, before `public`.
+        `aipa_ro` is a role name, and nothing stops a deployment from also
+        having a schema named `aipa_ro` - at which point the constant and the
+        server's own answer diverge, and this class was *asserting* a false
+        identity: `table_names()` advertised bare `customers` as
+        `public.customers`, `is_safe_query` validated it against that
+        identity, and PostgreSQL itself executed it against `aipa_ro.
+        customers` instead - a different real table, approved under the
+        wrong name. Querying `current_schema()` is the fix: it is PostgreSQL's
+        own answer to "what does a bare name resolve to on this connection",
+        not this engine's guess at one.
+
+        Cached in `self._default_schema` after the first successful query -
+        `current_schema()` cannot change mid-connection for this engine's
+        purposes (`execute()` opens its own short-lived connection per call
+        and never runs `SET search_path`, and no validated query can run one
+        either: `search_path` reads as a settings function, refused by
+        `safety.py` the same way `current_setting(...)` is). This also keeps
+        every read-only call site (`raw_schema`, `schema_chunks`,
+        `schema_fingerprint`, `table_names`, `table_columns`) consistent
+        within one `PostgresEngine` instance's lifetime - `schema.py`'s
+        `get_schema_chunks` builds a fresh instance from `open_engine` on
+        every call (see that module), so "per instance" here already means
+        "once per top-level call," not a process-lifetime cache that could go
+        stale. It is also why this stays consistent with `schema_fingerprint`
+        and `schema.py`'s own `lru_cache`: `schema_fingerprint()` includes
+        `self.default_schema` directly in the tuple it returns, so a
+        `search_path` change on the server (a schema created or dropped that
+        changes what `"$user", public` resolves to) still changes the
+        fingerprint and invalidates that cache the same way any other schema
+        change does.
+
+        A plain instance-level cache, not `functools.cached_property`: this
+        class already declares `default_schema` at the `Engine` Protocol's
+        expected name and type (`str`), and `cached_property` would still
+        need `self._default_schema` distinguished from "unset" - `None` is
+        never a valid schema name, so it is an unambiguous sentinel.
+
+        Returns:
+            `current_schema()`'s answer, or `_PUBLIC_SCHEMA` if the server
+            reports no default schema at all (an empty `search_path`) -
+            matching PostgreSQL's own behaviour for a bare table reference
+            in that case.
+        """
+        if self._default_schema is None:
+            with _connect_read_only(self.dsn) as conn:
+                self._resolve_default_schema(conn)
+        assert self._default_schema is not None
+        return self._default_schema
+
+    def _resolve_default_schema(self, conn: psycopg.Connection[tuple[Any, ...]]) -> None:
+        """Cache `current_schema()`'s answer using an already-open connection.
+
+        `raw_schema`/`schema_chunks`/`schema_fingerprint` each call this
+        first thing, inside the `with _connect_read_only(...)` block they
+        already open for their own catalogue reads, so their first access to
+        `self.default_schema` later in the same method hits the cache
+        instead of opening a second connection just to resolve it.
+        `tests/test_engine_postgres.py::
+        test_schema_extraction_uses_the_read_only_connection` pins each of
+        those three methods to exactly one `_connect_read_only` call - this
+        is what keeps that true now that resolving `default_schema` needs a
+        query of its own; only the `default_schema` property's *other*
+        callers (`table_names`/`table_columns`, and a caller reading it
+        directly before calling anything else) pay for a dedicated
+        connection, and only once per instance.
+
+        A no-op once cached - safe to call from every one of those three
+        methods unconditionally.
+        """
+        if self._default_schema is not None:
+            return
+        row = conn.execute("SELECT current_schema()").fetchone()
+        self._default_schema = row[0] if row and row[0] else _PUBLIC_SCHEMA
 
     def check_reachable(self) -> None:
         """Raise if the server cannot be reached, or the role is too privileged.
@@ -792,8 +917,13 @@ class PostgresEngine:
             and separated by blank lines, ordered by schema then table name.
         """
         with _connect_read_only(self.dsn) as conn:
+            self._resolve_default_schema(conn)
             schema_names = _user_schema_names(
-                conn, default_schema=self.default_schema, extra_schemas=self.extra_schemas
+                conn,
+                default_schema=self.default_schema,
+                extra_schemas=self.extra_schemas,
+                internal_prefixes=self.internal_prefixes,
+                internal_names=self.internal_names,
             )
             columns_by_table = _fetch_columns(conn, schema_names)
             pk_by_table = _fetch_primary_keys(conn, schema_names)
@@ -830,8 +960,13 @@ class PostgresEngine:
         uses - see `raw_schema()`'s docstring for why.
         """
         with _connect_read_only(self.dsn) as conn:
+            self._resolve_default_schema(conn)
             schema_names = _user_schema_names(
-                conn, default_schema=self.default_schema, extra_schemas=self.extra_schemas
+                conn,
+                default_schema=self.default_schema,
+                extra_schemas=self.extra_schemas,
+                internal_prefixes=self.internal_prefixes,
+                internal_names=self.internal_names,
             )
             columns_by_table = _fetch_columns(conn, schema_names)
             pk_by_table = _fetch_primary_keys(conn, schema_names)
@@ -919,8 +1054,13 @@ class PostgresEngine:
         uses - see `raw_schema()`'s docstring for why.
         """
         with _connect_read_only(self.dsn) as conn:
+            self._resolve_default_schema(conn)
             schema_names = _user_schema_names(
-                conn, default_schema=self.default_schema, extra_schemas=self.extra_schemas
+                conn,
+                default_schema=self.default_schema,
+                extra_schemas=self.extra_schemas,
+                internal_prefixes=self.internal_prefixes,
+                internal_names=self.internal_names,
             )
             column_rows = conn.execute(
                 "SELECT table_schema, table_name, column_name, data_type, "

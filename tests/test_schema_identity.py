@@ -24,6 +24,16 @@ there means `ATTACH DATABASE`, which this project's DSN model has no shape for
 (a DSN is one file path) and which the read-only authorizer denies outright -
 see `test_sqlite_has_exactly_one_schema_because_attach_is_denied`. Faking a
 second SQLite schema would test a shape the engine does not have.
+
+A 2026-09-26 review of this same boundary found one root cause behind four
+more findings: the engines' own schema filtering was case-sensitive while
+`safety.py`'s rules are case-insensitive, and the qualified-name spelling
+built in `engines/base.py` is a flat, unescaped string. The tests below this
+point (from `test_an_internal_looking_schema_is_never_advertised_or_readable`
+onward) pin that fix, all against live PostgreSQL - the only engine here with
+case-sensitive quoted identifiers, so the only one where any of this is
+reachable. See `engines/base.py::AmbiguousTableIdentityError` and
+`is_internal_schema_name` for the mechanism.
 """
 
 from __future__ import annotations
@@ -288,3 +298,288 @@ def test_sqlite_has_exactly_one_schema_because_attach_is_denied(tmp_path: Path) 
     with pytest.raises(sqlite3.DatabaseError):
         engine.execute(f"ATTACH DATABASE '{other}' AS two", max_rows=10, work_limit=0)
     assert engine.table_names() == frozenset({"customers", "main.customers"})
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-26 review: the schema-identity boundary, PostgreSQL only.
+#
+# Every scenario below needs a real, case-sensitive PostgreSQL identifier
+# (`"PG_evil"`, `"Public"`, a schema literally named after the connecting
+# role, a dotted table name) - none of that is reachable on SQLite or DuckDB,
+# whose identifiers fold to one case, so these are not parametrised over
+# `case`. Each test creates its own fixture schema(s) as the `postgres`
+# superuser (never through `open_engine`, which refuses a superuser DSN by
+# design - see `PostgresEngine.check_reachable`) and drops them in a
+# `finally`, mirroring the `case` fixture's own `analytics` cleanup.
+# ---------------------------------------------------------------------------
+
+
+def test_an_internal_looking_schema_is_never_advertised_or_readable(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 1: schema exclusion must be case-insensitive, matching safety.py.
+
+    At BASE, `PG_evil`/`Information_Schema` were read into `raw_schema()`/
+    `table_names()` - nothing on the engine side compared candidate schema
+    names case-insensitively - and then permanently rejected by
+    `safety._references_internals`, which does: advertised, then refused,
+    the same layer-disagreement shape `docs/3_decisions.md`'s 2026-09-25
+    entry closed in the opposite direction. The fix never advertises them at
+    all.
+    """
+    psycopg = pytest.importorskip("psycopg", reason="install the postgres extra")
+    admin = _as_postgres_superuser(postgres_dsn)
+
+    def _cleanup(conn: Any) -> None:
+        conn.execute('DROP SCHEMA IF EXISTS "PG_evil" CASCADE')
+        conn.execute('DROP SCHEMA IF EXISTS "Information_Schema" CASCADE')
+
+    with psycopg.connect(admin, connect_timeout=5, autocommit=True) as conn:
+        _cleanup(conn)
+        conn.execute('CREATE SCHEMA "PG_evil"')
+        conn.execute('CREATE TABLE "PG_evil".t (id INTEGER)')
+        conn.execute('GRANT USAGE ON SCHEMA "PG_evil" TO aipa_ro')
+        conn.execute('GRANT SELECT ON ALL TABLES IN SCHEMA "PG_evil" TO aipa_ro')
+        conn.execute('CREATE SCHEMA "Information_Schema"')
+        conn.execute('CREATE TABLE "Information_Schema".t (id INTEGER)')
+        conn.execute('GRANT USAGE ON SCHEMA "Information_Schema" TO aipa_ro')
+        conn.execute('GRANT SELECT ON ALL TABLES IN SCHEMA "Information_Schema" TO aipa_ro')
+    try:
+        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "PG_evil,Information_Schema")
+        engine = open_engine(postgres_dsn)
+
+        raw = engine.raw_schema().lower()
+        assert "pg_evil" not in raw
+        assert "information_schema" not in raw
+
+        names = engine.table_names()
+        assert not {n for n in names if "pg_evil" in n or "information_schema" in n}
+
+        assert not is_safe_query('SELECT * FROM "PG_evil".t', engine=engine)
+        assert not is_safe_query('SELECT * FROM "Information_Schema".t', engine=engine)
+    finally:
+        with psycopg.connect(admin, connect_timeout=5, autocommit=True) as conn:
+            _cleanup(conn)
+
+
+def test_a_case_variant_schema_collision_fails_closed(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 2: PostgreSQL's quoted identifiers are case-sensitive, so
+    `public` and `"Public"` are two different real schemas that fold to the
+    same lowercased spelling (`public.customers`). At BASE, `table_names()`
+    silently kept whichever chunk was built last under that one spelling, so
+    a reference to `"Public".customers` validated against - and, on
+    execution, actually reached - a genuinely different table than the one
+    every other query's `public.customers` means. The fix refuses to
+    advertise or accept either spelling once a real collision like this
+    exists, rather than picking a winner.
+    """
+    from text_to_sql_agent.engines.base import AmbiguousTableIdentityError
+
+    psycopg = pytest.importorskip("psycopg", reason="install the postgres extra")
+    admin = _as_postgres_superuser(postgres_dsn)
+
+    def _cleanup(conn: Any) -> None:
+        conn.execute('DROP SCHEMA IF EXISTS "Public" CASCADE')
+
+    with psycopg.connect(admin, connect_timeout=5, autocommit=True) as conn:
+        _cleanup(conn)
+        # `customers` already exists in `public` (docker/postgres-init.sql) -
+        # this is the colliding second table, in a schema differing only by
+        # case.
+        conn.execute('CREATE SCHEMA "Public"')
+        conn.execute('CREATE TABLE "Public".customers (id INTEGER, tag TEXT)')
+        conn.execute("INSERT INTO \"Public\".customers VALUES (1, 'UPPER-SCHEMA-ROW')")
+        conn.execute('GRANT USAGE ON SCHEMA "Public" TO aipa_ro')
+        conn.execute('GRANT SELECT ON ALL TABLES IN SCHEMA "Public" TO aipa_ro')
+    try:
+        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "Public")
+        engine = open_engine(postgres_dsn)
+
+        with pytest.raises(AmbiguousTableIdentityError):
+            engine.table_names()
+        with pytest.raises(AmbiguousTableIdentityError):
+            is_safe_query('SELECT * FROM "Public".customers', engine=engine)
+    finally:
+        with psycopg.connect(admin, connect_timeout=5, autocommit=True) as conn:
+            _cleanup(conn)
+
+
+def test_default_schema_is_the_servers_answer_not_a_hardcoded_constant(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 3: `search_path`'s stock value is `"$user", public` - a schema
+    named after the connecting role shadows `public` for a bare reference.
+    At BASE, `PostgresEngine.default_schema` was the constant `"public"`
+    regardless of the server's own answer, so `is_safe_query` approved a
+    bare `customers` reference against `public.customers`'s identity while
+    PostgreSQL itself resolved the same bare name to the role-named schema's
+    own `customers` - a query approved under one identity that then executed
+    against a different, real table.
+    """
+    psycopg = pytest.importorskip("psycopg", reason="install the postgres extra")
+    admin = _as_postgres_superuser(postgres_dsn)
+
+    def _cleanup(conn: Any) -> None:
+        conn.execute("DROP SCHEMA IF EXISTS aipa_ro CASCADE")
+
+    with psycopg.connect(admin, connect_timeout=5, autocommit=True) as conn:
+        _cleanup(conn)
+        conn.execute("CREATE SCHEMA aipa_ro")
+        conn.execute("CREATE TABLE aipa_ro.customers (id INTEGER, tag TEXT)")
+        conn.execute("INSERT INTO aipa_ro.customers VALUES (1, 'SHADOWED-SECRET')")
+        conn.execute("GRANT USAGE ON SCHEMA aipa_ro TO aipa_ro")
+        conn.execute("GRANT SELECT ON ALL TABLES IN SCHEMA aipa_ro TO aipa_ro")
+    try:
+        # `public` must be opted in explicitly here: now that `default_schema`
+        # correctly resolves to `aipa_ro`, `public` is no longer read for
+        # free as "the default schema" the way it was at BASE - this test
+        # still wants it reachable, under its own qualified spelling, to
+        # prove the fix changes what the *bare* name means without taking
+        # `public.customers` away.
+        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "public")
+        with psycopg.connect(postgres_dsn, connect_timeout=5) as roconn:
+            row = roconn.execute("SELECT current_schema()").fetchone()
+        assert row is not None
+        server_default = row[0]
+        assert server_default == "aipa_ro", "fixture assumption: role and schema share a name"
+
+        engine = open_engine(postgres_dsn)
+        assert engine.default_schema == server_default
+
+        assert is_safe_query("SELECT * FROM customers", engine=engine)
+        result = engine.execute("SELECT * FROM customers", max_rows=10, work_limit=0)
+        assert result.rows == [(1, "SHADOWED-SECRET")]
+
+        # `public.customers` is still its own, separately reachable table -
+        # the fix changes what the *bare* name means, not whether the other
+        # table is still there under its own qualified spelling.
+        assert is_safe_query("SELECT * FROM public.customers", engine=engine)
+        public_rows = engine.execute(
+            "SELECT * FROM public.customers", max_rows=10, work_limit=0
+        ).rows
+        assert all(row[1] != "SHADOWED-SECRET" for row in public_rows)
+    finally:
+        with psycopg.connect(admin, connect_timeout=5, autocommit=True) as conn:
+            _cleanup(conn)
+
+
+def test_a_dotted_table_name_colliding_with_a_qualified_spelling_fails_closed(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 4: the qualified-name namespace is a flat, unescaped string, so
+    a table literally named `"analytics.thing"` in the default schema and a
+    table `thing` in a schema named `analytics` both spell as
+    `analytics.thing`. Both are real tables - nothing escaped in the
+    reviewer's probe - but a default-deny gate approving a reference it
+    never meant to advertise is still wrong, so this fails closed the same
+    way finding 2's case collision does (both go through the same
+    `AmbiguousTableIdentityError` check in `engines/base.py`).
+    """
+    from text_to_sql_agent.engines.base import AmbiguousTableIdentityError
+
+    psycopg = pytest.importorskip("psycopg", reason="install the postgres extra")
+    admin = _as_postgres_superuser(postgres_dsn)
+
+    def _cleanup(conn: Any) -> None:
+        conn.execute('DROP TABLE IF EXISTS public."analytics.thing"')
+        conn.execute("DROP SCHEMA IF EXISTS analytics CASCADE")
+
+    with psycopg.connect(admin, connect_timeout=5, autocommit=True) as conn:
+        _cleanup(conn)
+        conn.execute('CREATE TABLE public."analytics.thing" (id INTEGER)')
+        conn.execute('GRANT SELECT ON public."analytics.thing" TO aipa_ro')
+        conn.execute("CREATE SCHEMA analytics")
+        conn.execute("CREATE TABLE analytics.thing (id INTEGER)")
+        conn.execute("GRANT USAGE ON SCHEMA analytics TO aipa_ro")
+        conn.execute("GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO aipa_ro")
+    try:
+        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "analytics")
+        engine = open_engine(postgres_dsn)
+        with pytest.raises(AmbiguousTableIdentityError):
+            engine.table_names()
+    finally:
+        with psycopg.connect(admin, connect_timeout=5, autocommit=True) as conn:
+            _cleanup(conn)
+
+
+def test_layer_agreement_over_a_hostile_multi_schema_database(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The property that actually matters, checked directly rather than by
+    construction: every real table is advertised, validates and executes to
+    the row that identifies it (not some other table's), and a schema that
+    must never be advertised (finding 1) is absent everywhere at once. This
+    is the check that would have caught all four findings in one run rather
+    than one at a time - a mixed-case extra schema, a `PG_`-prefixed schema,
+    and a dotted table name, none of which collide with each other, so the
+    ordinary multi-schema case still works after the fail-closed fix
+    (collisions themselves are pinned separately, above, where the assertion
+    is "refuses", not "agrees").
+    """
+    psycopg = pytest.importorskip("psycopg", reason="install the postgres extra")
+    admin = _as_postgres_superuser(postgres_dsn)
+
+    def _cleanup(conn: Any) -> None:
+        conn.execute('DROP SCHEMA IF EXISTS "Sales" CASCADE')
+        conn.execute('DROP SCHEMA IF EXISTS "PG_reports" CASCADE')
+        conn.execute('DROP TABLE IF EXISTS public."weird.dotted"')
+
+    with psycopg.connect(admin, connect_timeout=5, autocommit=True) as conn:
+        _cleanup(conn)
+        conn.execute('CREATE SCHEMA "Sales"')
+        conn.execute('CREATE TABLE "Sales".orders (id INTEGER, tag TEXT)')
+        conn.execute("INSERT INTO \"Sales\".orders VALUES (1, 'sales-orders-row')")
+        conn.execute('GRANT USAGE ON SCHEMA "Sales" TO aipa_ro')
+        conn.execute('GRANT SELECT ON ALL TABLES IN SCHEMA "Sales" TO aipa_ro')
+
+        conn.execute('CREATE SCHEMA "PG_reports"')
+        conn.execute('CREATE TABLE "PG_reports".secret (id INTEGER, tag TEXT)')
+        conn.execute("INSERT INTO \"PG_reports\".secret VALUES (1, 'should-never-be-visible')")
+        conn.execute('GRANT USAGE ON SCHEMA "PG_reports" TO aipa_ro')
+        conn.execute('GRANT SELECT ON ALL TABLES IN SCHEMA "PG_reports" TO aipa_ro')
+
+        conn.execute('CREATE TABLE public."weird.dotted" (id INTEGER, tag TEXT)')
+        conn.execute("INSERT INTO public.\"weird.dotted\" VALUES (1, 'dotted-row')")
+        conn.execute('GRANT SELECT ON public."weird.dotted" TO aipa_ro')
+    try:
+        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "Sales,PG_reports")
+        engine = open_engine(postgres_dsn)
+
+        # No ambiguity in this fixture - the collision check must not fire.
+        names = engine.table_names()
+        # Lowercased for comparison against `names`/`spelling` below, which
+        # are always lowercase - `SchemaChunk.qualified_name` itself is
+        # case-preserving (`"Sales".orders` spells as `"Sales.orders"`), and
+        # this fixture has no collision that lowercasing it here could cause.
+        chunks = {c.qualified_name.lower(): c for c in engine.schema_chunks()}
+        raw = engine.raw_schema().lower()
+
+        # Finding 1: the PG_-prefixed schema is invisible end to end, not
+        # merely rejected at the validator.
+        assert not any("pg_reports" in n for n in names)
+        assert "pg_reports" not in raw
+        assert not is_safe_query('SELECT * FROM "PG_reports".secret', engine=engine)
+
+        # Every other real table: advertised, in schema_chunks(), validates,
+        # and executes to the one sentinel row that identifies it.
+        expectations = {
+            '"Sales".orders': ("sales.orders", "sales-orders-row"),
+            'public."weird.dotted"': ("weird.dotted", "dotted-row"),
+        }
+        for sql_ref, (spelling, sentinel) in expectations.items():
+            assert spelling in names, spelling
+            assert spelling in chunks, spelling
+            sql = f"SELECT tag FROM {sql_ref}"
+            assert is_safe_query(sql, engine=engine), sql
+            rows = engine.execute(sql, max_rows=10, work_limit=0).rows
+            assert rows == [(sentinel,)], (sql_ref, rows)
+
+        # The reverse direction: every advertised spelling maps back to a
+        # real, distinct chunk (trivially true once the two loops above
+        # agree, but checked directly rather than assumed).
+        assert len({id(c) for c in chunks.values()}) == len(chunks)
+    finally:
+        with psycopg.connect(admin, connect_timeout=5, autocommit=True) as conn:
+            _cleanup(conn)

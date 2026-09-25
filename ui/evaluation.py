@@ -58,7 +58,13 @@ def evaluate_cases(
             case["question"],
             top_k=rag_top_k,
         )
-        retrieved_tables = {chunk.table_name for chunk in rag_context.chunks}
+        # `qualified_name`, not the bare `table_name`: two same-named tables
+        # in different schemas would otherwise merge into one entry on a
+        # multi-schema database, understating how many distinct tables were
+        # actually retrieved and skewing `schema_recall` (review finding,
+        # 2026-09-26). A no-op today - every demo database here is
+        # single-schema, where `qualified_name` already equals `table_name`.
+        retrieved_tables = {chunk.qualified_name for chunk in rag_context.chunks}
         schema_recall = (
             round(len(expected_tables & retrieved_tables) / len(expected_tables), 3)
             if expected_tables

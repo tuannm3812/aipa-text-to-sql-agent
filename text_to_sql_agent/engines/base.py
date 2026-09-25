@@ -57,74 +57,6 @@ def extra_schemas_from_env() -> frozenset[str]:
     return frozenset(name.strip() for name in raw.split(",") if name.strip())
 
 
-def table_name_spellings(chunks: Iterable[SchemaChunk], *, default_schema: str) -> frozenset[str]:
-    """Every spelling of every chunk's table that is valid to query, lowercased.
-
-    The one implementation of `Engine.table_names()`'s contract - see that
-    method's docstring for the rule and why the bare/qualified asymmetry is
-    what it is. Shared rather than repeated per engine deliberately: three
-    layers quietly disagreeing about which table names are real is the exact
-    defect `docs/3_decisions.md`'s 2026-09-25 entry recorded, so the rule
-    lives in one place that every engine calls, unlike read-only enforcement
-    (see `Engine`'s own docstring), where the three mechanisms genuinely have
-    nothing in common to factor out.
-
-    Args:
-        chunks: The engine's schema chunks, each carrying its own
-            `schema_name` (empty for the default schema).
-        default_schema: The engine's `default_schema`.
-
-    Returns:
-        Bare *and* `default_schema`-qualified spellings for a default-schema
-        table; the qualified spelling alone for every other table.
-    """
-    names: set[str] = set()
-    for chunk in chunks:
-        bare = chunk.table_name.lower()
-        schema = chunk.schema_name.lower()
-        if schema:
-            names.add(f"{schema}.{bare}")
-        else:
-            names.add(bare)
-            names.add(f"{default_schema.lower()}.{bare}")
-    return frozenset(names)
-
-
-def table_column_spellings(
-    chunks: Iterable[SchemaChunk], *, default_schema: str
-) -> dict[str, frozenset[str]]:
-    """Each queryable table spelling mapped to that table's own columns, lowercased.
-
-    The one implementation of `Engine.table_columns()`'s contract, keyed by
-    exactly the spellings `table_name_spellings` above produces, and shared
-    for the same reason: the validator resolves a qualified column against
-    *one table's* columns, so "which columns does this spelling have" must not
-    drift from "which spellings are real".
-
-    Per-table rather than a flat union deliberately, and that distinction is
-    load-bearing security (2026-09-26): a flat union over every readable
-    schema re-armed the `alias.name` function-call bypass the moment a column
-    anywhere in the database happened to be named after a single-argument
-    catalogue function. See
-    `safety._references_unresolvable_qualified_column`.
-
-    Args:
-        chunks: The engine's schema chunks, each carrying its own
-            `schema_name` (empty for the default schema).
-        default_schema: The engine's `default_schema`.
-
-    Returns:
-        Every spelling in `table_name_spellings(chunks, ...)`, mapped to the
-        lowercased column names of the table it spells.
-    """
-    columns_by_spelling: dict[str, frozenset[str]] = {}
-    for chunk in chunks:
-        columns = frozenset(column.lower() for column in chunk.columns)
-        for spelling in table_name_spellings([chunk], default_schema=default_schema):
-            columns_by_spelling[spelling] = columns
-    return columns_by_spelling
-
-
 class EngineError(Exception):
     """Base class for engine problems the caller is expected to handle."""
 
@@ -170,6 +102,210 @@ class EngineForbiddenError(EngineError):
     redact the text before it reaches the page, so no new catch site was
     needed for this to surface safely rather than as a raw traceback.
     """
+
+
+class AmbiguousTableIdentityError(EngineForbiddenError):
+    """Two distinct real tables would share one lowercased spelling.
+
+    Decision (2026-09-26, review finding 2/4 on the schema-identity
+    boundary). `table_name_spellings`/`table_column_spellings` below
+    lowercase every schema and table name before building the spelling a
+    query must use - deliberately, so a bare `customers` and a quoted
+    `"CUSTOMERS"` both resolve the way every other case-insensitive
+    comparison in `safety.py` already does. That lowercasing is safe only
+    because, on every engine this project shipped before PostgreSQL, two
+    *distinct* real tables could never produce the same lowercased spelling.
+    PostgreSQL breaks that assumption two ways:
+
+    * quoted identifiers are case-sensitive, so `public` and `"Public"` are
+      two different real schemas that fold to the same spelling
+      (`public.customers`) once lowercased - finding 2's live proof;
+    * the qualified-name namespace is a flat, unescaped string, so a table
+      named `"analytics.thing"` inside the default schema and a table
+      `thing` inside a schema named `analytics` both spell as
+      `analytics.thing` - finding 4.
+
+    Silently keeping whichever chunk happened to be seen last (the pre-fix
+    behaviour) means a query naming the *other* table validates and executes
+    against the wrong one - a default-deny gate approving a reference it
+    never meant to advertise, which is wrong regardless of whether today's
+    two colliding tables happen to both be real (finding 4's write-up:
+    "nothing escaped, but... is wrong"). Failing closed here means neither
+    colliding spelling is ever advertised or accepted, on the same
+    fail-closed precedent as `_refuse_if_role_is_overprivileged` in
+    `postgres.py`: an ambiguous config is refused loudly rather than
+    resolved by guessing.
+
+    Raised by `table_name_spellings`/`table_column_spellings`, so it
+    surfaces through `Engine.table_names()`/`Engine.table_columns()` and
+    from there through `safety.is_safe_query` (called from inside
+    `_references_unknown_table`/`_references_unresolvable_qualified_column`).
+    Every call site of `is_safe_query` in `pipeline.py` sits inside, or one
+    frame below, a broad `except Exception` (see `EngineForbiddenError`'s own
+    docstring for the equivalent propagation path DuckDB/PostgreSQL's other
+    fail-closed errors already take), so this still surfaces as a redacted
+    message rather than a raw traceback - it does not need its own catch
+    site.
+    """
+
+    def __init__(self, spelling: str, first: SchemaChunk, second: SchemaChunk) -> None:
+        """Build the message from the colliding spelling and the two chunks it names.
+
+        Args:
+            spelling: The lowercased spelling both chunks would share.
+            first: The chunk that already owned `spelling`.
+            second: The chunk that just collided with it.
+        """
+        super().__init__(
+            f"{spelling!r} would refer ambiguously to both "
+            f"{first.qualified_name!r} and {second.qualified_name!r} once "
+            "case-folded - refusing to advertise or accept either spelling. "
+            "Rename one of the two tables so their spellings no longer collide."
+        )
+        self.spelling = spelling
+        self.first = first
+        self.second = second
+
+
+def _spellings_with_identity(
+    chunks: Iterable[SchemaChunk], *, default_schema: str
+) -> dict[str, SchemaChunk]:
+    """Every valid, lowercased spelling mapped to the one chunk it must mean.
+
+    The shared engine of `table_name_spellings` and `table_column_spellings`
+    below - computed once so the two agree by construction rather than by
+    each re-deriving the same spellings and hoping they line up, and so the
+    collision check below runs exactly once per schema read.
+
+    Raises:
+        AmbiguousTableIdentityError: If a spelling this loop is about to
+            record already belongs to a *different* chunk (different
+            `(schema_name, table_name)`, exact case). Two spellings coming
+            from the *same* chunk - a default-schema table's bare and
+            qualified forms - are never a collision; they are the documented
+            dual-spelling contract `table_name_spellings` implements.
+    """
+    owners: dict[str, SchemaChunk] = {}
+    for chunk in chunks:
+        bare = chunk.table_name.lower()
+        schema = chunk.schema_name.lower()
+        spellings = [f"{schema}.{bare}"] if schema else [bare, f"{default_schema.lower()}.{bare}"]
+        for spelling in spellings:
+            existing = owners.get(spelling)
+            if existing is not None and (
+                existing.schema_name,
+                existing.table_name,
+            ) != (chunk.schema_name, chunk.table_name):
+                raise AmbiguousTableIdentityError(spelling, existing, chunk)
+            owners[spelling] = chunk
+    return owners
+
+
+def table_name_spellings(chunks: Iterable[SchemaChunk], *, default_schema: str) -> frozenset[str]:
+    """Every spelling of every chunk's table that is valid to query, lowercased.
+
+    The one implementation of `Engine.table_names()`'s contract - see that
+    method's docstring for the rule and why the bare/qualified asymmetry is
+    what it is. Shared rather than repeated per engine deliberately: three
+    layers quietly disagreeing about which table names are real is the exact
+    defect `docs/3_decisions.md`'s 2026-09-25 entry recorded, so the rule
+    lives in one place that every engine calls, unlike read-only enforcement
+    (see `Engine`'s own docstring), where the three mechanisms genuinely have
+    nothing in common to factor out.
+
+    Args:
+        chunks: The engine's schema chunks, each carrying its own
+            `schema_name` (empty for the default schema).
+        default_schema: The engine's `default_schema`.
+
+    Returns:
+        Bare *and* `default_schema`-qualified spellings for a default-schema
+        table; the qualified spelling alone for every other table.
+
+    Raises:
+        AmbiguousTableIdentityError: See `_spellings_with_identity`.
+    """
+    return frozenset(_spellings_with_identity(chunks, default_schema=default_schema))
+
+
+def table_column_spellings(
+    chunks: Iterable[SchemaChunk], *, default_schema: str
+) -> dict[str, frozenset[str]]:
+    """Each queryable table spelling mapped to that table's own columns, lowercased.
+
+    The one implementation of `Engine.table_columns()`'s contract, keyed by
+    exactly the spellings `table_name_spellings` above produces (both now
+    built from the same `_spellings_with_identity` pass, so the two cannot
+    drift), and shared for the same reason: the validator resolves a
+    qualified column against *one table's* columns, so "which columns does
+    this spelling have" must not drift from "which spellings are real".
+
+    Per-table rather than a flat union deliberately, and that distinction is
+    load-bearing security (2026-09-26): a flat union over every readable
+    schema re-armed the `alias.name` function-call bypass the moment a column
+    anywhere in the database happened to be named after a single-argument
+    catalogue function. See
+    `safety._references_unresolvable_qualified_column`.
+
+    Args:
+        chunks: The engine's schema chunks, each carrying its own
+            `schema_name` (empty for the default schema).
+        default_schema: The engine's `default_schema`.
+
+    Returns:
+        Every spelling in `table_name_spellings(chunks, ...)`, mapped to the
+        lowercased column names of the table it spells.
+
+    Raises:
+        AmbiguousTableIdentityError: See `_spellings_with_identity`.
+    """
+    owners = _spellings_with_identity(chunks, default_schema=default_schema)
+    return {
+        spelling: frozenset(column.lower() for column in chunk.columns)
+        for spelling, chunk in owners.items()
+    }
+
+
+def is_internal_schema_name(
+    name: str, *, internal_prefixes: tuple[str, ...], internal_names: frozenset[str]
+) -> bool:
+    """True if `name` is one of the engine's own internal schemas, case-insensitively.
+
+    Decision (2026-09-26, review finding 1). `safety._references_internals`
+    lowercases a query's schema qualifier before comparing it against an
+    engine's `internal_prefixes`/`internal_names` - deliberately, so
+    `"PG_evil".t` is refused exactly as `pg_evil.t` would be. Before this
+    function existed, nothing on the *engine* side made the same comparison
+    when deciding which schemas to read: `PostgresEngine._user_schema_names`
+    and `DuckDBEngine._allowed_schemas` matched only the exact literal
+    strings `"information_schema"`/`"pg_catalog"` (or, for PostgreSQL,
+    nothing at all beyond the operator-supplied candidate list). A schema
+    genuinely named `PG_evil` or `Information_Schema` - whether it exists in
+    the target database or was merely opted into via `AIPA_EXTRA_SCHEMAS` -
+    was therefore read into `raw_schema()` and `table_names()` and then
+    permanently rejected by `safety.py`'s case-insensitive check: advertised
+    to the model, refused by the validator, the exact layer-disagreement
+    `docs/3_decisions.md`'s 2026-09-25 entry closed in the opposite
+    direction. Both sides must apply the identical comparison - this
+    function *is* that comparison, called from each engine's own schema-scope
+    filtering (`PostgresEngine._user_schema_names`,
+    `DuckDBEngine._allowed_schemas`) so a schema `safety.py` would refuse to
+    let a query reference is never read in the first place.
+
+    Args:
+        name: A candidate schema name, in whatever case it was spelled -
+            by an operator in `AIPA_EXTRA_SCHEMAS`, or by the database's own
+            catalogue.
+        internal_prefixes: The engine's `Engine.internal_prefixes`.
+        internal_names: The engine's `Engine.internal_names`.
+
+    Returns:
+        True if `name`, lowercased, is in `internal_names` or starts with
+        one of `internal_prefixes` - the same test `_references_internals`
+        applies to a query's schema qualifier.
+    """
+    lowered = name.lower()
+    return lowered in internal_names or lowered.startswith(internal_prefixes)
 
 
 @runtime_checkable
@@ -292,6 +428,12 @@ class Engine(Protocol):
         it: it means the default schema's table or nothing, which is what the
         engine's own search path does. `analytics.shared` and `main.shared`
         coexist here as two distinct entries.
+
+        Raises:
+            AmbiguousTableIdentityError: If two distinct real tables would
+                share one lowercased spelling once case-folded - only
+                reachable on an engine with case-sensitive quoted
+                identifiers (PostgreSQL). See that error's own docstring.
         """
         ...
 
@@ -318,5 +460,8 @@ class Engine(Protocol):
         SQLite and DuckDB never reach it in practice. Implementations should
         reuse `schema.py`'s fingerprint-keyed schema-chunk cache the same way
         `table_names()` does - the two read the same chunks.
+
+        Raises:
+            AmbiguousTableIdentityError: See `table_names()`.
         """
         ...
