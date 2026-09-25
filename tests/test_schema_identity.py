@@ -68,11 +68,19 @@ def _as_postgres_superuser(dsn: str) -> str:
 
 
 @pytest.fixture(params=["sqlite", "duckdb", "postgres"])
-def case(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[_Case]:
+def case(
+    request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[_Case]:
     """A database holding `customers` in the default schema.
 
     For every engine whose DSN model admits one, it also holds
     `analytics.thing`, a table that exists *only* outside the default schema.
+    Schema scope became opt-in after this fixture was written (owner
+    decision, 2026-09-26), so `monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", ...)`
+    opts `analytics` in before either engine is constructed - without it,
+    every test below that relies on `analytics.thing` existing would instead
+    be proving the opt-in default (invisible), not the identity contract this
+    module exists to pin.
 
     `thing.lo_get` is named after a single-argument PostgreSQL catalogue
     function deliberately (added 2026-09-26): it is what arms the
@@ -101,6 +109,7 @@ def case(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[_Case]:
         con.execute(f"CREATE TABLE {OTHER_SCHEMA}.thing (label VARCHAR, lo_get INTEGER)")
         con.execute(f"INSERT INTO {OTHER_SCHEMA}.thing VALUES ('only-here', 1)")
         con.close()
+        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", OTHER_SCHEMA)
         yield _Case(engine=open_engine(f"duckdb://{db}"), other_schema=OTHER_SCHEMA)
         return
 
@@ -117,6 +126,7 @@ def case(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[_Case]:
             conn.execute(f"GRANT USAGE ON SCHEMA {OTHER_SCHEMA} TO aipa_ro")
             conn.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA {OTHER_SCHEMA} TO aipa_ro")
         try:
+            monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", OTHER_SCHEMA)
             yield _Case(engine=open_engine(dsn), other_schema=OTHER_SCHEMA)
         finally:
             # The container outlives the test, unlike tmp_path, so this schema

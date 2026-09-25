@@ -26,18 +26,30 @@ because `safety.py` accepted no other qualifier and advertising a table the
 validator would reject is exactly the inversion `docs/3_decisions.md`'s
 2026-09-25 entry closed for DuckDB. Task 6 removed that constraint at its
 source: the validator now takes its schema rule from `table_names()`, so
-`_user_schema_names` below reads **every** schema this role can actually use
-(never `pg_catalog`, `information_schema` or any other `pg_*`), and each
+`_user_schema_names` below could read every schema this role can actually
+use (never `pg_catalog`, `information_schema` or any other `pg_*`), and each
 table keeps its schema through `SchemaChunk.schema_name` all the way to the
 validator. Task 5's keying is what made that a widening rather than a
 rewrite: `_fetch_columns`/`_fetch_primary_keys`/`_fetch_foreign_keys` were
 already keyed by `(schema_name, table_name)`, never bare `table_name` - what
 a bare-name key does the moment two schemas share a table name is the live
 `BinderException` the 2026-09-25 DuckDB review found - and already took a
-list of schema names, so Task 6 widens that list and touches nothing else in
+list of schema names, so Task 6 widened that list and touched nothing else in
 them. The value-hint query has always qualified its table reference
 (`_quote_qualified`), so it resolves to the table asked for rather than to
 whatever `search_path` finds first.
+
+A 2026-09-26 owner decision narrowed Task 6's "every schema this role can
+read" to an opt-in: `_user_schema_names` now reads `default_schema` plus only
+what `engines/base.py`'s `extra_schemas_from_env()` (`AIPA_EXTRA_SCHEMAS`)
+names, still gated by `has_schema_privilege` - see that function's own
+docstring. The same owner decision added `_refuse_if_role_is_overprivileged`,
+called from `check_reachable()`: PostgreSQL's defence against reading host
+files (see the module's own first paragraph) is entirely a matter of how the
+connecting role was provisioned, unlike DuckDB's engine-enforced
+`enable_external_access=False`, so this engine now checks that at connect
+time and refuses with `EngineForbiddenError` rather than trusting every
+deployment to have provisioned its role correctly.
 """
 
 from __future__ import annotations
@@ -56,7 +68,13 @@ from ..config import (
     DEFAULT_WORK_LIMIT_MS,
 )
 from ..types import QueryResult, SchemaChunk
-from .base import EngineUnreachableError, table_column_spellings, table_name_spellings
+from .base import (
+    EngineForbiddenError,
+    EngineUnreachableError,
+    extra_schemas_from_env,
+    table_column_spellings,
+    table_name_spellings,
+)
 
 _CONNECT_TIMEOUT_SECONDS = 5
 
@@ -85,6 +103,78 @@ def _connect_read_only(dsn: str) -> psycopg.Connection[tuple[Any, ...]]:
     return conn
 
 
+# Decision (2026-09-26): PostgreSQL fails closed on an over-privileged role.
+# DuckDB's defence against reading host files is `enable_external_access=
+# False`, a connection setting the engine itself sets - see `duckdb.py`'s
+# module docstring. PostgreSQL has no equivalent flag: `pg_read_file`,
+# `COPY ... TO/FROM PROGRAM` and every other host-filesystem or
+# program-execution built-in are refused only because `aipa_ro` was never
+# granted membership in `pg_read_server_files`, `pg_write_server_files` or
+# `pg_execute_server_program` (`docker/postgres-init.sql`, and
+# `test_engine_postgres.py`'s Task 3 probes, which proved every one of those
+# built-ins refused for exactly that reason). That defence lives entirely in
+# how a deployment provisions its role - nothing here enforces it - so a
+# misconfigured deployment (or a plain `postgres` superuser DSN pasted into
+# the "Connection string" sidebar field) would otherwise connect successfully
+# and get no filesystem protection at all, with no error naming why. Checked
+# once, at `check_reachable()`, rather than on every `execute()`: the role
+# does not change between queries on the same DSN, and repeating a role-
+# introspection query per query would cost real latency for a property that
+# is fixed for the life of a connection string.
+_OVERPRIVILEGED_ROLE_MEMBERSHIPS: tuple[str, ...] = (
+    "pg_read_server_files",
+    "pg_write_server_files",
+    "pg_execute_server_program",
+)
+
+
+def _refuse_if_role_is_overprivileged(conn: psycopg.Connection[tuple[Any, ...]]) -> None:
+    """Refuse to proceed if the connecting role could reach the host filesystem.
+
+    Args:
+        conn: An open connection - any role. Reads `pg_roles` only, which
+            every role may read about itself (`current_user`'s own row).
+
+    Raises:
+        EngineForbiddenError: Naming which condition(s) held (superuser
+            status and/or the specific role membership) and what the role
+            should look like instead. Never includes the DSN
+            (`docs/0_coding_standards.md` §4's credential rule) - only
+            `current_user`'s name, which carries no password - so this is
+            safe to surface directly to a user, matching `check_reachable`'s
+            own existing redaction discipline.
+    """
+    row = conn.execute(
+        "SELECT rolname, rolsuper, "
+        "pg_has_role(rolname, 'pg_read_server_files', 'MEMBER'), "
+        "pg_has_role(rolname, 'pg_write_server_files', 'MEMBER'), "
+        "pg_has_role(rolname, 'pg_execute_server_program', 'MEMBER') "
+        "FROM pg_roles WHERE rolname = current_user"
+    ).fetchone()
+    if row is None:
+        return
+    rolname, is_superuser, *memberships = row
+
+    reasons: list[str] = []
+    if is_superuser:
+        reasons.append("is a superuser")
+    for name, held in zip(_OVERPRIVILEGED_ROLE_MEMBERSHIPS, memberships, strict=True):
+        if held:
+            reasons.append(f"holds {name}")
+    if not reasons:
+        return
+
+    raise EngineForbiddenError(
+        f"PostgreSQL role {rolname!r} {', '.join(reasons)} - refusing to "
+        "connect, because that role could read or write files on the "
+        "PostgreSQL server regardless of what this agent's own SQL "
+        "validator refuses. The connecting role must be a non-superuser "
+        "holding none of pg_read_server_files, pg_write_server_files or "
+        "pg_execute_server_program - see docker/postgres-init.sql's "
+        "aipa_ro role for one provisioned correctly."
+    )
+
+
 def _quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
@@ -93,30 +183,47 @@ def _quote_qualified(schema_name: str, table_name: str) -> str:
     return _quote_identifier(schema_name) + "." + _quote_identifier(table_name)
 
 
-def _user_schema_names(conn: psycopg.Connection[tuple[Any, ...]]) -> list[str]:
-    """Every schema this connection's role may use, PostgreSQL's own excluded.
+def _user_schema_names(
+    conn: psycopg.Connection[tuple[Any, ...]],
+    *,
+    default_schema: str,
+    extra_schemas: frozenset[str],
+) -> list[str]:
+    """This role's `default_schema` plus its opted-in, privileged extras.
+
+    Decision (2026-09-26): schema scope is opt-in, not "every schema this
+    role can read". Task 6 read every schema `has_schema_privilege` allowed,
+    which means a deployment that granted `aipa_ro` `USAGE` on a staging or
+    PII schema for some unrelated tool would have that schema's tables,
+    columns and DDL silently sent to the LLM provider. Reading is now
+    restricted to `default_schema` and whatever `engines/base.py`'s
+    `extra_schemas_from_env()` (`AIPA_EXTRA_SCHEMAS`) names - candidates the
+    caller supplies, not a value this function reads itself, so a single
+    engine instance's opt-in set is fixed for its lifetime rather than
+    re-read per catalogue query.
 
     `pg_catalog`, `pg_toast`, any `pg_temp_*`/`pg_toast_temp_*` and
     `information_schema` are PostgreSQL's internals, not the user's data, and
-    `safety.py` refuses a reference into them by name whatever this returns
+    were never reachable through this function even before this change - the
+    candidate list this filters is `default_schema` plus `extra_schemas`
+    alone, never "every `nspname`", so there is no separate exclusion left to
+    state; `safety.py` refuses a reference into them by name regardless
     (`internal_prefixes = ("pg_",)`, `internal_names = {"information_
-    schema"}`). Reading them here would therefore advertise to the model
-    exactly the tables the validator is guaranteed to reject - the
-    "advertised then blocked" inversion `docs/3_decisions.md`'s 2026-09-25
-    entry exists to prevent - so the exclusion is part of the identity
-    contract, not a tidiness preference.
+    schema"}`).
 
-    `has_schema_privilege` is what keeps the rest honest: `aipa_ro` is a
-    least-privilege role, and a schema it holds no `USAGE` on is one whose
-    tables it could not read even if they were advertised. Asking the
-    catalogue rather than assuming `public` is what makes this engine work
-    against a real database whose tables live in several schemas.
+    `has_schema_privilege` is still what keeps the rest honest: `aipa_ro` is
+    a least-privilege role, and a schema it holds no `USAGE` on is one whose
+    tables it could not read even if opted in - naming a schema in
+    `AIPA_EXTRA_SCHEMAS` does not by itself grant access to it. A schema that
+    is opted in but not granted, or granted but not opted in, is absent
+    either way; only the intersection is read.
     """
+    candidates = [default_schema, *sorted(extra_schemas)]
     rows = conn.execute(
         "SELECT nspname FROM pg_namespace "
-        "WHERE nspname <> 'information_schema' AND nspname NOT LIKE 'pg\\_%' "
-        "AND has_schema_privilege(nspname, 'USAGE') "
-        "ORDER BY nspname"
+        "WHERE nspname = ANY(%s) AND has_schema_privilege(nspname, 'USAGE') "
+        "ORDER BY nspname",
+        (candidates,),
     ).fetchall()
     return [name for (name,) in rows]
 
@@ -571,16 +678,35 @@ class PostgresEngine:
             dsn: A `postgresql://` or `postgres://` URL, scheme included.
         """
         self.dsn = dsn
+        # See `engines/base.py::extra_schemas_from_env` and `_user_schema_
+        # names` above - read once here so this instance's scope is fixed
+        # for its whole lifetime.
+        self.extra_schemas: frozenset[str] = extra_schemas_from_env()
 
     def check_reachable(self) -> None:
-        """Raise `EngineUnreachableError` if the server cannot be reached.
+        """Raise if the server cannot be reached, or the role is too privileged.
 
-        The message never includes `self.dsn` - it carries a password. Only
-        the exception's class name is reported.
+        Two independent failure modes, two exception types:
+
+        * `EngineUnreachableError` if the connection itself fails - wrong
+          host, wrong credentials, server down. The message never includes
+          `self.dsn` - it carries a password. Only the exception's class
+          name is reported.
+        * `EngineForbiddenError` (2026-09-26 decision) if the connection
+          succeeds but the connecting role is a superuser or holds
+          `pg_read_server_files`, `pg_write_server_files` or
+          `pg_execute_server_program` - see `_refuse_if_role_is_
+          overprivileged` for why this engine checks that at all. Re-raised
+          before the broad `except Exception` below can wrap it into an
+          `EngineUnreachableError`, which would misdescribe "reachable but
+          refused" as "unreachable."
         """
         try:
             with psycopg.connect(self.dsn, connect_timeout=_CONNECT_TIMEOUT_SECONDS) as conn:
                 conn.execute("SELECT 1")
+                _refuse_if_role_is_overprivileged(conn)
+        except EngineForbiddenError:
+            raise
         except Exception as exc:
             raise EngineUnreachableError(
                 f"cannot connect to PostgreSQL: {type(exc).__name__}"
@@ -648,8 +774,8 @@ class PostgresEngine:
     def raw_schema(self) -> str:
         """Extract synthesised `CREATE TABLE` statements for every readable table.
 
-        Every schema this role may use, not `public` alone - see
-        `_user_schema_names`. A table outside `public` is written
+        `default_schema` plus whatever is opted into via `AIPA_EXTRA_SCHEMAS`
+        - see `_user_schema_names`. A table outside `public` is written
         schema-qualified (`_display_table`), which is both how a query must
         spell it and how `table_names()` advertises it, so nothing is shown
         here that the validator would refuse.
@@ -666,7 +792,9 @@ class PostgresEngine:
             and separated by blank lines, ordered by schema then table name.
         """
         with _connect_read_only(self.dsn) as conn:
-            schema_names = _user_schema_names(conn)
+            schema_names = _user_schema_names(
+                conn, default_schema=self.default_schema, extra_schemas=self.extra_schemas
+            )
             columns_by_table = _fetch_columns(conn, schema_names)
             pk_by_table = _fetch_primary_keys(conn, schema_names)
             fk_by_table = _fetch_foreign_keys(conn, schema_names)
@@ -685,7 +813,8 @@ class PostgresEngine:
     def schema_chunks(self) -> list[SchemaChunk]:
         """Build table-level schema chunks for retrieval without reading row data.
 
-        Covers every schema this role may use - see `_user_schema_names`.
+        Covers `default_schema` plus whatever is opted into via
+        `AIPA_EXTRA_SCHEMAS` - see `_user_schema_names`.
         `_fetch_columns`/`_fetch_primary_keys`/`_fetch_foreign_keys` key
         everything by `(schema, table)` rather than bare `table_name`, which
         is what makes that widening safe: two schemas sharing a table name
@@ -701,7 +830,9 @@ class PostgresEngine:
         uses - see `raw_schema()`'s docstring for why.
         """
         with _connect_read_only(self.dsn) as conn:
-            schema_names = _user_schema_names(conn)
+            schema_names = _user_schema_names(
+                conn, default_schema=self.default_schema, extra_schemas=self.extra_schemas
+            )
             columns_by_table = _fetch_columns(conn, schema_names)
             pk_by_table = _fetch_primary_keys(conn, schema_names)
             fk_by_table = _fetch_foreign_keys(conn, schema_names)
@@ -772,11 +903,25 @@ class PostgresEngine:
         hashed columns alone, so adding or dropping a foreign key with no
         column-level change went unnoticed by the cache.
 
+        The returned tuple's second element (2026-09-26) is `self.extra_
+        schemas` itself, sorted - not merely implied by `schema_names`
+        changing. `schema_names` is the *effective* (opted-in AND
+        privileged) set; opting a schema in that the role cannot use leaves
+        `schema_names` unchanged, so hashing only `schema_names` would let a
+        config change that has no visible effect skip invalidation, which is
+        correct, but a config change from one *usable* opt-in set to another
+        must always invalidate even in the edge case where both sets happen
+        to resolve to the same usable schemas today and diverge only once a
+        grant changes later - included directly rather than relying on that
+        coincidence.
+
         Reads through `_connect_read_only`, the same connection `execute()`
         uses - see `raw_schema()`'s docstring for why.
         """
         with _connect_read_only(self.dsn) as conn:
-            schema_names = _user_schema_names(conn)
+            schema_names = _user_schema_names(
+                conn, default_schema=self.default_schema, extra_schemas=self.extra_schemas
+            )
             column_rows = conn.execute(
                 "SELECT table_schema, table_name, column_name, data_type, "
                 "is_nullable, ordinal_position "
@@ -809,7 +954,7 @@ class PostgresEngine:
             ).fetchall()
         digest_input = repr((schema_names, column_rows, fk_rows))
         digest = hashlib.sha256(digest_input.encode()).hexdigest()
-        return (self.default_schema, digest)
+        return (self.default_schema, tuple(sorted(self.extra_schemas)), digest)
 
     def table_names(self) -> frozenset[str]:
         """Every valid spelling of every user table, lowercased, via the cache.
@@ -840,10 +985,11 @@ class PostgresEngine:
         `name(alias)` function-call sugar. PostgreSQL is the only engine
         that actually reaches it.
 
-        Per table, not unioned across tables: this engine reads every schema
-        the role may use, so a union is a union over every readable schema,
-        which is precisely what re-armed that sugar as a bypass on 2026-09-26
-        (a column named `lo_get` in any readable schema was enough). See
+        Per table, not unioned across tables: this engine reads `default_
+        schema` plus every opted-in extra (`_user_schema_names`), so a union
+        is still a union over more than one table's columns, which is
+        precisely what re-armed that sugar as a bypass on 2026-09-26 (a
+        column named `lo_get` in any readable schema was enough). See
         `Engine.table_columns` and `base.table_column_spellings`.
 
         Routed through `schema.get_schema_chunks` so it shares the same

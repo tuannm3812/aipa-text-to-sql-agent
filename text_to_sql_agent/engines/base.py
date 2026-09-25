@@ -2,10 +2,59 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping
 from typing import Protocol, runtime_checkable
 
 from ..types import QueryResult, SchemaChunk
+
+# Decision (2026-09-26): schema scope is opt-in, not automatic. Phase 3b Task
+# 6 widened DuckDB and PostgreSQL from reading only their own default schema
+# (`main`/`public`) to every schema the connecting role can read - which
+# means every such schema's table names, columns and DDL are sent to the LLM
+# provider. A deployment may have granted its read-only role `USAGE` on a
+# staging or PII schema for some unrelated tool, and that must not silently
+# become LLM-visible just because this agent happened to widen its own
+# catalogue read. `AIPA_EXTRA_SCHEMAS` is the opt-in: a comma-separated list
+# of schema names to read *in addition to* the engine's own default schema.
+# Unset or empty opts into nothing, which is the safe default - both engines'
+# `__init__` read it once via `extra_schemas_from_env()` below, mirroring how
+# `ui/secrets.py`'s `active_gemini_key` reads `GEMINI_API_KEY` straight from
+# `os.environ` rather than through a threaded setting; `open_engine(dsn)`
+# takes only a DSN, and neither `ui/settings.py`'s `Settings` nor the sidebar
+# carries any other per-engine configuration today, so adding a second
+# constructor parameter (and plumbing it through every `open_engine` call
+# site and the DSN string itself) would be new surface for something an
+# operator sets once per deployment, not once per question. A DSN-level query
+# parameter was ruled out for the same reason `redact_dsn` exists at all: a
+# DSN is already sensitive text handled as a single opaque credential-bearing
+# string everywhere in this codebase (`ui/uploads.py`, `dsn.py`), and folding
+# scope configuration into it would mean redaction, logging and the "Using
+# `<dsn>`" sidebar caption all need to start parsing it apart again.
+_EXTRA_SCHEMAS_ENV_VAR = "AIPA_EXTRA_SCHEMAS"
+
+
+def extra_schemas_from_env() -> frozenset[str]:
+    """Schema names opted into beyond an engine's own default schema.
+
+    Reads `AIPA_EXTRA_SCHEMAS` fresh on every call (not cached at import
+    time) so a test can set it with `monkeypatch.setenv` and a redeployment
+    can change it without restarting a long-lived process; each engine reads
+    it once, in its own `__init__`, so one engine instance's scope stays
+    fixed for its whole lifetime even if the variable changes mid-process.
+    Blank entries and surrounding whitespace are dropped. Still gated by
+    each engine's own privilege check where one exists - `PostgresEngine`'s
+    `_user_schema_names` only ever reads a schema this names *and* the
+    connecting role holds `USAGE` on; naming a schema here does not by
+    itself grant access to it.
+
+    Returns:
+        The opted-in schema names, exactly as spelled in the environment
+        variable. Empty when the variable is unset or blank, which is the
+        safe default: only the engine's own default schema is read.
+    """
+    raw = os.environ.get(_EXTRA_SCHEMAS_ENV_VAR, "")
+    return frozenset(name.strip() for name in raw.split(",") if name.strip())
 
 
 def table_name_spellings(chunks: Iterable[SchemaChunk], *, default_schema: str) -> frozenset[str]:
@@ -90,6 +139,36 @@ class EngineUnreachableError(EngineError, FileNotFoundError):
     Also inherits `FileNotFoundError` so pipeline callers that historically
     raised `FileNotFoundError("input database not found")` keep that
     documented contract for any caller that still catches it specifically.
+    """
+
+
+class EngineForbiddenError(EngineError):
+    """The engine's target is reachable, but refuses to proceed on safety grounds.
+
+    Decision (2026-09-26): distinct from `EngineUnreachableError` - the
+    target answered, so "unreachable" would be wrong, and this deliberately
+    does **not** also inherit `FileNotFoundError` the way that class does.
+    `EngineUnreachableError`'s `FileNotFoundError` inheritance exists so a
+    caller that historically checked for a missing file keeps working; there
+    is no equivalent legacy contract for "reachable but refused," and
+    claiming one would misdescribe the failure to any caller that branches on
+    `FileNotFoundError` specifically.
+
+    Raised by `PostgresEngine.check_reachable()` when the connecting role is
+    a superuser or holds `pg_read_server_files`, `pg_write_server_files` or
+    `pg_execute_server_program` - see that method for why PostgreSQL alone
+    needs a role-provisioning check at connect time: its defence against
+    reading host files rests entirely on how the role was provisioned,
+    unlike DuckDB's `enable_external_access=False`, which the connection
+    itself enforces regardless of how the DuckDB file was opened.
+
+    `pipeline.ask_database`/`ask_database_with_sql` call
+    `engine.check_reachable()` before their own `try` block (the same place
+    `EngineUnreachableError` is raised from), so this propagates to their
+    caller the same way - `ui/chat.py`'s `_run_query` and `ui/sidebar.py`'s
+    `active_db_path` call already catch bare `Exception` around that call and
+    redact the text before it reaches the page, so no new catch site was
+    needed for this to surface safely rather than as a raw traceback.
     """
 
 

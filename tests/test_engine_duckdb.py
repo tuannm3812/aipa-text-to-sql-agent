@@ -1317,14 +1317,21 @@ def test_cte_scoping_fix_is_load_bearing(monkeypatch, engine_with_table_t):
 
 
 @pytest.fixture
-def cross_schema_duplicate_name_db(tmp_path):
+def cross_schema_duplicate_name_db(tmp_path, monkeypatch):
     """`main.shared` and `analytics.shared`, same table name, disjoint columns.
 
     Reproduces the reviewer's live probe: a value-hint query for
     `analytics.shared`'s `analytics_only` column, issued unqualified, resolves
     to `main.shared` (found first on the default search path) and raises
     `duckdb.BinderException` because that column does not exist there.
+
+    Schema scope became opt-in after this fixture was written (owner
+    decision, 2026-09-26): DuckDB has no privilege model to fall back on, so
+    `AIPA_EXTRA_SCHEMAS` is the only gate on `analytics` being read at all.
+    `monkeypatch.setenv` here opts it in so the fixture still reproduces the
+    scenario it was built for, rather than the schema simply being invisible.
     """
+    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "analytics")
     db = tmp_path / "dup.duckdb"
     con = duckdb.connect(str(db))
     con.execute("CREATE TABLE main.shared (main_only INTEGER)")
@@ -1377,7 +1384,7 @@ def test_duplicate_table_name_across_schemas_does_not_crash_schema_building(
 
 
 @pytest.fixture
-def non_main_schema_only_db(tmp_path):
+def non_main_schema_only_db(tmp_path, monkeypatch):
     """`analytics.sales` exists; `main.sales` does not.
 
     Reproduces the reviewer's second failure: before the 2026-09-25 fix,
@@ -1385,7 +1392,11 @@ def non_main_schema_only_db(tmp_path):
     returned it, but the validator (`main`-only) rejected the qualified query
     the model should have needed and, after wrongly approving the unqualified
     form, the query failed against the real database anyway.
+
+    Opts `analytics` in via `AIPA_EXTRA_SCHEMAS` - see `cross_schema_
+    duplicate_name_db`'s docstring for why, now that schema scope is opt-in.
     """
+    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "analytics")
     db = tmp_path / "nonmain.duckdb"
     con = duckdb.connect(str(db))
     con.execute("CREATE SCHEMA analytics")
@@ -1426,6 +1437,60 @@ def test_table_outside_main_is_advertised_and_accepted_only_when_qualified(
     assert not is_safe_query("SELECT amt FROM sales", engine=engine)
     with pytest.raises(duckdb.CatalogException):
         engine.execute("SELECT amt FROM sales", max_rows=10, work_limit=0)
+
+
+# --- Schema scope is opt-in (2026-09-26 owner decision) ---------------------
+#
+# DuckDB has no privilege model the way PostgreSQL does (`_user_schema_names`,
+# `has_schema_privilege`) - opening the file grants access to every schema in
+# it - so `AIPA_EXTRA_SCHEMAS` is the *only* gate here, not a second one
+# alongside a grant check. `non_main_schema_only_db`/
+# `cross_schema_duplicate_name_db` above already prove the opted-in case
+# (they opt `analytics` in via `monkeypatch.setenv`); these prove the default
+# (not opted in) and the cache-invalidation half.
+
+
+def test_a_schema_outside_main_is_not_advertised_without_opting_in(tmp_path, monkeypatch):
+    """The safe default: a schema nobody opted into is invisible everywhere
+    and a qualified query against it is refused, even though nothing in
+    DuckDB itself would stop the read - unlike PostgreSQL, there is no grant
+    for a deployment to have forgotten; the opt-in is the whole guard.
+    """
+    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    db = tmp_path / "not_opted_in.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE SCHEMA analytics")
+    con.execute("CREATE TABLE analytics.sales (amt INTEGER)")
+    con.execute("INSERT INTO analytics.sales VALUES (10)")
+    con.close()
+
+    engine = open_engine(f"duckdb://{db}")
+    assert "sales" not in engine.raw_schema()
+    assert "analytics.sales" not in engine.table_names()
+    assert {c.table_name for c in engine.schema_chunks()} == set()
+    assert not is_safe_query("SELECT amt FROM analytics.sales", engine=engine)
+
+
+def test_duckdb_schema_fingerprint_changes_when_the_opted_in_set_changes(tmp_path, monkeypatch):
+    """`AIPA_EXTRA_SCHEMAS` is process configuration the DuckDB file itself
+    never records, so neither its mtime nor its size changes when the opt-in
+    set does - see `DuckDBEngine.schema_fingerprint`'s docstring for why the
+    config is hashed in directly rather than relying on the file to reflect
+    it. Without this, `schema.py`'s cache would keep serving the pre-change
+    schema to a process whose opt-in set had already changed.
+    """
+    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    db = tmp_path / "fingerprint_opt_in.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE SCHEMA analytics")
+    con.execute("CREATE TABLE analytics.sales (amt INTEGER)")
+    con.close()
+
+    before = open_engine(f"duckdb://{db}").schema_fingerprint()
+    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "analytics")
+    after = open_engine(f"duckdb://{db}").schema_fingerprint()
+
+    assert after != before
 
 
 def test_duckdb_default_work_limit_is_5000_ms() -> None:

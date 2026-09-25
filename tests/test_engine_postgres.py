@@ -129,6 +129,98 @@ def test_check_reachable_message_never_contains_the_dsn() -> None:
     assert dsn not in message
 
 
+# --- Fail closed on an over-privileged role (2026-09-26 owner decision) -----
+#
+# PostgreSQL has no connection-level flag equivalent to DuckDB's
+# `enable_external_access=False` (`duckdb.py`'s module docstring); its
+# defence against `pg_read_file`, `COPY ... TO/FROM PROGRAM` and the rest of
+# the filesystem/program surface proven refused above rests entirely on how
+# the connecting role was provisioned. `check_reachable()` now checks that at
+# connect time and refuses with `EngineForbiddenError` rather than trusting
+# every deployment to have gotten `docker/postgres-init.sql`'s shape right.
+
+
+def test_check_reachable_refuses_a_superuser_dsn(postgres_dsn: str) -> None:
+    """A superuser DSN must be refused with a clear message and no DSN in it.
+
+    `_as_postgres_superuser` swaps in the compose file's `postgres`
+    superuser - the same substitution the role-isolation tests at the top of
+    this module use for setup, applied here as the thing under test instead.
+    """
+    from text_to_sql_agent.engines.base import EngineForbiddenError
+
+    su_dsn = _as_postgres_superuser(postgres_dsn)
+    engine = PostgresEngine(su_dsn)
+
+    with pytest.raises(EngineForbiddenError) as caught:
+        engine.check_reachable()
+
+    message = str(caught.value)
+    assert "postgres:postgres" not in message
+    assert su_dsn not in message
+    assert "superuser" in message
+    assert "aipa_ro" in message  # names what the role should look like
+
+
+def test_check_reachable_permits_aipa_ro(postgres_dsn: str) -> None:
+    """The least-privilege role from `docker/postgres-init.sql` must still connect."""
+    PostgresEngine(postgres_dsn).check_reachable()  # must not raise
+
+
+def test_check_reachable_refuses_a_role_holding_only_file_privileges(
+    postgres_dsn: str,
+) -> None:
+    """Not a superuser-only check: a non-superuser role holding one of the
+    three file/program memberships must be refused too, naming that specific
+    membership rather than only ever saying "superuser".
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    from text_to_sql_agent.engines.base import EngineForbiddenError
+
+    role = "task_decision2_overprivileged"
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        conn.execute(f"DROP ROLE IF EXISTS {role}")
+        conn.execute(f"CREATE ROLE {role} LOGIN PASSWORD 'x' IN ROLE pg_read_server_files")
+    try:
+        parts = urlsplit(postgres_dsn)
+        netloc = f"{role}:x@{parts.hostname}"
+        if parts.port is not None:
+            netloc += f":{parts.port}"
+        role_dsn = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+        engine = PostgresEngine(role_dsn)
+
+        with pytest.raises(EngineForbiddenError) as caught:
+            engine.check_reachable()
+
+        message = str(caught.value)
+        assert "pg_read_server_files" in message
+        assert "is a superuser" not in message  # the reason given, not the guidance text
+        assert "x@" not in message  # the role's password
+    finally:
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            conn.execute(f"DROP ROLE IF EXISTS {role}")
+
+
+def test_ask_database_raises_engine_forbidden_error_for_a_superuser_dsn(
+    postgres_dsn: str,
+) -> None:
+    """The fail-closed check must actually reach a pipeline caller, not just
+    `PostgresEngine.check_reachable()` in isolation - `pipeline.ask_database`
+    calls `engine.check_reachable()` before its own `try` block (the same
+    place `EngineUnreachableError` is already proven to propagate from,
+    `tests/test_pipeline.py::test_ask_database_raises_when_the_database_is_
+    unreachable`), so this is the same contract, exercised through the real
+    entry point rather than assumed from the unit-level test above.
+    """
+    from text_to_sql_agent.engines.base import EngineForbiddenError
+    from text_to_sql_agent.pipeline import ask_database
+
+    su_dsn = _as_postgres_superuser(postgres_dsn)
+    with pytest.raises(EngineForbiddenError):
+        ask_database("irrelevant question", db_path=su_dsn)
+
+
 # --- Filesystem and program-execution surface (Task 3) ---------------------
 #
 # Every entry is (label, sql). Probed 2026-09-26 through `engine.execute` as
@@ -872,11 +964,20 @@ _HOSTILE_COLUMN_PAYLOADS: list[tuple[str, str]] = [
 
 
 def test_a_hostile_column_name_elsewhere_cannot_re_arm_the_column_call_bypass(
-    postgres_dsn: str,
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A column named after a catalogue function, in a schema the role may
-    read, must not make `alias.name` resolve for a qualifier that cannot
-    supply it. See the comment above for the regression this pins.
+    read *and has opted into*, must not make `alias.name` resolve for a
+    qualifier that cannot supply it. See the comment above for the
+    regression this pins.
+
+    Schema scope became opt-in after this regression was first fixed (owner
+    decision, 2026-09-26): the schema must be named in `AIPA_EXTRA_SCHEMAS`
+    or it is invisible regardless of grants, which would make the payload
+    refused for the wrong reason (never advertised at all) rather than the
+    reason this test exists to pin (advertised, but still refused by
+    per-table column resolution). The `monkeypatch.setenv` below keeps the
+    fixture armed the way it was before the opt-in decision.
 
     The same fixture also pins the other direction, which is what stops the
     fix from being a blunt name ban: `ext.audit`'s own `lo_get` column is a
@@ -892,6 +993,7 @@ def test_a_hostile_column_name_elsewhere_cannot_re_arm_the_column_call_bypass(
         conn.execute(f"INSERT INTO {schema}.audit VALUES (42, 'ok')")
         conn.execute(f"GRANT SELECT ON {schema}.audit TO aipa_ro")
     try:
+        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", schema)
         engine = open_engine(postgres_dsn)
         # The fixture is armed: the hostile name really is an advertised
         # column of a readable table outside `public`. Without this the
@@ -1258,20 +1360,24 @@ def test_fetch_columns_keys_by_schema_and_table_not_bare_name(postgres_dsn: str)
             conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
 
 
-def test_a_table_outside_public_is_advertised_and_queryable_when_qualified(
-    postgres_dsn: str,
+def test_a_table_outside_public_is_advertised_and_queryable_only_once_opted_in(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Task 5's scoping test, updated to Task 6's contract rather than deleted.
+    """Task 5's scoping test, updated twice now rather than deleted.
 
-    At Task 5 this asserted the opposite - `only_here` in neither
-    `raw_schema()` nor `table_names()` - because `safety.py` accepted no
-    qualifier but `main` and advertising a table the validator would reject
-    is the `docs/3_decisions.md` 2026-09-25 inversion. Task 6 removed that
-    constraint at its source, so the scoping is gone and what replaces it is
-    *agreement*: advertised, accepted qualified, refused bare (because bare
-    resolves against `public`, where no such table exists), and actually
-    executable. The schema is still created and granted exactly as before, so
-    this remains the same live reproduction, now pinning the opposite answer.
+    At Task 5 this asserted `only_here` in neither `raw_schema()` nor
+    `table_names()` - `safety.py` accepted no qualifier but `main`, and
+    advertising a table the validator would reject is the
+    `docs/3_decisions.md` 2026-09-25 inversion. Task 6 removed that
+    constraint at its source and pinned the opposite answer: granted alone
+    was enough to be advertised, accepted qualified, and executable. A
+    2026-09-26 owner decision narrowed that again - schema scope is opt-in,
+    not "every schema the role can read" - so this now pins *both* halves in
+    one place: granted but not opted in stays invisible and refused (the
+    safe default, and what a deployment that granted `aipa_ro` a schema for
+    unrelated tooling needs to be true), and granted *and* opted in via
+    `AIPA_EXTRA_SCHEMAS` is advertised, accepted qualified, refused bare, and
+    actually executable, same as Task 6 pinned.
     """
     schema = "task5_only_schema"
     with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
@@ -1282,6 +1388,16 @@ def test_a_table_outside_public_is_advertised_and_queryable_when_qualified(
         conn.execute(f"INSERT INTO {schema}.only_here VALUES (7)")
         conn.execute(f"GRANT SELECT ON {schema}.only_here TO aipa_ro")
     try:
+        # Granted but not opted in: invisible everywhere, query refused.
+        monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+        not_opted_in = open_engine(postgres_dsn)
+        assert "only_here" not in not_opted_in.raw_schema()
+        assert f"{schema}.only_here" not in not_opted_in.table_names()
+        assert not is_safe_query(f"SELECT a FROM {schema}.only_here", engine=not_opted_in)
+
+        # Opted in via AIPA_EXTRA_SCHEMAS: advertised, accepted qualified,
+        # refused bare, executes.
+        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", schema)
         engine = open_engine(postgres_dsn)
         assert "only_here" in engine.raw_schema()
         assert f"{schema}.only_here" in engine.table_names()
@@ -1295,14 +1411,17 @@ def test_a_table_outside_public_is_advertised_and_queryable_when_qualified(
             conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
 
 
-def test_a_schema_the_role_cannot_use_is_not_advertised(postgres_dsn: str) -> None:
-    """Widening to "every schema" means every schema the *role* may use.
+def test_a_schema_the_role_cannot_use_is_not_advertised_even_when_opted_in(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opt-in and privilege are both required, independently.
 
-    `_user_schema_names` filters on `has_schema_privilege`, so a schema with
-    no `USAGE` grant to `aipa_ro` is neither read nor advertised - otherwise
-    the model would be shown a table every query against which is refused by
-    PostgreSQL itself, which is the same advertised-then-blocked inversion
-    one layer down.
+    `_user_schema_names` filters `AIPA_EXTRA_SCHEMAS`'s candidates on
+    `has_schema_privilege`, so a schema with no `USAGE` grant to `aipa_ro` is
+    neither read nor advertised even once named in the opt-in list -
+    otherwise the model would be shown a table every query against which is
+    refused by PostgreSQL itself, which is the same advertised-then-blocked
+    inversion one layer down. Opting in is necessary, not sufficient.
     """
     schema = "task6_ungranted_schema"
     with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
@@ -1310,6 +1429,7 @@ def test_a_schema_the_role_cannot_use_is_not_advertised(postgres_dsn: str) -> No
         conn.execute(f"CREATE SCHEMA {schema}")
         conn.execute(f"CREATE TABLE {schema}.secret_ledger (a INTEGER)")
     try:
+        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", schema)
         engine = open_engine(postgres_dsn)
         assert "secret_ledger" not in engine.raw_schema()
         assert f"{schema}.secret_ledger" not in engine.table_names()
@@ -1317,6 +1437,50 @@ def test_a_schema_the_role_cannot_use_is_not_advertised(postgres_dsn: str) -> No
     finally:
         with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
             conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+def test_extra_schemas_env_var_is_comma_separated_and_trims_whitespace(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`AIPA_EXTRA_SCHEMAS` accepts more than one schema, and tolerates the
+    spacing a human is likely to type around the commas.
+    """
+    schema_a = "task6_multi_a"
+    schema_b = "task6_multi_b"
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        for schema in (schema_a, schema_b):
+            conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            conn.execute(f"CREATE SCHEMA {schema}")
+            conn.execute(f"GRANT USAGE ON SCHEMA {schema} TO aipa_ro")
+            conn.execute(f"CREATE TABLE {schema}.t (a INTEGER)")
+            conn.execute(f"GRANT SELECT ON {schema}.t TO aipa_ro")
+    try:
+        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", f" {schema_a} ,{schema_b},")
+        engine = open_engine(postgres_dsn)
+        names = engine.table_names()
+        assert f"{schema_a}.t" in names
+        assert f"{schema_b}.t" in names
+    finally:
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            for schema in (schema_a, schema_b):
+                conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+def test_schema_fingerprint_changes_when_the_opted_in_set_changes(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale `schema.py` cache would serve the wrong schema across a config
+    change, so the fingerprint must reflect the opt-in set itself, not only
+    its visible effect - see `PostgresEngine.schema_fingerprint`'s docstring
+    for why the raw config, not just the resulting table list, is hashed.
+    """
+    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    before = open_engine(postgres_dsn).schema_fingerprint()
+
+    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "some_schema_nobody_granted")
+    after = open_engine(postgres_dsn).schema_fingerprint()
+
+    assert after != before
 
 
 # --- Task 5: the work-limit unit fix ----------------------------------------

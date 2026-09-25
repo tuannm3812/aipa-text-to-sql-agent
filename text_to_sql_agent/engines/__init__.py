@@ -9,6 +9,7 @@ from typing import cast
 from .base import (
     Engine,
     EngineError,
+    EngineForbiddenError,
     EngineUnavailableError,
     EngineUnreachableError,
 )
@@ -16,6 +17,7 @@ from .base import (
 __all__ = [
     "Engine",
     "EngineError",
+    "EngineForbiddenError",
     "EngineUnavailableError",
     "EngineUnreachableError",
     "open_engine",

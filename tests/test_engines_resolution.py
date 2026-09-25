@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from text_to_sql_agent.engines import EngineUnavailableError, open_engine
+from text_to_sql_agent.engines.base import extra_schemas_from_env
 
 
 @pytest.mark.parametrize(
@@ -73,3 +74,29 @@ def test_a_missing_postgres_driver_names_the_extra_to_install(monkeypatch) -> No
 
     with pytest.raises(EngineUnavailableError, match="postgres"):
         open_engine("postgresql://user:pw@localhost:5432/db")
+
+
+# --- Schema scope is opt-in (2026-09-26 owner decision) ---------------------
+#
+# `extra_schemas_from_env` is the shared parsing both `DuckDBEngine` and
+# `PostgresEngine` build on (see `engines/base.py`'s module-level comment for
+# why an env var rather than a constructor argument or a DSN-level option).
+# These pin the parsing itself, independent of either engine or a live
+# database - a plain unit test, unlike the schema-visibility proofs in
+# `tests/test_engine_duckdb.py`/`tests/test_engine_postgres.py`, which need a
+# real database to prove the opt-in actually gates what is read.
+
+
+def test_extra_schemas_from_env_is_empty_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    assert extra_schemas_from_env() == frozenset()
+
+
+def test_extra_schemas_from_env_is_empty_when_blank(monkeypatch) -> None:
+    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "   ")
+    assert extra_schemas_from_env() == frozenset()
+
+
+def test_extra_schemas_from_env_splits_on_commas_and_trims_whitespace(monkeypatch) -> None:
+    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", " analytics ,staging,, reporting")
+    assert extra_schemas_from_env() == frozenset({"analytics", "staging", "reporting"})

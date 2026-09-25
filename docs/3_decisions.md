@@ -2,6 +2,99 @@
 
 Newest first. Each entry states what was chosen and what it ruled out.
 
+## 2026-09-26 — PostgreSQL fails closed on an over-privileged role
+
+**Chosen:** `PostgresEngine.check_reachable()` now also queries `pg_roles`
+for `current_user` and raises the new `EngineForbiddenError` (`engines/
+base.py`) if the connecting role is a superuser or holds
+`pg_read_server_files`, `pg_write_server_files` or
+`pg_execute_server_program` - naming which condition held and pointing at
+`docker/postgres-init.sql`'s `aipa_ro` role as what a correctly provisioned
+one looks like. `EngineForbiddenError` is a new `EngineError` subclass,
+deliberately **not** also a `FileNotFoundError` the way `EngineUnreachable
+Error` is - "reachable but refused" is not "not found." `check_reachable()`
+re-raises it ahead of the broad `except Exception -> EngineUnreachableError`
+wrapping so it is not misreported as unreachable, and it propagates through
+`pipeline.ask_database`/`ask_database_with_sql` (called before their own
+`try`, the same place `EngineUnreachableError` already propagated from) to
+`ui/chat.py`'s `_run_query` and `ui/sidebar.py`'s `active_db_path`, both of
+which already catch bare `Exception` and redact before display - no new
+catch site was needed.
+
+**Ruled out:** Trusting every deployment to provision its role like `docker/
+postgres-init.sql` and documenting the requirement instead of checking it;
+reusing `EngineUnreachableError` for this failure; checking on every
+`execute()` call instead of once at `check_reachable()`.
+
+**Why:** DuckDB's defence against reading host files
+(`enable_external_access=False`) is enforced by the engine itself, whatever
+file is opened. PostgreSQL has no equivalent connection flag - its defence
+is entirely a property of how the connecting role was provisioned, which
+this codebase does not control. A superuser DSN (or a role a deployment
+over-granted for unrelated tooling) pasted into the "Connection string"
+sidebar field would otherwise connect successfully with no filesystem
+protection at all and no error naming why - exactly the class of hole
+`test_engine_postgres.py`'s Task 3 probes proved `aipa_ro` itself is refused.
+Reusing `EngineUnreachableError` was ruled out because it also inherits
+`FileNotFoundError` for a documented legacy-caller contract that has nothing
+to do with this failure; claiming it here would misdescribe "reachable but
+refused" as "not found" to any caller that branches on that type
+specifically. Checking once at `check_reachable()` rather than per-query is
+correct because the role does not change between queries on one DSN -
+`docker/postgres-init.sql`'s superuser fixtures (`_as_postgres_superuser` in
+several test files) stay outside the engine on purpose, connecting directly
+via `psycopg.connect` to set up schemas or prove the read-only transaction
+flag is load-bearing without the role, never through `PostgresEngine.
+check_reachable()`, so this check was not weakened to keep them working - the
+new tests (`test_check_reachable_refuses_a_superuser_dsn` et al.) call
+`check_reachable()` directly against a superuser DSN to prove the check is
+itself honest.
+
+## 2026-09-26 — schema scope is opt-in, via `AIPA_EXTRA_SCHEMAS`
+
+**Chosen:** `PostgresEngine`/`DuckDBEngine` read only their own default
+schema (`public`/`main`) plus whatever schema names
+`engines/base.py::extra_schemas_from_env()` finds in the `AIPA_EXTRA_SCHEMAS`
+environment variable (comma-separated, whitespace-trimmed), read once per
+engine instance in `__init__`. PostgreSQL still additionally requires
+`has_schema_privilege` on each opted-in name - naming a schema does not by
+itself grant access to it. Both engines' `schema_fingerprint()` now include
+the opted-in set (sorted) directly, not only its visible effect, so
+`schema.py`'s cache invalidates on a config change even when that change
+happens to produce the same effective table list today.
+
+**Ruled out:** A constructor argument threaded through `open_engine(dsn)`
+and every caller (`ui/settings.py`'s `Settings`, the sidebar) - opt-in scope
+is deployment-level configuration set once, not a per-question choice, and
+`open_engine` takes only a DSN today; a DSN-level query parameter - a DSN is
+already handled everywhere in this codebase (`dsn.py`, `ui/uploads.py`) as a
+single opaque, credential-bearing string, and `redact_dsn`/the sidebar's
+"Using `<dsn>`" caption would all need to start parsing it apart again;
+leaving Task 6's "every schema the role can read" as it was and documenting
+the risk instead of closing it.
+
+**Why:** Phase 3b Task 6 widened DuckDB and PostgreSQL from their own
+default schema to every schema the connecting role could read, so that
+schema's table names, columns and DDL are sent to the LLM provider. A
+deployment may have granted its read-only role `USAGE` on a staging or PII
+schema for some unrelated tool; that must not silently become LLM-visible
+just because this agent widened its own catalogue read. An environment
+variable matches how this codebase already handles single, deployment-level
+settings read directly from `os.environ` (`ui/secrets.py`'s
+`active_gemini_key` reads `GEMINI_API_KEY` the same way) without adding new
+plumbing through `Settings`/the sidebar for something with no reason to vary
+per question. Both engines had to change together, since DuckDB has no
+privilege model to fall back on - `AIPA_EXTRA_SCHEMAS` is the *only* gate for
+DuckDB, where for PostgreSQL it is one of two (opted in **and** privileged).
+`raw_schema()`, `schema_chunks()`, `table_names()`, `table_columns()` and
+`schema_fingerprint()` all resolve the opted-in set the same way per engine
+(`PostgresEngine._user_schema_names`, `DuckDBEngine._allowed_schemas`), so a
+table the model is shown and a table the validator accepts stay the same set
+- the "advertised then blocked" inversion this phase already closed twice
+(`docs/3_decisions.md`'s 2026-09-25 and 2026-09-26 schema-identity entries)
+does not reopen a third time from a scope mismatch between the opt-in and
+the validator.
+
 ## 2026-09-26 — schema-qualified table identity, carried through every engine
 
 **Supersedes** the 2026-09-25 entry below, which was explicitly a placeholder

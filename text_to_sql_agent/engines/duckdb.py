@@ -31,7 +31,12 @@ from ..config import (
     DEFAULT_WORK_LIMIT_MS,
 )
 from ..types import QueryResult, SchemaChunk
-from .base import EngineUnreachableError, table_column_spellings, table_name_spellings
+from .base import (
+    EngineUnreachableError,
+    extra_schemas_from_env,
+    table_column_spellings,
+    table_name_spellings,
+)
 
 # DuckDB groups tables into schemas ("main" is the default a bare filesystem
 # path connects into, same as PostgreSQL's "public"). Between 2026-09-25 and
@@ -46,6 +51,15 @@ from .base import EngineUnreachableError, table_column_spellings, table_name_spe
 # rather than by narrowing all three. Both remain pinned by
 # `tests/test_engine_duckdb.py`'s cross-schema regression tests.
 _DEFAULT_SCHEMA = "main"
+
+# Decision (2026-09-26): reading "every schema of the opened database" (the
+# comment above) is no longer unconditional - it is scoped to `_DEFAULT_
+# SCHEMA` plus whatever `engines/base.py`'s `extra_schemas_from_env()` opts
+# into (`AIPA_EXTRA_SCHEMAS`). Unlike PostgreSQL, DuckDB has no privilege
+# model to fall back on: opening the file grants access to every schema in
+# it, so the opt-in is the *only* gate here, not a second one alongside a
+# `has_schema_privilege` check. See `DuckDBEngine.__init__` and `Postgres
+# Engine`'s module docstring for the shared reasoning.
 
 # Schemas that belong to DuckDB itself rather than to the user's data. They
 # are not in `duckdb_tables()`'s output for a file database (probed
@@ -494,6 +508,21 @@ DUCKDB DIALECT (must follow):
             dsn: Filesystem path to the DuckDB database.
         """
         self.dsn = dsn
+        # See the module-level comment above `_INTERNAL_SCHEMAS` and
+        # `engines/base.py::extra_schemas_from_env` - read once here so this
+        # instance's scope is fixed for its whole lifetime.
+        self.extra_schemas: frozenset[str] = extra_schemas_from_env()
+
+    def _allowed_schemas(self) -> tuple[str, ...]:
+        """`default_schema` plus the opted-in extras, for an `IN (...)` filter.
+
+        Sorted so `raw_schema()`/`schema_chunks()`/`schema_fingerprint()`
+        build the identical parameter list given the identical opt-in set -
+        not load-bearing for correctness (DuckDB's `IN` doesn't care about
+        parameter order), but it keeps the three query call sites trivially
+        comparable.
+        """
+        return (self.default_schema, *sorted(self.extra_schemas))
 
     def check_reachable(self) -> None:
         """Raise `EngineUnreachableError` if the database file does not exist."""
@@ -576,18 +605,26 @@ DUCKDB DIALECT (must follow):
         `table_names()` accepts - which is the whole point of Task 6, and
         what the 2026-09-25 narrowing achieved by showing less instead.
 
+        Scoped to `_allowed_schemas()` - `default_schema` plus whatever
+        `AIPA_EXTRA_SCHEMAS` opted into (2026-09-26 decision, see the
+        module-level comment above `_INTERNAL_SCHEMAS`) - not every schema
+        of the opened database.
+
         Returns:
             The `CREATE TABLE` statements, one per table, semicolon-terminated
             and separated by blank lines, ordered by schema then table name.
         """
+        allowed = self._allowed_schemas()
+        placeholders = ", ".join("?" for _ in allowed)
         conn = _connect_read_only(self.dsn)
         try:
             rows = conn.execute(
                 "SELECT schema_name, table_name, sql FROM duckdb_tables() "
                 "WHERE database_name = current_database() "
                 "AND schema_name NOT IN (?, ?) "
+                f"AND schema_name IN ({placeholders}) "
                 "ORDER BY schema_name, table_name",
-                list(_INTERNAL_SCHEMAS),
+                [*_INTERNAL_SCHEMAS, *allowed],
             ).fetchall()
         finally:
             conn.close()
@@ -609,21 +646,29 @@ DUCKDB DIALECT (must follow):
         A chunk records `schema_name` only when the table is outside
         `default_schema`, so `chunk.qualified_name` is exactly the spelling
         `table_names()` advertises and `safety.py` accepts.
+
+        Scoped to `_allowed_schemas()`, the same opt-in `raw_schema()` reads -
+        see that method's docstring for the 2026-09-26 decision.
         """
+        allowed = self._allowed_schemas()
+        placeholders = ", ".join("?" for _ in allowed)
         conn = _connect_read_only(self.dsn)
         try:
             table_rows = conn.execute(
                 "SELECT schema_name, table_name, sql FROM duckdb_tables() "
                 "WHERE database_name = current_database() "
                 "AND schema_name NOT IN (?, ?) "
+                f"AND schema_name IN ({placeholders}) "
                 "ORDER BY schema_name, table_name",
-                list(_INTERNAL_SCHEMAS),
+                [*_INTERNAL_SCHEMAS, *allowed],
             ).fetchall()
             all_columns = conn.execute(
                 "SELECT table_schema, table_name, column_name, data_type "
                 "FROM information_schema.columns "
                 "WHERE table_catalog = current_database() "
+                f"AND table_schema IN ({placeholders}) "
                 "ORDER BY table_schema, table_name, ordinal_position",
+                list(allowed),
             ).fetchall()
             # DuckDB refuses a foreign key across schemas outright ("Binder
             # Error: Creating foreign keys across different schemas or
@@ -634,7 +679,9 @@ DUCKDB DIALECT (must follow):
                 "SELECT schema_name, table_name, referenced_table "
                 "FROM duckdb_constraints() "
                 "WHERE constraint_type = 'FOREIGN KEY' AND referenced_table IS NOT NULL "
-                "AND database_name = current_database()",
+                "AND database_name = current_database() "
+                f"AND schema_name IN ({placeholders})",
+                list(allowed),
             ).fetchall()
 
             columns_by_table: dict[tuple[str, str], list[tuple[str, str]]] = {}
@@ -681,14 +728,26 @@ DUCKDB DIALECT (must follow):
         return chunks
 
     def schema_fingerprint(self) -> tuple[object, ...]:
-        """Return `(path, mtime_ns, size)`, like `SQLiteEngine`'s cache key.
+        """Return `(path, mtime_ns, size, extra_schemas)`.
 
-        A DuckDB database is a file too, so the same filesystem-metadata
-        fingerprint applies unchanged.
+        The first three match `SQLiteEngine`'s filesystem-metadata
+        fingerprint unchanged - a DuckDB database is a file too. The fourth
+        is new (2026-09-26): `AIPA_EXTRA_SCHEMAS` is process configuration,
+        not something the DuckDB file itself records, so a config change
+        that opts a schema in or out changes neither the file's mtime nor
+        its size. Without this, `schema.py`'s fingerprint-keyed cache would
+        keep serving the pre-change schema (chunks, `table_names()`,
+        `table_columns()`) to a process whose opt-in set had already
+        changed - the exact stale-cache failure the task called out.
         """
         path = Path(self.dsn).resolve()
         stat = path.stat()
-        return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+        return (
+            str(path),
+            int(stat.st_mtime_ns),
+            int(stat.st_size),
+            tuple(sorted(self.extra_schemas)),
+        )
 
     def table_names(self) -> frozenset[str]:
         """Every valid spelling of every user table, lowercased, via the cache.
