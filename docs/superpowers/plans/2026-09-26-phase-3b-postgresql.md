@@ -432,6 +432,29 @@ Note `dsn`, not `rest`: libpq needs the whole URL including its scheme, unlike t
 engines. Add a test in `tests/test_engines_resolution.py` pinning that both spellings resolve and
 that the full DSN is preserved.
 
+**While you are here, replace the if/elif chain with a registry** — Codex's 2026-09-26 review
+found that `tests/test_llm.py::_known_engine_classes()` is hand-maintained despite a docstring
+claiming it grows on its own, so a new engine silently escapes the cross-dialect prompt guard.
+Give `engines/__init__.py` a module-level mapping that `open_engine` dispatches on and tests can
+import:
+
+```python
+# scheme -> (module, class name, extra that provides the driver). The one
+# place a scheme maps to an implementation, so a test can enumerate every
+# engine rather than hand-maintaining a parallel list that silently omits
+# the newest one.
+_ENGINES: dict[str, tuple[str, str, str | None]] = {
+    "sqlite": (".sqlite", "SQLiteEngine", None),
+    "duckdb": (".duckdb", "DuckDBEngine", "duckdb"),
+    "postgresql": (".postgres", "PostgresEngine", "postgres"),
+    "postgres": (".postgres", "PostgresEngine", "postgres"),
+}
+```
+
+Keep the existing behaviour exactly: a bare path still means SQLite, a missing driver still raises
+`EngineUnavailableError` naming the extra, and an unknown scheme still raises `ValueError`. Add a
+test pinning each of those three, so the refactor cannot quietly drop one.
+
 - [ ] **Step 7: Run conformance green**
 
 ```bash
@@ -743,10 +766,15 @@ matching, and double-quoted identifiers.
 
 - [ ] **Step 2: Extend the no-foreign-dialect test**
 
-`tests/test_llm.py` already asserts, per engine, that no *other* engine's dialect name appears
-outside its own section. Adding PostgreSQL to that parametrisation should be all that is needed —
-confirm it fails first if you stub the fragments with SQLite's text, so you know the test covers
-the new engine rather than passing vacuously.
+`tests/test_llm.py` asserts, per engine, that no *other* engine's dialect name appears outside its
+own section — but over a **hand-maintained** list, which is the gap Codex flagged on 2026-09-26.
+Rewrite `_known_engine_classes()` to enumerate Task 2's `_ENGINES` registry, skipping schemes
+whose driver is not installed, and correct its docstring. Then add a test asserting that every
+scheme in the registry is represented, so the next engine cannot escape the guard the way
+PostgreSQL would have.
+
+Prove it is not vacuous: temporarily give PostgreSQL SQLite's prompt fragments and confirm the
+guard fails, then restore. Report that failure output.
 
 - [ ] **Step 3: Extend the repair-dialect test**
 

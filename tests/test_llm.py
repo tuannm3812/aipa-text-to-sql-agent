@@ -172,11 +172,16 @@ def test_generate_sql_system_prompt_for_duckdb_has_no_sqlite_instructions() -> N
 def _known_engine_classes() -> list[type]:
     """Every `Engine` implementation this test suite can construct today.
 
-    Grows automatically as new engines (PostgreSQL, Phase 3b) are added,
-    which is the point of `test_assembled_prompt_names_no_other_known_engine`
-    below: it is written over this registry, not over four hardcoded
-    strings, so a future engine that reintroduces the same leak fails a test
-    that already exists rather than needing a new one written for it.
+    **Hand-maintained.** An earlier version of this docstring claimed the
+    list grows automatically; it does not - it names `SQLiteEngine` and
+    conditionally imports `DuckDBEngine`, so an engine added to
+    `open_engine` does not appear here (Codex review, 2026-09-26). The
+    guard below is still written over this list rather than over hardcoded
+    dialect strings, but adding an engine means adding it here too, or
+    `test_assembled_prompt_names_no_other_known_engine` stays green while
+    the new engine repeats the leak it exists to catch. Phase 3b replaces
+    this with the scheme registry `open_engine` itself dispatches on, which
+    is the version that really does grow on its own.
     """
     engines: list[type] = [SQLiteEngine]
     try:
