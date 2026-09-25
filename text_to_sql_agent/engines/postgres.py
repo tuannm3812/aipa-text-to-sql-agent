@@ -18,31 +18,60 @@ it, `InsufficientPrivilege` when only the role's grants would have.
 are placeholders - Task 7 writes PostgreSQL's real prompt fragments.
 `allowed_functions` (Task 4, 2026-09-26) is PostgreSQL's own default-deny
 allowlist, matching `DuckDBEngine`'s Task 6b work - see that attribute's own
-comment for how it was built and verified. Every schema method below is the
-straightforward version Step 5 of the task brief asked for - DDL synthesised
-from `information_schema.columns`, chunks carrying columns and foreign keys
-read from `pg_constraint`, and a fingerprint hashing a catalogue query - not
-the schema-qualified, value-hint-hardened version Task 5 and Task 6 build on
-top of it.
+comment for how it was built and verified.
+
+Task 5 (2026-09-26) hardened the schema-extraction methods below without
+widening what they expose: every catalogue query still filters to `public`
+(`default_schema`) alone, the same single-schema scope `DuckDBEngine` was
+deliberately narrowed to on 2026-09-25
+(`docs/3_decisions.md`: "DuckDB support is scoped to the `main` schema,
+consistently across every layer"). That entry's own reasoning is why
+PostgreSQL stays scoped too: "PostgreSQL forces the same question for both
+engines in Phase 3b ... so doing it once there [Task 6] beats doing it
+twice" - advertising a table outside `public` via `raw_schema()`/
+`schema_chunks()` before `safety.py`'s schema-qualifier check (which still
+only accepts `main`/absent, Task 6's job to fix) would reproduce exactly the
+"advertised then blocked" inversion that decision closed for DuckDB: a model
+correctly qualifying a non-default-schema table gets rejected, while the
+unqualified form validates and fails at execution.
+
+What *did* change: `_fetch_columns`/`_fetch_primary_keys`/`_fetch_
+foreign_keys` all key by `(schema_name, table_name)`, never bare
+`table_name` - the 2026-09-25 DuckDB fix (`duckdb.py`'s module docstring) is
+what a bare-name key crashes on the moment a query result ever spans two
+schemas sharing a table name. Every one of those helpers takes a list of
+schema names for exactly that reason (Task 6 widens the one-element list
+this module passes today, `[default_schema]`, without needing to touch the
+keying itself), and the value-hint query has always qualified its table
+reference (`_quote_qualified`) so it cannot silently resolve to a same-named
+table in a schema this module does not even query.
 """
 
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from typing import Any
 
 import psycopg
 from psycopg import errors as psycopg_errors
 
-from ..config import DEFAULT_VALUE_HINT_LIMIT, DEFAULT_VALUE_HINT_MAX_CARDINALITY
+from ..config import (
+    DEFAULT_VALUE_HINT_LIMIT,
+    DEFAULT_VALUE_HINT_MAX_CARDINALITY,
+    DEFAULT_WORK_LIMIT_MS,
+)
 from ..types import QueryResult, SchemaChunk
 from .base import EngineUnreachableError
 
 _CONNECT_TIMEOUT_SECONDS = 5
 
-# See `PostgresEngine.default_schema`. Every catalogue query in this module is
-# filtered to this one schema - Task 6 is what makes multi-schema identity a
-# first-class concept across all three engines at once.
+# See `PostgresEngine.default_schema`. This is what a bare, unqualified table
+# name resolves against, and the only schema `safety.py`'s qualifier check
+# accepts today (Task 6 is what wires `default_schema` through that check for
+# every engine). It is also the only schema `raw_schema()`/`schema_chunks()`/
+# `schema_fingerprint()` read - see the module docstring for why that scope
+# is deliberate, not a leftover from Task 2.
 _PUBLIC_SCHEMA = "public"
 
 
@@ -72,62 +101,175 @@ def _quote_qualified(schema_name: str, table_name: str) -> str:
 
 
 def _fetch_columns(
-    conn: psycopg.Connection[tuple[Any, ...]], schema_name: str
-) -> dict[str, list[tuple[str, str, str]]]:
-    """Every table's `(column_name, data_type, is_nullable)`, keyed by table name."""
+    conn: psycopg.Connection[tuple[Any, ...]], schema_names: list[str]
+) -> dict[tuple[str, str], list[tuple[str, str, str]]]:
+    """Every table's `(column_name, data_type, is_nullable)`, keyed by `(schema, table)`.
+
+    Keyed by the pair, never by bare `table_name` - the 2026-09-25 DuckDB fix
+    (see `duckdb.py`'s module docstring) is what a bare-name key does the
+    moment a query result spans two schemas holding a same-named table:
+    their columns land in the same list, silently merged. Every caller in
+    this module passes a single-element `schema_names` today (see the
+    module docstring for why), but the keying holds regardless of how many
+    schemas are asked for - proven directly, with more than one, by
+    `tests/test_engine_postgres.py::
+    test_fetch_columns_keys_by_schema_and_table_not_bare_name`.
+    """
+    if not schema_names:
+        return {}
     rows = conn.execute(
-        "SELECT table_name, column_name, data_type, is_nullable "
+        "SELECT table_schema, table_name, column_name, data_type, is_nullable "
         "FROM information_schema.columns "
-        "WHERE table_schema = %s ORDER BY table_name, ordinal_position",
-        (schema_name,),
+        "WHERE table_schema = ANY(%s) "
+        "ORDER BY table_schema, table_name, ordinal_position",
+        (schema_names,),
     ).fetchall()
-    columns_by_table: dict[str, list[tuple[str, str, str]]] = {}
-    for table_name, column_name, data_type, is_nullable in rows:
-        columns_by_table.setdefault(table_name, []).append((column_name, data_type, is_nullable))
+    columns_by_table: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+    for schema_name, table_name, column_name, data_type, is_nullable in rows:
+        columns_by_table.setdefault((schema_name, table_name), []).append(
+            (column_name, data_type, is_nullable)
+        )
     return columns_by_table
 
 
-def _fetch_foreign_tables(
-    conn: psycopg.Connection[tuple[Any, ...]], schema_name: str
-) -> dict[str, set[str]]:
-    """Every table's referenced tables, via `pg_constraint`.
+def _fetch_primary_keys(
+    conn: psycopg.Connection[tuple[Any, ...]], schema_names: list[str]
+) -> dict[tuple[str, str], list[str]]:
+    """Every table's primary-key column names, in key order, keyed by `(schema, table)`.
 
-    `information_schema.table_constraints`/`constraint_column_usage` only
-    show what `aipa_ro` owns, which is nothing - probed 2026-09-26, both
-    returned zero rows for `aipa_ro` despite it holding `SELECT` on every
-    table. `pg_constraint` is a plain catalog table, readable like any other
-    under `GRANT SELECT ... IN SCHEMA public`'s reach for the catalog itself,
-    and returned the expected row.
+    `information_schema.table_constraints`/`key_column_usage` only show what
+    `aipa_ro` owns, which is nothing - probed 2026-09-26 for `_fetch_
+    foreign_keys` below, same result here. `pg_constraint` plus `pg_class`/
+    `pg_namespace`/`pg_attribute` are plain catalog tables, world-readable
+    the way `pg_proc` already is (see `allowed_functions`'s comment), so
+    this reads those directly instead.
     """
+    if not schema_names:
+        return {}
     rows = conn.execute(
-        "SELECT con.conrelid::regclass::text AS table_name, "
-        "confrel.relname AS referenced_table "
+        "SELECT nsp.nspname, cls.relname, att.attname, "
+        "array_position(con.conkey, att.attnum) AS ordinal "
         "FROM pg_constraint con "
-        "JOIN pg_namespace nsp ON nsp.oid = con.connamespace "
-        "LEFT JOIN pg_class confrel ON confrel.oid = con.confrelid "
-        "WHERE con.contype = 'f' AND nsp.nspname = %s",
-        (schema_name,),
+        "JOIN pg_class cls ON cls.oid = con.conrelid "
+        "JOIN pg_namespace nsp ON nsp.oid = cls.relnamespace "
+        "JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = ANY(con.conkey) "
+        "WHERE con.contype = 'p' AND nsp.nspname = ANY(%s) "
+        "ORDER BY nsp.nspname, cls.relname, ordinal",
+        (schema_names,),
     ).fetchall()
-    fk_by_table: dict[str, set[str]] = {}
-    for table_name, referenced_table in rows:
-        if referenced_table:
-            fk_by_table.setdefault(table_name, set()).add(referenced_table)
+    pk_by_table: dict[tuple[str, str], list[str]] = {}
+    for schema_name, table_name, column_name, _ordinal in rows:
+        pk_by_table.setdefault((schema_name, table_name), []).append(column_name)
+    return pk_by_table
+
+
+@dataclass(frozen=True)
+class _ForeignKey:
+    """One `FOREIGN KEY` constraint, with both sides' schema-qualified identity."""
+
+    local_columns: tuple[str, ...]
+    ref_schema: str
+    ref_table: str
+    ref_columns: tuple[str, ...]
+
+
+def _fetch_foreign_keys(
+    conn: psycopg.Connection[tuple[Any, ...]], schema_names: list[str]
+) -> dict[tuple[str, str], list[_ForeignKey]]:
+    """Every table's foreign-key constraints, keyed by `(schema, table)`.
+
+    Deliberately not `con.conrelid::regclass::text` for the referencing or
+    referenced table name (Task 2's original approach): `::regclass::text`
+    renders bare or schema-qualified depending on the connection's
+    `search_path`, which is exactly the ambiguity `_quote_qualified`'s
+    module-level comment warns a value-hint query about - this joins
+    `pg_class`/`pg_namespace` directly instead, so both sides' schema come
+    from the catalogue, never from search-path-dependent formatting.
+    `unnest(con.conkey, con.confkey) WITH ORDINALITY` zips the local and
+    referenced column-number arrays element-wise (verified live 2026-09-26)
+    so a multi-column foreign key's columns pair up correctly rather than
+    being cross-joined. `con.oid` (via `con.conname`, unique per table) is
+    the true `GROUP BY` key - two separate foreign keys from the same table
+    to the same referenced table would otherwise have their column arrays
+    merged by `array_agg` if grouped on the table pair alone.
+    """
+    if not schema_names:
+        return {}
+    rows = conn.execute(
+        "SELECT nsp.nspname, cls.relname, con.conname, "
+        "array_agg(att.attname ORDER BY k.ord) AS local_columns, "
+        "fnsp.nspname, fcls.relname, "
+        "array_agg(fatt.attname ORDER BY k.ord) AS ref_columns "
+        "FROM pg_constraint con "
+        "JOIN pg_class cls ON cls.oid = con.conrelid "
+        "JOIN pg_namespace nsp ON nsp.oid = cls.relnamespace "
+        "JOIN pg_class fcls ON fcls.oid = con.confrelid "
+        "JOIN pg_namespace fnsp ON fnsp.oid = fcls.relnamespace "
+        "JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY "
+        "AS k(local_attnum, ref_attnum, ord) ON true "
+        "JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = k.local_attnum "
+        "JOIN pg_attribute fatt ON fatt.attrelid = con.confrelid AND fatt.attnum = k.ref_attnum "
+        "WHERE con.contype = 'f' AND nsp.nspname = ANY(%s) "
+        "GROUP BY con.oid, nsp.nspname, cls.relname, con.conname, fnsp.nspname, fcls.relname "
+        "ORDER BY nsp.nspname, cls.relname, con.conname",
+        (schema_names,),
+    ).fetchall()
+    fk_by_table: dict[tuple[str, str], list[_ForeignKey]] = {}
+    for schema_name, table_name, _conname, local_cols, ref_schema, ref_table, ref_cols in rows:
+        fk_by_table.setdefault((schema_name, table_name), []).append(
+            _ForeignKey(
+                local_columns=tuple(local_cols),
+                ref_schema=ref_schema,
+                ref_table=ref_table,
+                ref_columns=tuple(ref_cols),
+            )
+        )
     return fk_by_table
 
 
-def _table_ddl(table_name: str, typed_columns: list[tuple[str, str, str]]) -> str:
-    """Synthesise a `CREATE TABLE` statement from catalogue columns.
+def _display_table(schema_name: str, table_name: str, default_schema: str) -> str:
+    """Bare-quoted for `default_schema`, schema-qualified otherwise.
 
-    Not `pg_dump` fidelity - no constraints, defaults or indexes - just
-    enough for the LLM prompt and `raw_schema()`/`schema_chunks()` to name
-    every table and column with its type. Task 5 is where this gets hardened.
+    Keeps `raw_schema()`/`schema_chunks()`'s output byte-for-byte the same as
+    before this task for the common single-schema (`public`-only) case,
+    while still disambiguating a table that lives somewhere else.
     """
-    column_defs = []
+    if schema_name == default_schema:
+        return _quote_identifier(table_name)
+    return _quote_qualified(schema_name, table_name)
+
+
+def _table_ddl(
+    schema_name: str,
+    table_name: str,
+    typed_columns: list[tuple[str, str, str]],
+    pk_columns: list[str],
+    foreign_keys: list[_ForeignKey],
+    *,
+    default_schema: str,
+) -> str:
+    """Synthesise a `CREATE TABLE` statement from catalogue columns, PK and FKs.
+
+    Not `pg_dump` fidelity - no defaults, indexes or check constraints - but
+    enough to read like the DDL `SQLiteEngine.raw_schema()` returns: typed
+    columns, a `PRIMARY KEY` clause, and one `FOREIGN KEY ... REFERENCES`
+    clause per constraint, columns included on both sides.
+    """
+    lines = []
     for column_name, data_type, is_nullable in typed_columns:
         not_null = "" if is_nullable == "YES" else " NOT NULL"
-        column_defs.append(f"{_quote_identifier(column_name)} {data_type}{not_null}")
-    body = ",\n  ".join(column_defs)
-    return f"CREATE TABLE {_quote_identifier(table_name)} (\n  {body}\n);"
+        lines.append(f"{_quote_identifier(column_name)} {data_type}{not_null}")
+    if pk_columns:
+        pk_list = ", ".join(_quote_identifier(c) for c in pk_columns)
+        lines.append(f"PRIMARY KEY ({pk_list})")
+    for fk in foreign_keys:
+        local_list = ", ".join(_quote_identifier(c) for c in fk.local_columns)
+        ref_list = ", ".join(_quote_identifier(c) for c in fk.ref_columns)
+        ref_table = _display_table(fk.ref_schema, fk.ref_table, default_schema)
+        lines.append(f"FOREIGN KEY ({local_list}) REFERENCES {ref_table} ({ref_list})")
+    body = ",\n  ".join(lines)
+    table_ref = _display_table(schema_name, table_name, default_schema)
+    return f"CREATE TABLE {table_ref} (\n  {body}\n);"
 
 
 def _value_hints_for_table(
@@ -365,6 +507,16 @@ class PostgresEngine:
             "generate_series",
         }
     )
+    # `work_limit` for PostgreSQL is milliseconds (`SET LOCAL statement_timeout`
+    # - see `execute()`), not SQLite's VM-step count. `DEFAULT_MAX_VM_STEPS`
+    # (100_000) is a VM-instruction budget and means something completely
+    # different in this unit - passing it straight through as a millisecond
+    # budget is a ~100-second timeout, not the design's intended 5 seconds
+    # (`docs/superpowers/specs/2026-09-14-phase-3-engine-abstraction-design.md`
+    # §4.5: `QUERY_ABORTED_AFTER_5000_MS` for both DuckDB and PostgreSQL).
+    # `execution.execute_query` reads this attribute when its own caller does
+    # not pass `max_vm_steps` explicitly - see that module for the fix.
+    default_work_limit: int = DEFAULT_WORK_LIMIT_MS
     schema_header: str = "PostgreSQL schema (DDL)"
     # Placeholder. Task 7 writes PostgreSQL's real prompt fragments
     # (`prompt_dialect_section`, `prompt_dialect_name`,
@@ -460,33 +612,72 @@ class PostgresEngine:
     def raw_schema(self) -> str:
         """Extract synthesised `CREATE TABLE` statements for every table in `public`.
 
+        Reads through the same read-only, least-privilege connection
+        `execute()` uses (`_connect_read_only`) rather than a plain
+        `psycopg.connect` - only fixed catalogue SQL runs here, never
+        LLM-authored text, so the practical risk was always low, but there is
+        no reason for a schema-reading method to hold a connection with a
+        wider guarantee than the one that runs real queries.
+
         Returns:
             The `CREATE TABLE` statements, one per table, semicolon-terminated
             and separated by blank lines, in table-name order.
         """
-        with psycopg.connect(self.dsn, connect_timeout=_CONNECT_TIMEOUT_SECONDS) as conn:
-            columns_by_table = _fetch_columns(conn, self.default_schema)
+        schema_names = [self.default_schema]
+        with _connect_read_only(self.dsn) as conn:
+            columns_by_table = _fetch_columns(conn, schema_names)
+            pk_by_table = _fetch_primary_keys(conn, schema_names)
+            fk_by_table = _fetch_foreign_keys(conn, schema_names)
         return "\n\n".join(
-            _table_ddl(table_name, columns_by_table[table_name])
-            for table_name in sorted(columns_by_table)
+            _table_ddl(
+                schema_name,
+                table_name,
+                columns_by_table[(schema_name, table_name)],
+                pk_by_table.get((schema_name, table_name), []),
+                fk_by_table.get((schema_name, table_name), []),
+                default_schema=self.default_schema,
+            )
+            for schema_name, table_name in sorted(columns_by_table)
         )
 
     def schema_chunks(self) -> list[SchemaChunk]:
-        """Build table-level schema chunks for retrieval without reading row data."""
-        with psycopg.connect(self.dsn, connect_timeout=_CONNECT_TIMEOUT_SECONDS) as conn:
-            columns_by_table = _fetch_columns(conn, self.default_schema)
-            fk_by_table = _fetch_foreign_tables(conn, self.default_schema)
+        """Build table-level schema chunks for retrieval without reading row data.
+
+        Filtered to `public` (`default_schema`) alone - see the module
+        docstring for why that scope is deliberate. `_fetch_columns`/`_fetch_
+        primary_keys`/`_fetch_foreign_keys` still key everything by
+        `(schema, table)` rather than bare `table_name`: a single-schema
+        filter means today's query results can never actually collide, but
+        keying by the pair is what keeps that true if Task 6 ever widens
+        `schema_names` beyond one element, rather than relying on the filter
+        alone the way the pre-Task-5 version implicitly did.
+
+        Reads through `_connect_read_only`, the same connection `execute()`
+        uses - see `raw_schema()`'s docstring for why.
+        """
+        schema_names = [self.default_schema]
+        with _connect_read_only(self.dsn) as conn:
+            columns_by_table = _fetch_columns(conn, schema_names)
+            pk_by_table = _fetch_primary_keys(conn, schema_names)
+            fk_by_table = _fetch_foreign_keys(conn, schema_names)
 
             chunks: list[SchemaChunk] = []
-            for table_name in sorted(columns_by_table):
-                typed_columns = columns_by_table[table_name]
+            for schema_name, table_name in sorted(columns_by_table):
+                typed_columns = columns_by_table[(schema_name, table_name)]
                 columns = [c for c, _, _ in typed_columns]
-                foreign_tables = sorted(fk_by_table.get(table_name, set()))
-                ddl = _table_ddl(table_name, typed_columns)
-                untyped_columns = [(c, t) for c, t, _ in typed_columns]
-                value_hints = _value_hints_for_table(
-                    conn, self.default_schema, table_name, untyped_columns
+                pk_columns = pk_by_table.get((schema_name, table_name), [])
+                foreign_keys = fk_by_table.get((schema_name, table_name), [])
+                foreign_tables = sorted({fk.ref_table for fk in foreign_keys})
+                ddl = _table_ddl(
+                    schema_name,
+                    table_name,
+                    typed_columns,
+                    pk_columns,
+                    foreign_keys,
+                    default_schema=self.default_schema,
                 )
+                untyped_columns = [(c, t) for c, t, _ in typed_columns]
+                value_hints = _value_hints_for_table(conn, schema_name, table_name, untyped_columns)
                 value_text = " ".join(value for values in value_hints.values() for value in values)
                 search_text = " ".join([table_name, ddl, *columns, *foreign_tables, value_text])
                 chunks.append(
@@ -502,23 +693,60 @@ class PostgresEngine:
         return chunks
 
     def schema_fingerprint(self) -> tuple[object, ...]:
-        """Hash `information_schema.columns` for `public` into a cache key.
+        """Hash table names, column names/types and foreign keys into a cache key.
 
-        Deterministically ordered, so the hash is stable when nothing changes
-        and changes whenever a table, column or column's type does - Task 5
-        is where this grows the same semantics-hardening the other two
-        engines' fingerprints already have (their file-`mtime`-based ones
-        aren't a model PostgreSQL can follow at all, since there is no single
-        file to stat).
+        Filtered to `public` (`default_schema`) alone, matching `raw_schema()`/
+        `schema_chunks()` - see the module docstring. Nothing row-derived
+        goes into the hash - no row count, no value-hint query - which is
+        what `tests/test_engine_postgres.py::
+        test_the_fingerprint_changes_on_ddl_but_not_on_insert` proves
+        directly: this must be stable across a plain `INSERT`, or every
+        write to the database would invalidate `schema.py`'s cache.
+        `is_nullable` and `ordinal_position` are included beyond the design
+        doc's literal "table names, column names and types, and foreign
+        keys" - a nullability change or a column reorder is still
+        schema-derived, not row-derived, and either should still invalidate
+        the cache. Foreign keys are new in this hash; Task 2's version
+        hashed columns alone, so adding or dropping a foreign key with no
+        column-level change went unnoticed by the cache.
+
+        Reads through `_connect_read_only`, the same connection `execute()`
+        uses - see `raw_schema()`'s docstring for why.
         """
-        with psycopg.connect(self.dsn, connect_timeout=_CONNECT_TIMEOUT_SECONDS) as conn:
-            rows = conn.execute(
-                "SELECT table_name, column_name, data_type, is_nullable, ordinal_position "
+        schema_names = [self.default_schema]
+        with _connect_read_only(self.dsn) as conn:
+            column_rows = conn.execute(
+                "SELECT table_schema, table_name, column_name, data_type, "
+                "is_nullable, ordinal_position "
                 "FROM information_schema.columns "
-                "WHERE table_schema = %s ORDER BY table_name, ordinal_position",
-                (self.default_schema,),
+                "WHERE table_schema = ANY(%s) "
+                "ORDER BY table_schema, table_name, ordinal_position",
+                (schema_names,),
             ).fetchall()
-        digest = hashlib.sha256(repr(rows).encode()).hexdigest()
+            fk_rows = conn.execute(
+                "SELECT nsp.nspname, cls.relname, con.conname, "
+                "array_agg(att.attname ORDER BY k.ord) AS local_columns, "
+                "fnsp.nspname, fcls.relname, "
+                "array_agg(fatt.attname ORDER BY k.ord) AS ref_columns "
+                "FROM pg_constraint con "
+                "JOIN pg_class cls ON cls.oid = con.conrelid "
+                "JOIN pg_namespace nsp ON nsp.oid = cls.relnamespace "
+                "JOIN pg_class fcls ON fcls.oid = con.confrelid "
+                "JOIN pg_namespace fnsp ON fnsp.oid = fcls.relnamespace "
+                "JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY "
+                "AS k(local_attnum, ref_attnum, ord) ON true "
+                "JOIN pg_attribute att "
+                "ON att.attrelid = con.conrelid AND att.attnum = k.local_attnum "
+                "JOIN pg_attribute fatt "
+                "ON fatt.attrelid = con.confrelid AND fatt.attnum = k.ref_attnum "
+                "WHERE con.contype = 'f' AND nsp.nspname = ANY(%s) "
+                "GROUP BY con.oid, nsp.nspname, cls.relname, con.conname, "
+                "fnsp.nspname, fcls.relname "
+                "ORDER BY nsp.nspname, cls.relname, con.conname",
+                (schema_names,),
+            ).fetchall()
+        digest_input = repr((schema_names, column_rows, fk_rows))
+        digest = hashlib.sha256(digest_input.encode()).hexdigest()
         return (self.default_schema, digest)
 
     def table_names(self) -> frozenset[str]:

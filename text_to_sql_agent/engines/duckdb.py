@@ -24,7 +24,11 @@ from pathlib import Path
 
 import duckdb
 
-from ..config import DEFAULT_VALUE_HINT_LIMIT, DEFAULT_VALUE_HINT_MAX_CARDINALITY
+from ..config import (
+    DEFAULT_VALUE_HINT_LIMIT,
+    DEFAULT_VALUE_HINT_MAX_CARDINALITY,
+    DEFAULT_WORK_LIMIT_MS,
+)
 from ..types import QueryResult, SchemaChunk
 from .base import EngineUnreachableError
 
@@ -132,6 +136,12 @@ class DuckDBEngine:
     # as a separate protocol-facing attribute rather than aliased to it, so
     # this class's public surface doesn't depend on a module-private name.
     default_schema: str = _MAIN_SCHEMA
+    # Milliseconds, like PostgreSQL's - see `Engine.default_work_limit`. This
+    # is the fix for the pre-Task-5 bug where `execution.execute_query`
+    # passed SQLite's 100_000-VM-step figure straight through as
+    # milliseconds, making every DuckDB (and PostgreSQL) query's default
+    # budget ~100 seconds instead of the design's intended 5.
+    default_work_limit: int = DEFAULT_WORK_LIMIT_MS
     # DuckDB's own catalogue functions (duckdb_tables(), duckdb_constraints(),
     # ...) and its Postgres-compatibility views (pg_catalog etc.) are both
     # readable from a read-only connection, unlike sqlite_master's write-only

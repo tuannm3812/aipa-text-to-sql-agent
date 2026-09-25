@@ -67,6 +67,17 @@ class Engine(Protocol):
     # on the protocol now so every implementation states its own value rather
     # than one being added later with no engine actually holding it.
     default_schema: str
+    # The `work_limit` `execute()` receives when a caller does not pass one
+    # explicitly - see `execution.execute_query`. Each engine's `work_limit`
+    # is in its own unit (SQLite counts VM steps, DuckDB and PostgreSQL count
+    # milliseconds), so this must be the right number *in that engine's own
+    # unit*, not a single value shared across engines - passing SQLite's
+    # 100_000-VM-step figure straight through as milliseconds to a
+    # millisecond engine is a ~100-second timeout, not the ~5-second one the
+    # design intends. SQLite's own value and error code
+    # (`QUERY_ABORTED_AFTER_100000_VM_STEPS`) are pinned by
+    # `tests/test_execution.py` and must not change.
+    default_work_limit: int
     internal_prefixes: tuple[str, ...]
     internal_names: frozenset[str]
     allowed_functions: frozenset[str] | None

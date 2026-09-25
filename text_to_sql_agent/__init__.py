@@ -17,6 +17,7 @@ from .config import (
     DEFAULT_RAG_TOP_K,
     DEFAULT_VALUE_HINT_LIMIT,
     DEFAULT_VALUE_HINT_MAX_CARDINALITY,
+    DEFAULT_WORK_LIMIT_MS,
     RAG_SYNONYMS,
 )
 from .data_setup import create_dummy_university_data, write_university_db
@@ -54,6 +55,7 @@ __all__ = [
     "DEFAULT_RAG_TOP_K",
     "DEFAULT_VALUE_HINT_LIMIT",
     "DEFAULT_VALUE_HINT_MAX_CARDINALITY",
+    "DEFAULT_WORK_LIMIT_MS",
     "Engine",
     "QueryResult",
     "RAG_SYNONYMS",

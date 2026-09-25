@@ -12,7 +12,11 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from ..config import DEFAULT_VALUE_HINT_LIMIT, DEFAULT_VALUE_HINT_MAX_CARDINALITY
+from ..config import (
+    DEFAULT_MAX_VM_STEPS,
+    DEFAULT_VALUE_HINT_LIMIT,
+    DEFAULT_VALUE_HINT_MAX_CARDINALITY,
+)
 from ..types import QueryResult, SchemaChunk
 from .base import EngineUnreachableError
 
@@ -126,6 +130,9 @@ class SQLiteEngine:
     # what an unqualified table name resolves against, and the only schema
     # `safety.py`'s qualifier check accepts today.
     default_schema: str = "main"
+    # SQLite's own unit: a VM-instruction count, unchanged by Phase 3b's
+    # PostgreSQL work - see `Engine.default_work_limit`.
+    default_work_limit: int = DEFAULT_MAX_VM_STEPS
     internal_prefixes: tuple[str, ...] = ("sqlite_", "pragma_")
     internal_names: frozenset[str] = frozenset({"dbstat"})
     # `None` keeps `is_safe_query`'s original blocklist-only behaviour for

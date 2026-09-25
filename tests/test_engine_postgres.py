@@ -30,6 +30,9 @@ defence).
 
 from __future__ import annotations
 
+import time
+from unittest.mock import patch
+
 import pytest
 import sqlglot
 from sqlglot import exp
@@ -38,8 +41,10 @@ psycopg = pytest.importorskip("psycopg", reason="install the postgres extra")
 
 from text_to_sql_agent import is_safe_query  # noqa: E402
 from text_to_sql_agent import safety as _safety  # noqa: E402
+from text_to_sql_agent.config import DEFAULT_VALUE_HINT_LIMIT  # noqa: E402
 from text_to_sql_agent.engines import open_engine  # noqa: E402
 from text_to_sql_agent.engines.postgres import PostgresEngine  # noqa: E402
+from text_to_sql_agent.execution import execute_query  # noqa: E402
 
 
 def _as_postgres_superuser(dsn: str) -> str:
@@ -1014,3 +1019,217 @@ def test_analytics_corpus_passes_validation_and_executes(postgres_dsn: str, sql:
     assert is_safe_query(sql, engine=engine), f"wrongly rejected: {sql!r}"
     result = engine.execute(sql, max_rows=1000, work_limit=0)
     assert result.ok, f"{sql!r} failed to execute: {result.error}"
+
+
+# --- Task 5: harden the schema layer ----------------------------------------
+#
+# Task 2 wrote the straightforward version of raw_schema()/schema_chunks()/
+# schema_fingerprint() - enough for test_engine_conformance.py's generic,
+# per-engine assertions. These tests prove the conditions that suite cannot
+# reach: DDL that reads like DDL (PK/FK present), a fingerprint that tracks
+# DDL and ignores row data, and - the exact defect the 2026-09-25 DuckDB fix
+# (`duckdb.py`'s module docstring, `docs/3_decisions.md`) found the hard way
+# - that keying by bare table name, not `(schema, table)`, is what crashes or
+# corrupts schema-building the moment two schemas share a table name.
+#
+# `docs/3_decisions.md`'s 2026-09-25 entry scoped DuckDB to its `main` schema
+# alone specifically so a table outside it is never advertised by `raw_
+# schema()`/`schema_chunks()` only to be rejected by `safety.py`'s validator
+# (which still only accepts `main`/`public`, Task 6's job to widen) - the
+# same "advertised then blocked" inversion that entry closed for DuckDB would
+# reopen for PostgreSQL if `schema_chunks()` read beyond `public` today. So
+# `PostgresEngine`'s exposed surface stays `public`-only here; what Task 5
+# hardens is the *mechanism* (`_fetch_columns`/`_fetch_primary_keys`/`_fetch_
+# foreign_keys`, all keyed by `(schema, table)`) that Task 6 will lean on
+# once it widens the one-element `[default_schema]` list these methods pass
+# today.
+
+
+def test_raw_schema_includes_primary_key_and_foreign_key(postgres_dsn: str) -> None:
+    """`raw_schema()`'s synthesised DDL must carry PK/FK, not just column
+    types - the LLM prompt shows this text directly (task brief Step 1), and
+    Task 2's version had neither.
+    """
+    engine = open_engine(postgres_dsn)
+    schema = engine.raw_schema()
+    assert "PRIMARY KEY" in schema
+    assert "FOREIGN KEY" in schema
+    assert "REFERENCES" in schema
+    assert '"customer_id"' in schema
+    assert "NOT NULL" in schema  # sale_id/customer_id (customers) are NOT NULL
+
+
+def test_schema_chunks_value_hints_stay_low_cardinality_only(postgres_dsn: str) -> None:
+    """`sales.category`/`status`/`region` are the realistic hint candidates
+    (task brief context); `sale_id`/`amount`/`sale_date`/`customer_id` are
+    not low-cardinality text columns and must carry none - the standard's
+    §4 row-data rule is what `DEFAULT_VALUE_HINT_MAX_CARDINALITY` enforces,
+    this just proves it held after Task 5's rewrite.
+    """
+    engine = open_engine(postgres_dsn)
+    chunks = {c.table_name: c for c in engine.schema_chunks()}
+    hints = chunks["sales"].value_hints or {}
+    assert set(hints) == {"category", "status", "region"}
+    for values in hints.values():
+        assert len(values) <= DEFAULT_VALUE_HINT_LIMIT
+
+
+def test_schema_extraction_uses_the_read_only_connection(postgres_dsn: str) -> None:
+    """`raw_schema()`/`schema_chunks()`/`schema_fingerprint()` must route
+    through `_connect_read_only`, the same connection `execute()` uses - not
+    a plain `psycopg.connect`, which is what Task 2's version did. The
+    module's own docstring says "neither alone is enough"; a schema-reading
+    method holding a connection with a wider guarantee than the one that
+    runs real queries contradicts that, even though only fixed catalogue SQL
+    runs here today.
+    """
+    from text_to_sql_agent.engines import postgres as postgres_module
+
+    engine = open_engine(postgres_dsn)
+    with patch(
+        "text_to_sql_agent.engines.postgres._connect_read_only",
+        wraps=postgres_module._connect_read_only,
+    ) as spy:
+        engine.raw_schema()
+        engine.schema_chunks()
+        engine.schema_fingerprint()
+    assert spy.call_count == 3
+
+
+def test_the_fingerprint_changes_on_ddl_but_not_on_insert(postgres_dsn: str) -> None:
+    """The task brief's "one test with teeth": a fingerprint built over row
+    data would invalidate `schema.py`'s cache on every write. Proves both
+    directions against the live database, DDL via the superuser connection -
+    `aipa_ro` holds no DDL grant.
+    """
+    engine = open_engine(postgres_dsn)
+    before = engine.schema_fingerprint()
+
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        conn.execute("CREATE TABLE task5_fingerprint_probe (x INTEGER)")
+    try:
+        after_ddl = engine.schema_fingerprint()
+        assert after_ddl != before, "must change when a table is created"
+
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            conn.execute(
+                "INSERT INTO sales "
+                "(sale_id, customer_id, sale_date, amount, category, status, region) "
+                "VALUES (90001, 1, '2024-06-01', 42.0, 'widgets', 'completed', 'north')"
+            )
+        try:
+            after_insert = engine.schema_fingerprint()
+            assert after_insert == after_ddl, "must NOT change when only a row is inserted"
+        finally:
+            with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+                conn.execute("DELETE FROM sales WHERE sale_id = 90001")
+    finally:
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            conn.execute("DROP TABLE IF EXISTS task5_fingerprint_probe")
+
+
+def test_fetch_columns_keys_by_schema_and_table_not_bare_name(postgres_dsn: str) -> None:
+    """The mechanism-level proof: `_fetch_columns` (and, by the same
+    construction, `_fetch_primary_keys`/`_fetch_foreign_keys`) must not merge
+    two schemas' columns for a same-named table - the exact defect the
+    2026-09-25 DuckDB fix found (`duckdb.py`'s module docstring), one engine
+    over. Calls the private helper directly with two schema names, since
+    `PostgresEngine.schema_chunks()` itself deliberately never queries beyond
+    `public` (see the section docstring above) - this is what proves the
+    keying fix Task 6 will rely on when it widens that one-element list.
+    """
+    from text_to_sql_agent.engines.postgres import _connect_read_only, _fetch_columns
+
+    schema = "task5_other_schema"
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        conn.execute(f"CREATE SCHEMA {schema}")
+        conn.execute(f"GRANT USAGE ON SCHEMA {schema} TO aipa_ro")
+        conn.execute(
+            f"CREATE TABLE {schema}.customers "
+            "(widget_id INTEGER PRIMARY KEY, widget_name TEXT, extra_col TEXT)"
+        )
+        conn.execute(f"GRANT SELECT ON {schema}.customers TO aipa_ro")
+    try:
+        with _connect_read_only(postgres_dsn) as conn:
+            columns_by_table = _fetch_columns(conn, ["public", schema])
+
+        public_columns = [c for c, _, _ in columns_by_table[("public", "customers")]]
+        other_columns = [c for c, _, _ in columns_by_table[(schema, "customers")]]
+        assert public_columns == ["customer_id", "name"]
+        assert other_columns == ["widget_id", "widget_name", "extra_col"]
+        # No cross-contamination in either direction.
+        assert "widget_id" not in public_columns
+        assert "customer_id" not in other_columns
+    finally:
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+def test_a_table_outside_public_is_never_advertised(postgres_dsn: str) -> None:
+    """The other half of the `docs/3_decisions.md` scoping: a table living
+    only in a second schema must not appear in `raw_schema()` or `table_
+    names()` - mirrors `test_engine_duckdb.py::
+    test_table_outside_main_is_never_advertised_or_accepted` for the same
+    documented reason, one engine over.
+    """
+    schema = "task5_only_schema"
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        conn.execute(f"CREATE SCHEMA {schema}")
+        conn.execute(f"GRANT USAGE ON SCHEMA {schema} TO aipa_ro")
+        conn.execute(f"CREATE TABLE {schema}.only_here (a INTEGER)")
+        conn.execute(f"GRANT SELECT ON {schema}.only_here TO aipa_ro")
+    try:
+        engine = open_engine(postgres_dsn)
+        assert "only_here" not in engine.raw_schema()
+        assert "only_here" not in engine.table_names()
+    finally:
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+# --- Task 5: the work-limit unit fix ----------------------------------------
+#
+# `config.DEFAULT_MAX_VM_STEPS` (100_000) is a SQLite VM-instruction count.
+# `execution.execute_query` used to pass it verbatim as `work_limit` to
+# whichever engine a DSN resolves to, so PostgreSQL (and DuckDB) got a
+# ~100-second `statement_timeout` instead of the design's intended 5 seconds.
+# The fix is `Engine.default_work_limit`, read by `execute_query` only when
+# its own caller passes no explicit `max_vm_steps`.
+
+
+def test_postgres_default_work_limit_is_5000_ms() -> None:
+    assert PostgresEngine.default_work_limit == 5000
+
+
+def test_a_slow_postgres_query_aborts_near_5_seconds_not_100(postgres_dsn: str) -> None:
+    """`execute_query`'s caller-omitted default must resolve to `Postgres
+    Engine.default_work_limit` (5000 ms) - proven end-to-end, through the
+    same public entry point `pipeline.py`/`evaluation.py` call, not just
+    `engine.execute` directly. `pg_sleep` is refused by `is_safe_query` (see
+    `_DANGEROUS_FUNCTION_PROBES` above) but not by the connection or the
+    `aipa_ro` role's own grants, so calling `execute_query` - which, like
+    `engine.execute`, bypasses `is_safe_query` - reaches PostgreSQL for real,
+    the same bypass every other conformance-style probe in this file relies
+    on.
+    """
+    start = time.monotonic()
+    result = execute_query(postgres_dsn, "SELECT pg_sleep(20)")
+    elapsed = time.monotonic() - start
+
+    assert result.error == "QUERY_ABORTED_AFTER_5000_MS"
+    assert elapsed < 15, f"aborted after {elapsed:.1f}s - too slow for a 5s statement_timeout"
+
+
+def test_sqlite_default_work_limit_is_unchanged() -> None:
+    """The other half of the fix: a SQLite database must still resolve
+    `execute_query`'s default to 100_000 VM steps, not PostgreSQL's
+    millisecond figure - `tests/test_execution.py::
+    test_execute_query_returns_typed_error_when_aborted` already pins the
+    exact error code end-to-end; this is the narrower, engine-attribute-level
+    check that explains why that test still passes unchanged.
+    """
+    from text_to_sql_agent.engines.sqlite import SQLiteEngine
+
+    assert SQLiteEngine.default_work_limit == 100_000

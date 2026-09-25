@@ -12,8 +12,21 @@ DEFAULT_MAX_ROWS = 1_000
 # SQLite virtual-machine steps a single query may run before it is aborted.
 # This is a runaway-query guard for the hosted demo, where anyone can submit a
 # query: a cross join over a large table would otherwise run unbounded. All 12
-# gold evaluation cases complete well inside it. 0 disables the guard.
+# gold evaluation cases complete well inside it. 0 disables the guard. This is
+# SQLiteEngine's own `default_work_limit` - a VM-instruction count, not a time
+# budget, and specific to SQLite's `work_limit` unit alone. See
+# DEFAULT_WORK_LIMIT_MS for the millisecond engines (DuckDB, PostgreSQL); do
+# not pass this constant to either of them - `execution.execute_query` used
+# to do exactly that (a ~100-second timeout instead of the intended 5), which
+# is the bug `Engine.default_work_limit` fixes.
 DEFAULT_MAX_VM_STEPS = 100_000
+# Milliseconds a single query may run on a server engine (DuckDB, PostgreSQL)
+# before it is aborted - each engine's own `default_work_limit`. A wall-clock
+# budget, not an instruction count, which is why it is a separate constant
+# from DEFAULT_MAX_VM_STEPS rather than the same number reused across units.
+# Matches the design's QUERY_ABORTED_AFTER_5000_MS
+# (docs/superpowers/specs/2026-09-14-phase-3-engine-abstraction-design.md §4.5).
+DEFAULT_WORK_LIMIT_MS = 5_000
 DEFAULT_RAG_TOP_K = 6
 DEFAULT_RAG_NEIGHBORS = 1
 DEFAULT_RAG_SEMANTIC_WEIGHT = 3.0
