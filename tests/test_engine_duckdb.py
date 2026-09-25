@@ -1004,6 +1004,21 @@ ANALYTICS_CORPUS = [
     "SELECT order_id, list_aggregate(tags, 'count') AS tag_count FROM orders",
     "SELECT COUNT(*) FROM main.orders",
     'SELECT COUNT(*) FROM "order items"',
+    # False-rejection fix (2026-09-26 review round): sqlglot parses `AND`,
+    # `OR` and `EXISTS` as `exp.Func` subclasses, which the default-deny
+    # function-name gate previously rejected outright since `"and"`/`"or"`/
+    # `"exists"` are not - and structurally cannot be - entries in
+    # `allowed_functions`. These shapes are what the corpus missed before
+    # this fix: a multi-condition `WHERE` joined by `AND`, one joined by
+    # `OR`, and an `EXISTS` subquery predicate. See `safety.
+    # _PURE_SYNTAX_FUNC_TYPES` for the structural fix and why it is not a
+    # three-name addition to this file's own allowlist instead.
+    "SELECT order_id FROM orders WHERE amount > 50 AND status = 'completed'",
+    "SELECT order_id FROM orders WHERE status = 'refunded' OR status = 'pending'",
+    (
+        "SELECT c.name FROM customers c WHERE EXISTS "
+        "(SELECT 1 FROM orders o WHERE o.customer_id = c.customer_id)"
+    ),
 ]
 
 

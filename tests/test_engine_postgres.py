@@ -729,7 +729,7 @@ def test_column_call_bypass_is_rejected(engine_with_table_t, label: str, sql: st
 
 # The Bypass 3 fix is default-deny over *qualified* column references, so the
 # thing it must not do is reject ordinary analytics SQL that qualifies its
-# columns - which is most real SQL. Beyond `ANALYTICS_CORPUS` below (32
+# columns - which is most real SQL. Beyond `ANALYTICS_CORPUS` below (35
 # queries, all of which both validate and execute), these are the shapes
 # where a qualifier resolves to something other than a plain base table:
 # derived tables, explicit CTE column alias lists, `LATERAL`, self-joins,
@@ -769,20 +769,30 @@ _LEGITIMATE_QUALIFIED_COLUMN_QUERIES: list[tuple[str, str]] = [
         "SELECT c.name FROM customers AS c JOIN LATERAL "
         "(SELECT s.amount FROM sales s WHERE s.customer_id = c.customer_id) l ON TRUE",
     ),
+    # `... WHERE EXISTS (SELECT 1 FROM sales s ...)` used to be excluded from
+    # this list, for reasons that had nothing to do with Bypass 3: `exp.
+    # Exists` is an `exp.Func` subclass, and before the 2026-09-26
+    # false-rejection fix (`safety._PURE_SYNTAX_FUNC_TYPES`), the
+    # default-deny function-name gate rejected it outright since `"exists"`
+    # is not - and structurally cannot be - an entry in
+    # `PostgresEngine.allowed_functions`. Included here now that it
+    # correctly validates.
+    (
+        "exists_subquery",
+        "SELECT c.name FROM customers c WHERE EXISTS "
+        "(SELECT 1 FROM sales s WHERE s.customer_id = c.customer_id)",
+    ),
 ]
-# Two shapes deliberately left out of the list above, because both are
-# already refused at BASE (commit 30baa70) for reasons that have nothing to
-# do with Bypass 3, and listing them here would misattribute a pre-existing
-# limitation to this fix:
-#   - `... WHERE EXISTS (SELECT 1 FROM customers c ...)` - `exp.Exists` is an
-#     `exp.Func` subclass and `"exists"` is not in
-#     `PostgresEngine.allowed_functions`.
+# One shape deliberately left out of the list above, because it is already
+# refused at BASE (commit 30baa70) for reasons that have nothing to do with
+# Bypass 3, and listing it here would misattribute a pre-existing limitation
+# to this fix:
 #   - `SELECT public.customers.name FROM public.customers` -
 #     `_references_unknown_table` still hardcodes `"main"` as the only
 #     acceptable schema qualifier; PostgreSQL's is `"public"`
 #     (`PostgresEngine.default_schema`). Phase 3b Task 6 is where
 #     `default_schema` gets wired through that check.
-# Both were re-confirmed False at BASE on 2026-09-26 before being excluded.
+# Re-confirmed False at BASE on 2026-09-26 before being excluded.
 
 
 @pytest.mark.parametrize(
@@ -964,6 +974,22 @@ ANALYTICS_CORPUS: list[str] = [
         "FROM sales s JOIN customers c ON c.customer_id = s.customer_id "
         "WHERE s.status = 'completed' "
         "GROUP BY s.region, month ORDER BY month, s.region"
+    ),
+    # False-rejection fix (2026-09-26 review round): sqlglot parses `AND`,
+    # `OR` and `EXISTS` as `exp.Func` subclasses, which the default-deny
+    # function-name gate previously rejected outright since `"and"`/`"or"`/
+    # `"exists"` are not - and structurally cannot be - entries in
+    # `allowed_functions`. These shapes are what the corpus missed before
+    # this fix, and exactly the "EXISTS" case the comment above
+    # `_LEGITIMATE_QUALIFIED_COLUMN_QUERIES` used to carve out as a known,
+    # pre-existing limitation. See `safety._PURE_SYNTAX_FUNC_TYPES` for the
+    # structural fix and why it is not a three-name addition to this file's
+    # own allowlist instead.
+    "SELECT sale_id FROM sales WHERE amount > 50 AND status = 'completed'",
+    "SELECT sale_id FROM sales WHERE status = 'refunded' OR status = 'pending'",
+    (
+        "SELECT c.name FROM customers c WHERE EXISTS "
+        "(SELECT 1 FROM sales s WHERE s.customer_id = c.customer_id)"
     ),
 ]
 

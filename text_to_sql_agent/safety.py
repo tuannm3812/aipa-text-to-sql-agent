@@ -230,6 +230,74 @@ def _dispatches_to_disallowed_function(
     return target not in allowed_functions
 
 
+# False-rejection fix (2026-09-26): sqlglot models `AND`, `OR` and `EXISTS`
+# as `exp.Func` subclasses (`exp.And`, `exp.Or`, `exp.Exists`) purely so its
+# own AST has one base class to hang `Binary`/`SubqueryPredicate` behaviour
+# off of - not because PostgreSQL or DuckDB treat them as catalogue
+# functions. Before this fix, `_references_disallowed_function`'s
+# `find_all(exp.Func)` walk reached every one of them and rejected the
+# statement outright, since `"and"`/`"or"`/`"exists"` are in neither engine's
+# `allowed_functions`: any query with two conditions joined by `AND`, or an
+# `OR`, or an `EXISTS (...)` subquery anywhere in it - which is most real
+# analytical SQL - was refused with `BLOCKED_UNSAFE_SQL`.
+#
+# The fix is structural (by node *type*), not by adding `"and"`/`"or"`/
+# `"exists"` as three more literal strings to two allowlists. An allowlist
+# entry means "this name may dispatch to a callable the engine looks up in
+# its function catalogue" - that is what a reviewer reading
+# `DuckDBEngine.allowed_functions`/`PostgresEngine.allowed_functions` is
+# entitled to assume every entry means, and it is what makes those lists
+# auditable. `AND`/`OR`/`EXISTS` do not fit that meaning at all: they are
+# reserved-keyword grammar, not identifiers a caller writes and a catalogue
+# resolves.
+#
+# Each of the three was checked to confirm it truly cannot reach a callable
+# dispatch, not merely assumed:
+#
+#   - `exp.And`/`exp.Or`: only ever produced by parsing the infix keywords
+#     `AND`/`OR` between two boolean expressions. `AND`/`OR` are reserved
+#     words in both dialects' grammars, so there is no spelling
+#     (`and(a, b)`, a schema-qualified `pg_catalog.and(...)`, a quoted
+#     `"and"(...)`) that parses as a function call instead - verified
+#     2026-09-26: `sqlglot.parse_one("SELECT and(true, false)", read=<either
+#     dialect>)` raises `ParseError` ("Required keyword: 'this' missing"),
+#     because the parser commits to the infix-operator production the moment
+#     it sees the `AND` token and then has nowhere to put a following `(`.
+#     There is no catalogue entry either grammar could route a call to even
+#     if one were somehow written.
+#   - `exp.Exists`: only ever produced by the `EXISTS ( ... )` predicate
+#     grammar, which requires the parenthesised argument to immediately
+#     follow the reserved word `EXISTS` and produces this node whether or
+#     not there is a preceding qualifier - `SELECT exists(true)` and
+#     `WHERE EXISTS (SELECT 1 ...)` both parse to `exp.Exists` (verified
+#     2026-09-26, both dialects). Nothing about that grammar production ever
+#     looks a name up in a function catalogue; `EXISTS` cannot be
+#     schema-qualified, aliased, or shadowed by a user-defined function the
+#     way an ordinary call name can.
+#
+#   `exp.Xor` was considered and deliberately *not* added here, as the
+#   counter-example that proves the other three are not being exempted
+#   merely because they are `Connector`/`SubqueryPredicate` subclasses.
+#   Under the `postgres` dialect, `xor(true, false)` - real parenthesised
+#   call syntax, not an infix keyword - parses to `exp.Xor` (verified
+#   2026-09-26); DuckDB instead resolves that same spelling to
+#   `exp.BitwiseXor`, a distinct, non-exempt class. Because `exp.Xor` *is*
+#   reachable through ordinary call syntax under PostgreSQL, it stays
+#   subject to the same default-deny walk as every other `exp.Func` - it is
+#   simply never in `allowed_functions` today, which is a correct rejection
+#   of an obscure function no business question over this schema needs, not
+#   a false one.
+#
+# This lives here, in shared `safety.py`, rather than as three more entries
+# in `DuckDBEngine.allowed_functions` and `PostgresEngine.allowed_functions`:
+# every current and future default-deny engine benefits from one exemption
+# list keyed on sqlglot's own AST shape, instead of every engine author
+# needing to remember to re-add the same three non-functions by name.
+_PURE_SYNTAX_FUNC_TYPES: tuple[type[sqlglot_exp.Expression], ...] = ()
+if exp is not None:
+    _PURE_SYNTAX_FUNC_TYPES = (exp.And, exp.Or, exp.Exists)
+
+
 def _references_disallowed_function(
     parsed: sqlglot_exp.Expression, *, allowed_functions: frozenset[str]
 ) -> bool:
@@ -249,6 +317,14 @@ def _references_disallowed_function(
     second string-literal argument, to a function that is not - see
     `_dispatches_to_disallowed_function`.
 
+    `exp.Func` nodes in `_PURE_SYNTAX_FUNC_TYPES` (`AND`/`OR`/`EXISTS`) are
+    skipped entirely rather than name-checked - see that constant's comment
+    for why each one is pure grammar with no catalogue dispatch to gate.
+    This only skips the check for the node itself; every descendant is still
+    reached by this same `find_all(exp.Func)` walk, so
+    `SELECT x FROM t WHERE a = 1 AND current_setting('x') = 'y'` is still
+    rejected on `current_setting` regardless of the `AND` wrapping it.
+
     Args:
         parsed: The parsed statement.
         allowed_functions: The engine's function allowlist. Only called when
@@ -260,6 +336,8 @@ def _references_disallowed_function(
     if exp is None:
         return True
     for function in parsed.find_all(exp.Func):
+        if isinstance(function, _PURE_SYNTAX_FUNC_TYPES):
+            continue
         resolved = _resolve_function_name(function)
         if resolved not in allowed_functions:
             return True
