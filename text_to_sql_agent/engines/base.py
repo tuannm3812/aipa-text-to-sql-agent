@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Protocol, runtime_checkable
 
 from ..types import QueryResult, SchemaChunk
@@ -39,6 +39,41 @@ def table_name_spellings(chunks: Iterable[SchemaChunk], *, default_schema: str) 
             names.add(bare)
             names.add(f"{default_schema.lower()}.{bare}")
     return frozenset(names)
+
+
+def table_column_spellings(
+    chunks: Iterable[SchemaChunk], *, default_schema: str
+) -> dict[str, frozenset[str]]:
+    """Each queryable table spelling mapped to that table's own columns, lowercased.
+
+    The one implementation of `Engine.table_columns()`'s contract, keyed by
+    exactly the spellings `table_name_spellings` above produces, and shared
+    for the same reason: the validator resolves a qualified column against
+    *one table's* columns, so "which columns does this spelling have" must not
+    drift from "which spellings are real".
+
+    Per-table rather than a flat union deliberately, and that distinction is
+    load-bearing security (2026-09-26): a flat union over every readable
+    schema re-armed the `alias.name` function-call bypass the moment a column
+    anywhere in the database happened to be named after a single-argument
+    catalogue function. See
+    `safety._references_unresolvable_qualified_column`.
+
+    Args:
+        chunks: The engine's schema chunks, each carrying its own
+            `schema_name` (empty for the default schema).
+        default_schema: The engine's `default_schema`.
+
+    Returns:
+        Every spelling in `table_name_spellings(chunks, ...)`, mapped to the
+        lowercased column names of the table it spells.
+    """
+    columns_by_spelling: dict[str, frozenset[str]] = {}
+    for chunk in chunks:
+        columns = frozenset(column.lower() for column in chunk.columns)
+        for spelling in table_name_spellings([chunk], default_schema=default_schema):
+            columns_by_spelling[spelling] = columns
+    return columns_by_spelling
 
 
 class EngineError(Exception):
@@ -181,16 +216,23 @@ class Engine(Protocol):
         """
         ...
 
-    def column_names(self) -> frozenset[str]:
-        """Every user table's column names, lowercased, unioned across tables.
+    def table_columns(self) -> Mapping[str, frozenset[str]]:
+        """Each spelling `table_names()` advertises, mapped to that table's columns.
 
         Used by `safety.is_safe_query`'s default-deny *column* check
         (`_references_unresolvable_qualified_column`), which extends
         default-deny from functions and tables to the qualified-column
-        position PostgreSQL also reads as a function call - see that
-        function's docstring for the bypass it closes and why the union
-        across tables (rather than a per-table resolution) is the right
-        granularity here.
+        position PostgreSQL also reads as a function call.
+
+        Per table, not a union across tables. It was a union
+        (`column_names()`) until 2026-09-26: Task 6 widened every engine from
+        one schema to every schema the role can read, which silently widened
+        that union to every column in the database and re-armed the bypass -
+        a table named after a single-argument catalogue function in any
+        readable schema was enough. The validator now resolves each qualifier
+        against the one table it names, so a function scan (which has no table
+        columns at all) can no longer borrow another table's column name. See
+        `table_column_spellings`, which every engine implements this with.
 
         Only called for an engine whose `allowed_functions` is not `None`
         *and* whose `sqlglot_dialect` is in `safety._DOT_CALL_DIALECTS`, so

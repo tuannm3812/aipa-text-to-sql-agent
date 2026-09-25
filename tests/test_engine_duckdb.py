@@ -1045,14 +1045,16 @@ def test_duckdbs_dialect_is_deliberately_outside_the_dot_call_dialects():
     assert DuckDBEngine.sqlglot_dialect not in _safety._DOT_CALL_DIALECTS
 
 
-def test_duckdb_column_names_reports_the_real_columns(analytics_db):
-    """`Engine.column_names()` is implemented for DuckDB even though
+def test_duckdb_table_columns_reports_each_table_separately(analytics_db):
+    """`Engine.table_columns()` is implemented for DuckDB even though
     `is_safe_query` never calls it here - same principle as `table_names`,
     and pinned so the implementation cannot rot unnoticed behind the dialect
-    gate above.
+    gate above. Keyed per table spelling rather than unioned, matching the
+    2026-09-26 contract change that closed the regression on PostgreSQL.
     """
-    columns = analytics_db.column_names()
-    assert {"order_id", "customer_id", "amount", "order_date", "tags"} <= columns
+    columns = analytics_db.table_columns()
+    assert {"order_id", "customer_id", "amount", "order_date", "tags"} <= columns["orders"]
+    assert columns["main.orders"] == columns["orders"]
 
 
 def test_duckdb_struct_field_access_is_not_treated_as_a_column_call(tmp_path):

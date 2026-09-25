@@ -43,6 +43,7 @@ whatever `search_path` finds first.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,7 +56,7 @@ from ..config import (
     DEFAULT_WORK_LIMIT_MS,
 )
 from ..types import QueryResult, SchemaChunk
-from .base import EngineUnreachableError, table_name_spellings
+from .base import EngineUnreachableError, table_column_spellings, table_name_spellings
 
 _CONNECT_TIMEOUT_SECONDS = 5
 
@@ -830,14 +831,20 @@ class PostgresEngine:
 
         return table_name_spellings(get_schema_chunks(self.dsn), default_schema=self.default_schema)
 
-    def column_names(self) -> frozenset[str]:
-        """Every user table's column names, lowercased, unioned across tables.
+    def table_columns(self) -> Mapping[str, frozenset[str]]:
+        """Each table spelling mapped to that table's own columns, lowercased.
 
         This is what `safety.is_safe_query`'s default-deny column check
         (`_references_unresolvable_qualified_column`) calls to tell a real
         qualified column reference from PostgreSQL's `alias.name` ->
         `name(alias)` function-call sugar. PostgreSQL is the only engine
         that actually reaches it.
+
+        Per table, not unioned across tables: this engine reads every schema
+        the role may use, so a union is a union over every readable schema,
+        which is precisely what re-armed that sugar as a bypass on 2026-09-26
+        (a column named `lo_get` in any readable schema was enough). See
+        `Engine.table_columns` and `base.table_column_spellings`.
 
         Routed through `schema.get_schema_chunks` so it shares the same
         fingerprint-keyed cache `table_names` reads - the two resolve to the
@@ -849,8 +856,9 @@ class PostgresEngine:
         """
         from ..schema import get_schema_chunks
 
-        chunks = get_schema_chunks(self.dsn)
-        return frozenset(column.lower() for chunk in chunks for column in chunk.columns)
+        return table_column_spellings(
+            get_schema_chunks(self.dsn), default_schema=self.default_schema
+        )
 
 
 __all__ = ["PostgresEngine"]

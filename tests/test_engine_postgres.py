@@ -830,16 +830,108 @@ def test_dot_call_dialects_pins_the_postgres_engines_own_dialect() -> None:
     assert PostgresEngine.sqlglot_dialect in _safety._DOT_CALL_DIALECTS
 
 
-def test_postgres_column_names_reports_the_real_columns(postgres_dsn: str) -> None:
-    """`Engine.column_names()` is what `_references_unresolvable_qualified_
+# Regression, 2026-09-26 (second round). Bypass 3's default-deny column check
+# originally resolved `alias.name` against `Engine.column_names()`, a flat
+# union of every advertised column. Phase 3b Task 6 then widened every engine
+# from one schema to every schema the role may read, which silently widened
+# that union to "every column in every readable schema" - and a table named
+# after a single-argument catalogue function, in any of them, re-armed the
+# payload. Reproduced before the fix with the fixture below:
+#
+#   lo_get in the advertised column universe:                        True
+#   is_safe_query("SELECT g.lo_get FROM generate_series(o, o) g"):   True
+#
+# where PostgreSQL then either refuses execution on privileges or, with a
+# readable large object, returns that object's bytes. Proven a regression
+# rather than a pre-existing hole: at the pre-Task-6 commit `a87e8be`, with
+# the same table present, the name was outside the universe and the payload
+# was refused.
+#
+# The fix scopes resolution to the tables the *statement* references, per
+# qualifier - see `safety._references_unresolvable_qualified_column`. The
+# fixture is created by the test itself because the payload is only armed
+# while a column with that name exists somewhere the role can read.
+_HOSTILE_COLUMN_SCHEMA = "ext_hostile_column"
+_HOSTILE_COLUMN_PAYLOADS: list[tuple[str, str]] = [
+    ("aliased_function_scan", "SELECT g.lo_get FROM generate_series(16384,16400) g"),
+    ("unaliased_function_scan", "SELECT generate_series.lo_get FROM generate_series(16384,16400)"),
+    (
+        "function_scan_beside_the_hostile_table",
+        f"SELECT g.lo_get FROM {_HOSTILE_COLUMN_SCHEMA}.audit a, generate_series(16384,16400) g",
+    ),
+    (
+        "lateral_function_scan",
+        "SELECT g.lo_get FROM customers c JOIN LATERAL generate_series(16384,16400) g ON TRUE",
+    ),
+    (
+        "function_scan_inside_a_cte",
+        "WITH t AS (SELECT g.lo_get AS leaked FROM generate_series(16384,16400) g) "
+        "SELECT t.leaked FROM t",
+    ),
+]
+
+
+def test_a_hostile_column_name_elsewhere_cannot_re_arm_the_column_call_bypass(
+    postgres_dsn: str,
+) -> None:
+    """A column named after a catalogue function, in a schema the role may
+    read, must not make `alias.name` resolve for a qualifier that cannot
+    supply it. See the comment above for the regression this pins.
+
+    The same fixture also pins the other direction, which is what stops the
+    fix from being a blunt name ban: `ext.audit`'s own `lo_get` column is a
+    real column, and reading it through its own table's alias still validates
+    *and* executes.
+    """
+    schema = _HOSTILE_COLUMN_SCHEMA
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        conn.execute(f"CREATE SCHEMA {schema}")
+        conn.execute(f"GRANT USAGE ON SCHEMA {schema} TO aipa_ro")
+        conn.execute(f"CREATE TABLE {schema}.audit (lo_get INTEGER, note TEXT)")
+        conn.execute(f"INSERT INTO {schema}.audit VALUES (42, 'ok')")
+        conn.execute(f"GRANT SELECT ON {schema}.audit TO aipa_ro")
+    try:
+        engine = open_engine(postgres_dsn)
+        # The fixture is armed: the hostile name really is an advertised
+        # column of a readable table outside `public`. Without this the
+        # payload assertions below would pass for the wrong reason.
+        assert engine.table_columns()[f"{schema}.audit"] == frozenset({"lo_get", "note"})
+
+        for label, sql in _HOSTILE_COLUMN_PAYLOADS:
+            assert not is_safe_query(sql, engine=engine), f"wrongly accepted ({label}): {sql!r}"
+
+        # Not a name ban: the real column, read through its own table.
+        real = f"SELECT a.lo_get FROM {schema}.audit a"
+        assert is_safe_query(real, engine=engine)
+        assert engine.execute(real, max_rows=10, work_limit=0).rows == [(42,)]
+        # And Task 6's multi-schema identity is untouched.
+        assert is_safe_query(f"SELECT note FROM {schema}.audit", engine=engine)
+    finally:
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+def test_postgres_table_columns_reports_each_table_separately(postgres_dsn: str) -> None:
+    """`Engine.table_columns()` is what `_references_unresolvable_qualified_
     column` resolves against, so an empty or wrong answer here would turn
     Part 2 of the Bypass 3 fix into either a no-op or a blanket refusal
     without any other test necessarily noticing.
+
+    The *separation* is the part with teeth (2026-09-26): this used to be
+    `column_names()`, one flat union over every table, and Task 6's widening
+    to every readable schema turned that union into "every column in the
+    database", which re-armed the `alias.name` bypass. Each spelling must
+    therefore carry its own table's columns and nobody else's.
     """
     engine = open_engine(postgres_dsn)
-    columns = engine.column_names()
-    assert {"customer_id", "name", "amount", "sale_date", "category"} <= columns
-    assert "pg_column_size" not in columns
+    columns = engine.table_columns()
+    assert columns["customers"] == frozenset({"customer_id", "name"})
+    assert columns["public.customers"] == columns["customers"]
+    assert {"amount", "sale_date", "category"} <= columns["sales"]
+    # No union: `sales`-only columns must not appear under `customers`.
+    assert "amount" not in columns["customers"]
+    assert "pg_column_size" not in set().union(*columns.values())
 
 
 def test_collate_is_allowed(postgres_dsn: str) -> None:

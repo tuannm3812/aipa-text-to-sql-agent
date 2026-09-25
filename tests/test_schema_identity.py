@@ -73,6 +73,15 @@ def case(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[_Case]:
 
     For every engine whose DSN model admits one, it also holds
     `analytics.thing`, a table that exists *only* outside the default schema.
+
+    `thing.lo_get` is named after a single-argument PostgreSQL catalogue
+    function deliberately (added 2026-09-26): it is what arms the
+    `column_call_lo_get` probe below. While the validator resolved a
+    qualified column against a flat union of every advertised column, this
+    one column - in a schema only reachable *because* of Task 6's widening -
+    was enough to re-arm PostgreSQL's `alias.name` -> `name(alias)` bypass
+    for every function scan in the database. Unarmed, that probe passes
+    whatever the resolution model does.
     """
     if request.param == "sqlite":
         db = tmp_path / "identity.db"
@@ -89,8 +98,8 @@ def case(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[_Case]:
         con.execute("CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, name TEXT)")
         con.execute("INSERT INTO customers VALUES (1, 'Alice')")
         con.execute(f"CREATE SCHEMA {OTHER_SCHEMA}")
-        con.execute(f"CREATE TABLE {OTHER_SCHEMA}.thing (label VARCHAR)")
-        con.execute(f"INSERT INTO {OTHER_SCHEMA}.thing VALUES ('only-here')")
+        con.execute(f"CREATE TABLE {OTHER_SCHEMA}.thing (label VARCHAR, lo_get INTEGER)")
+        con.execute(f"INSERT INTO {OTHER_SCHEMA}.thing VALUES ('only-here', 1)")
         con.close()
         yield _Case(engine=open_engine(f"duckdb://{db}"), other_schema=OTHER_SCHEMA)
         return
@@ -103,8 +112,8 @@ def case(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[_Case]:
         with psycopg.connect(admin, connect_timeout=5) as conn:
             conn.execute(f"DROP SCHEMA IF EXISTS {OTHER_SCHEMA} CASCADE")
             conn.execute(f"CREATE SCHEMA {OTHER_SCHEMA}")
-            conn.execute(f"CREATE TABLE {OTHER_SCHEMA}.thing (label TEXT)")
-            conn.execute(f"INSERT INTO {OTHER_SCHEMA}.thing VALUES ('only-here')")
+            conn.execute(f"CREATE TABLE {OTHER_SCHEMA}.thing (label TEXT, lo_get INTEGER)")
+            conn.execute(f"INSERT INTO {OTHER_SCHEMA}.thing VALUES ('only-here', 1)")
             conn.execute(f"GRANT USAGE ON SCHEMA {OTHER_SCHEMA} TO aipa_ro")
             conn.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA {OTHER_SCHEMA} TO aipa_ro")
         try:

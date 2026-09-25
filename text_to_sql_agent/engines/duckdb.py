@@ -20,6 +20,7 @@ directly, bypassing `is_safe_query`.
 from __future__ import annotations
 
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 
 import duckdb
@@ -30,7 +31,7 @@ from ..config import (
     DEFAULT_WORK_LIMIT_MS,
 )
 from ..types import QueryResult, SchemaChunk
-from .base import EngineUnreachableError, table_name_spellings
+from .base import EngineUnreachableError, table_column_spellings, table_name_spellings
 
 # DuckDB groups tables into schemas ("main" is the default a bare filesystem
 # path connects into, same as PostgreSQL's "public"). Between 2026-09-25 and
@@ -721,8 +722,8 @@ DUCKDB DIALECT (must follow):
             get_schema_chunks(f"duckdb://{self.dsn}"), default_schema=self.default_schema
         )
 
-    def column_names(self) -> frozenset[str]:
-        """Every user table's column names, lowercased, unioned across tables.
+    def table_columns(self) -> Mapping[str, frozenset[str]]:
+        """Each table spelling mapped to that table's own columns, lowercased.
 
         Never reached by `safety.is_safe_query` for DuckDB: the column check
         that calls this is gated on `safety._DOT_CALL_DIALECTS`, which
@@ -736,8 +737,9 @@ DUCKDB DIALECT (must follow):
         """
         from ..schema import get_schema_chunks
 
-        chunks = get_schema_chunks(f"duckdb://{self.dsn}")
-        return frozenset(column.lower() for chunk in chunks for column in chunk.columns)
+        return table_column_spellings(
+            get_schema_chunks(f"duckdb://{self.dsn}"), default_schema=self.default_schema
+        )
 
 
 __all__ = ["DuckDBEngine"]

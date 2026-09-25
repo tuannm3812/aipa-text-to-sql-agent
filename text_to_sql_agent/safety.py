@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from types import ModuleType
 from typing import TYPE_CHECKING
 
@@ -25,17 +25,26 @@ _ALLOWED_PREFIX = re.compile(r"(?is)^(select|with)\b")
 
 
 def _no_table_names() -> frozenset[str]:
-    """The `get_real_table_names`/`get_real_column_names` default for SQLite.
+    """The `get_real_table_names` default for SQLite.
 
     Never called in practice, since `SQLiteEngine.allowed_functions` is
     `None` and `_references_unknown_table` only runs when it isn't - exists
     so the `engine=None` path has a value of the right type to pass down
-    without instantiating `SQLiteEngine` or touching the filesystem. Shared
-    by both catalogue closures: both are `Callable[[], frozenset[str]]`
-    returning "nothing known", and a second identical function would only be
-    a second thing to keep in step.
+    without instantiating `SQLiteEngine` or touching the filesystem.
     """
     return frozenset()
+
+
+def _no_table_columns() -> Mapping[str, frozenset[str]]:
+    """The `get_real_table_columns` default for SQLite.
+
+    The column catalogue's counterpart to `_no_table_names`, and a separate
+    function only because its type is now different: since the 2026-09-26
+    scoping fix the column check resolves a qualifier against *one table's*
+    columns, so it receives a table-keyed mapping rather than a flat set (see
+    `_references_unresolvable_qualified_column`).
+    """
+    return {}
 
 
 # sqlglot parses many function calls into typed classes (`exp.Count`,
@@ -610,18 +619,251 @@ def _query_bound_names(parsed: sqlglot_exp.Expression) -> frozenset[str]:
     return frozenset(names)
 
 
+def _alias_name(relation: sqlglot_exp.Expression) -> str:
+    """The alias a relation is bound under in its `FROM`/`JOIN`, lowercased.
+
+    Args:
+        relation: A node in a table-source position.
+
+    Returns:
+        The alias, or `""` when the relation carries none.
+    """
+    if exp is None:
+        return ""
+    alias = relation.args.get("alias")
+    if isinstance(alias, exp.TableAlias):
+        return (alias.name or "").lower()
+    return ""
+
+
+def _alias_columns(relation: sqlglot_exp.Expression) -> frozenset[str]:
+    """The explicit column alias list a relation carries, lowercased.
+
+    `generate_series(1, 5) AS g(n)`, `WITH t(x, y) AS (...)` and
+    `(VALUES (1)) AS v(x)` all rename their output columns this way, and all
+    three parse to a `TableAlias` carrying a `columns` arg.
+
+    Args:
+        relation: A node in a table-source position.
+
+    Returns:
+        The lowercased alias-list column names; empty when there is no list.
+    """
+    if exp is None:
+        return frozenset()
+    alias = relation.args.get("alias")
+    if not isinstance(alias, exp.TableAlias):
+        return frozenset()
+    names = {(column.name or "").lower() for column in (alias.args.get("columns") or [])}
+    names.discard("")
+    return frozenset(names)
+
+
+def _scope_relations(scope: sqlglot_exp.Expression) -> list[sqlglot_exp.Expression]:
+    """The relations `scope`'s own `FROM`/`JOIN`s bind - not a nested query's.
+
+    One SQL scope's worth, deliberately: `_qualifier_binding` resolves a
+    qualifier against the *nearest enclosing* scope that binds it, which is
+    what stops the same alias, reused for a different relation in a different
+    scope, from resolving to the wrong one. A comma join arrives in `joins`
+    exactly like an explicit `JOIN` does, and a `LATERAL` arrives either as a
+    `Join` wrapping an `exp.Lateral` or in the `laterals` arg depending on the
+    spelling, so all three are collected here.
+
+    Args:
+        scope: A parsed node, normally an `exp.Select`.
+
+    Returns:
+        The relation nodes this scope binds directly.
+    """
+    if exp is None:
+        return []
+    relations: list[sqlglot_exp.Expression] = []
+    from_arg = scope.args.get("from")
+    if isinstance(from_arg, exp.From) and isinstance(from_arg.this, exp.Expression):
+        relations.append(from_arg.this)
+    for join in scope.args.get("joins") or []:
+        target = join.this if isinstance(join, exp.Join) else None
+        if isinstance(target, exp.Expression):
+            relations.append(target)
+    for lateral in scope.args.get("laterals") or []:
+        if isinstance(lateral, exp.Expression):
+            relations.append(lateral)
+    return relations
+
+
+def _relation_binding(
+    relation: sqlglot_exp.Expression, *, real_table_columns: Mapping[str, frozenset[str]]
+) -> tuple[frozenset[str], frozenset[str] | None]:
+    """What one `FROM`/`JOIN` relation binds: its qualifiers, and its columns.
+
+    The second element is the set of names a qualified reference through this
+    relation may legitimately resolve to, or `None` for a relation whose
+    output columns this module deliberately does not compute - see
+    `_references_unresolvable_qualified_column` for which kinds those are and
+    why resolving them exactly is not attempted.
+
+    Args:
+        relation: A node in a table-source position.
+        real_table_columns: The engine's per-table column map, keyed by every
+            spelling `Engine.table_names()` advertises.
+
+    Returns:
+        `(qualifiers, names)` - the spellings a column reference may use to
+        qualify against this relation, and the names it may then resolve to
+        (`None` meaning "resolve permissively").
+    """
+    if exp is None:
+        return frozenset(), None
+    alias = _alias_name(relation)
+    alias_columns = _alias_columns(relation)
+
+    # A function scan: `FROM generate_series(1, 5) g`, or the same thing
+    # spelled `JOIN LATERAL generate_series(...) g`. This is the relation kind
+    # the whole bypass runs through, and the one that must stay strict: its
+    # only output column is named after the function itself (plus whatever an
+    # explicit alias list renames it to), so a catalogue function reached as
+    # `g.lo_get` resolves to nothing here however many real columns elsewhere
+    # in the database happen to share that name.
+    inner = relation.this
+    if isinstance(relation, (exp.Table, exp.Lateral)) and isinstance(inner, exp.Func):
+        function_name = _resolve_function_name(inner)
+        names = alias_columns | ({function_name} if function_name else set())
+        if alias:
+            return frozenset({alias}), frozenset(names)
+        # Unaliased, so PostgreSQL qualifies it by the function's own name:
+        # `SELECT generate_series.generate_series FROM generate_series(1, 5)`.
+        return frozenset({function_name} if function_name else set()), frozenset(names)
+
+    if isinstance(relation, exp.Table):
+        name = (relation.name or "").lower()
+        schema = (relation.db or "").lower()
+        # An unaliased table answers to its bare name and, on PostgreSQL, to
+        # its schema-qualified one too; an aliased one answers only to the
+        # alias, which is what PostgreSQL itself enforces.
+        qualifiers = {alias} if alias else ({name} | ({f"{schema}.{name}"} if schema else set()))
+        if not schema and name in _visible_cte_names(relation):
+            # A CTE reference. Its output columns are the inner query's, which
+            # this module does not compute - permissive.
+            return frozenset(qualifiers), None
+        columns = real_table_columns.get(f"{schema}.{name}" if schema else name)
+        if columns is None:
+            # Not a table this engine advertises. `_references_unknown_table`
+            # has already rejected the statement in that case, so this is
+            # unreachable in practice; permissive rather than strict so that a
+            # future caller order cannot turn it into a silent false rejection.
+            return frozenset(qualifiers), None
+        return frozenset(qualifiers), frozenset(columns | alias_columns)
+
+    # A derived table, a `VALUES` list, a `LATERAL` over a subquery, or
+    # anything else that binds an alias - permissive, for the reasons in
+    # `_references_unresolvable_qualified_column`'s docstring.
+    return frozenset({alias} if alias else set()), None
+
+
+def _qualifier_keys(column: sqlglot_exp.Column) -> tuple[str, ...]:
+    """The spellings a qualified column's qualifier could be bound under.
+
+    `analytics.thing.label` yields `("analytics.thing", "thing")`: the second
+    is what resolves it when the statement spells the same table bare in its
+    `FROM` (`SELECT public.customers.name FROM customers` is legal
+    PostgreSQL).
+
+    Args:
+        column: A qualified `exp.Column`.
+
+    Returns:
+        The candidate qualifier keys, most specific first.
+    """
+    if exp is None:
+        return ()
+    table = (column.table or "").lower()
+    if not table:
+        return ()
+    db_arg = column.args.get("db")
+    schema = (db_arg.name or "").lower() if isinstance(db_arg, exp.Identifier) else ""
+    return (f"{schema}.{table}", table) if schema else (table,)
+
+
+def _qualifier_binding(
+    column: sqlglot_exp.Column, *, real_table_columns: Mapping[str, frozenset[str]]
+) -> frozenset[str] | None:
+    """The names `column`'s qualifier binds, or `None` to resolve permissively.
+
+    Walks outward from the column through its ancestors and stops at the
+    first scope that binds the qualifier - which is both how PostgreSQL
+    resolves it and what makes a correlated reference (`c.customer_id` inside
+    a subquery, bound by the outer query's `FROM`) resolve at all.
+
+    Args:
+        column: A qualified `exp.Column`.
+        real_table_columns: The engine's per-table column map.
+
+    Returns:
+        The bound names, or `None` when the qualifier is bound by a relation
+        kind this module does not resolve, or is not bound in the statement at
+        all.
+    """
+    if exp is None:
+        return None
+    keys = _qualifier_keys(column)
+    if not keys:
+        return None
+    node: sqlglot_exp.Expression | None = column.parent
+    while node is not None:
+        if isinstance(node, exp.Select):
+            for relation in _scope_relations(node):
+                qualifiers, names = _relation_binding(
+                    relation, real_table_columns=real_table_columns
+                )
+                if any(key in qualifiers for key in keys):
+                    return names
+        node = node.parent
+    return None
+
+
+def _referenced_table_columns(
+    parsed: sqlglot_exp.Expression, real_table_columns: Mapping[str, frozenset[str]]
+) -> frozenset[str]:
+    """Every column of every real table the statement actually references.
+
+    The permissive fallback's universe, and the whole point of the
+    2026-09-26 scoping fix: it is the columns of *this statement's* tables,
+    never every column in the database.
+
+    Args:
+        parsed: The parsed statement.
+        real_table_columns: The engine's per-table column map.
+
+    Returns:
+        The lowercased column names, unioned over the referenced tables.
+    """
+    if exp is None:
+        return frozenset()
+    names: set[str] = set()
+    for table in parsed.find_all(exp.Table):
+        if isinstance(table.this, exp.Func):
+            continue
+        schema = (table.db or "").lower()
+        name = (table.name or "").lower()
+        columns = real_table_columns.get(f"{schema}.{name}" if schema else name)
+        if columns:
+            names |= columns
+    return frozenset(names)
+
+
 def _references_unresolvable_qualified_column(
     parsed: sqlglot_exp.Expression,
     *,
     dialect: str,
-    get_real_column_names: Callable[[], frozenset[str]],
+    get_real_table_columns: Callable[[], Mapping[str, frozenset[str]]],
 ) -> bool:
     """True if a qualified column reference names nothing the query can supply.
 
     Part 2 of the bypass-3 fix documented above, and the part that is
     default-deny rather than a name rule. `alias.name` is only accepted when
-    `name` is a column of some advertised table
-    (`Engine.column_names()`) or a name the statement binds for itself
+    `name` is a column the qualifier can actually supply
+    (`Engine.table_columns()`) or a name the statement binds for itself
     (`_query_bound_names`). `g.pg_relation_filepath`, `g.lo_get` and every
     other catalogue function reached through the sugar is neither, so it is
     refused whether or not anyone thought to blocklist its name - which is
@@ -639,27 +881,60 @@ def _references_unresolvable_qualified_column(
     skipped: it names no identifier, so there is nothing to resolve, and
     PostgreSQL never reads it as a call.
 
-    The resolution is a union across tables, not per-qualifier: it asks "is
-    this a real column name anywhere in this database", not "is this a column
-    of the table this alias binds to". That is deliberate. Resolving each
-    qualifier to its own range-table entry would mean re-implementing name
-    resolution through derived tables, CTEs with `SELECT *`, `LATERAL` and
-    `USING` joins, and every gap in that re-implementation becomes a false
-    rejection of a legitimate query. The union costs one residual: a
-    reference like `g.amount` (a real column, but of a different table) is
-    allowed here, so a PostgreSQL function whose name exactly matches one of
-    the user's own column names *and* takes a single argument of the range
-    entry's type would still slip through. Rule 1 covers the entire `pg_`
-    surface of that residual; what is left is a catalogue function sharing a
-    name with a user column, which requires the schema to cooperate with the
-    attack.
+    **The resolution model (rewritten 2026-09-26, second round).** The first
+    version resolved against `Engine.column_names()`, a flat union of every
+    column in the database. Phase 3b Task 6 then widened the engines from one
+    schema to every schema the role can read, so that union became "every
+    column in every readable schema" - and a table named after a
+    single-argument catalogue function in *any* schema re-armed the payload.
+    Reproduced with `ext.audit(lo_get integer, ...)` in a non-default schema
+    `aipa_ro` may read: `SELECT g.lo_get FROM generate_series(<oid>, <oid>) g`
+    validated again, and with a readable large object it returns its bytes.
+    The universe is therefore now the tables **this statement references**,
+    resolved per qualifier:
 
-    Measured before shipping (2026-09-26): 0 rejections across PostgreSQL's
-    32-query analytics corpus and DuckDB's 58-query corpus, plus a dozen
-    hand-written derived-table, LATERAL, self-join, `WITH t(x, y)` and
-    function-scan-alias shapes - see `.superpowers/sdd/task-4-report.md`.
+    - A qualifier bound to a real table resolves against *that table's*
+      columns (plus any explicit column alias list). A self-join, a `USING`
+      or `NATURAL` join and a correlated reference all resolve here without
+      special cases, because each alias still names a real table.
+    - A qualifier bound to a **function scan** (`generate_series(...) g`,
+      including the `LATERAL` spelling) resolves against the function's own
+      output column name and its alias list - nothing else. A function scan
+      contributes no table columns at all, which is exactly why the payload
+      above now fails to resolve: `lo_get` is not `generate_series`.
+    - Resolution is scoped, nearest enclosing `FROM` first (see
+      `_qualifier_binding`), so the same alias reused for a different relation
+      in a nested scope cannot lend its columns to the other.
 
-    `get_real_column_names` is a zero-argument callable for the same reason
+    **The fallback, and why it is the permissive direction.** Three qualifier
+    kinds are deliberately *not* resolved exactly: a CTE name, a derived table
+    or `VALUES` alias, and a qualifier the statement does not bind at all.
+    Computing a CTE's or derived table's output columns means re-implementing
+    name resolution through `SELECT *`, nested `USING`/`NATURAL` joins and
+    `LATERAL` - the previous implementer avoided exactly that, and rightly:
+    every gap in such a re-implementation is a *rejected legitimate query*.
+    Those qualifiers instead resolve against `_referenced_table_columns` (the
+    columns of the real tables this statement names) plus `_query_bound_names`
+    (every `AS` alias, alias list and function-scan output name in it), which
+    is a strict subset of the old whole-database union and closes the
+    regression for them too: a payload that reaches no readable table cannot
+    borrow a column name from one. The residual is narrow and was checked
+    against PostgreSQL's own semantics rather than assumed: the sugar passes
+    the range-table entry's own type as the argument, and a CTE or derived
+    table's type is an anonymous `record`, which no OID-taking catalogue
+    function (`lo_get`, `pg_relation_filepath`, `pg_terminate_backend`, ...)
+    accepts - only `record`/`anyelement`-taking functions are reachable that
+    way, and rule 1 above refuses the entire `pg_` surface of those on name
+    alone. An unbound qualifier is refused by PostgreSQL itself with "missing
+    FROM-clause entry" before any function resolution happens.
+
+    Measured before shipping (2026-09-26, second round): 0 rejections across
+    PostgreSQL's 35-query analytics corpus, DuckDB's 61-query corpus and all
+    twelve shapes in `tests/test_engine_postgres.py::
+    _LEGITIMATE_QUALIFIED_COLUMN_QUERIES` - see
+    `.superpowers/sdd/task-6-report.md`.
+
+    `get_real_table_columns` is a zero-argument callable for the same reason
     `_references_unknown_table`'s `get_real_table_names` is: a statement with
     no qualified column reference at all (`SELECT COUNT(*) FROM sales`) must
     not pay for a catalogue read to be told so.
@@ -667,8 +942,8 @@ def _references_unresolvable_qualified_column(
     Args:
         parsed: The parsed statement.
         dialect: The dialect the statement was parsed under.
-        get_real_column_names: Returns every advertised column name,
-            lowercased - see `Engine.column_names()`.
+        get_real_table_columns: Returns each advertised table spelling's own
+            column names, lowercased - see `Engine.table_columns()`.
 
     Returns:
         True if the statement must be rejected.
@@ -677,19 +952,31 @@ def _references_unresolvable_qualified_column(
         return True
     if dialect not in _DOT_CALL_DIALECTS:
         return False
-    candidates: list[str] = []
+    candidates: list[sqlglot_exp.Column] = []
     for column in parsed.find_all(exp.Column):
         if not column.args.get("table"):
             continue
         if isinstance(column.this, exp.Star):
             continue
-        name = (column.name or "").lower()
-        if name:
-            candidates.append(name)
+        if (column.name or "").strip():
+            candidates.append(column)
     if not candidates:
         return False
-    resolvable = get_real_column_names() | _query_bound_names(parsed)
-    return any(name not in resolvable for name in candidates)
+    real_table_columns = get_real_table_columns()
+    # Computed at most once per statement, and only if some qualifier actually
+    # falls back to it.
+    fallback: frozenset[str] | None = None
+    for column in candidates:
+        resolvable = _qualifier_binding(column, real_table_columns=real_table_columns)
+        if resolvable is None:
+            if fallback is None:
+                fallback = _referenced_table_columns(parsed, real_table_columns) | (
+                    _query_bound_names(parsed)
+                )
+            resolvable = fallback
+        if (column.name or "").lower() not in resolvable:
+            return True
+    return False
 
 
 # Task 4 bypass 2 (2026-09-26 review round): `"cast"` is allowlisted for
@@ -1067,7 +1354,7 @@ def _is_safe_ast(
     internal_names: frozenset[str],
     allowed_functions: frozenset[str] | None,
     get_real_table_names: Callable[[], frozenset[str]],
-    get_real_column_names: Callable[[], frozenset[str]],
+    get_real_table_columns: Callable[[], Mapping[str, frozenset[str]]],
 ) -> bool:
     """Reject anything that parses to more than one statement or writes data.
 
@@ -1138,7 +1425,7 @@ def _is_safe_ast(
         if _references_unknown_table(parsed, get_real_table_names=get_real_table_names):
             return False
         if _references_unresolvable_qualified_column(
-            parsed, dialect=dialect, get_real_column_names=get_real_column_names
+            parsed, dialect=dialect, get_real_table_columns=get_real_table_columns
         ):
             return False
 
@@ -1185,7 +1472,7 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
             the internals blocklist, and its `allowed_functions` switches on
             default-deny function *and table* validation when it is a set
             rather than `None`, calling `engine.table_names()` only in that
-            case and `engine.column_names()` only when its `sqlglot_dialect`
+            case and `engine.table_columns()` only when its `sqlglot_dialect`
             is additionally one where a qualified column can be a function
             call (`_DOT_CALL_DIALECTS`). Defaults to `None`, meaning SQLite - resolved from
             `SQLiteEngine`'s own class attributes, so this stays a single
@@ -1217,7 +1504,7 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         internal_names: frozenset[str] = SQLiteEngine.internal_names
         allowed_functions: frozenset[str] | None = SQLiteEngine.allowed_functions
         get_real_table_names: Callable[[], frozenset[str]] = _no_table_names
-        get_real_column_names: Callable[[], frozenset[str]] = _no_table_names
+        get_real_table_columns: Callable[[], Mapping[str, frozenset[str]]] = _no_table_columns
     else:
         dialect = engine.sqlglot_dialect
         internal_prefixes = engine.internal_prefixes
@@ -1245,8 +1532,8 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         # (`_references_unresolvable_qualified_column`) also requires the
         # dialect to be in `_DOT_CALL_DIALECTS`, so DuckDB and SQLite never
         # read a column list at all.
-        get_real_column_names = (
-            engine.column_names if allowed_functions is not None else _no_table_names
+        get_real_table_columns = (
+            engine.table_columns if allowed_functions is not None else _no_table_columns
         )
     return _is_safe_ast(
         s,
@@ -1255,5 +1542,5 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         internal_names=internal_names,
         allowed_functions=allowed_functions,
         get_real_table_names=get_real_table_names,
-        get_real_column_names=get_real_column_names,
+        get_real_table_columns=get_real_table_columns,
     )

@@ -8,6 +8,7 @@ Moved from `execution.py` and `schema.py` verbatim; only the enclosing
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Mapping
 from contextlib import closing
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,7 @@ from ..config import (
     DEFAULT_VALUE_HINT_MAX_CARDINALITY,
 )
 from ..types import QueryResult, SchemaChunk
-from .base import EngineUnreachableError, table_name_spellings
+from .base import EngineUnreachableError, table_column_spellings, table_name_spellings
 
 
 def _sqlite_read_only_authorizer(action: int, *_args: Any) -> int:
@@ -352,8 +353,8 @@ SQLITE DIALECT (must follow):
 
         return table_name_spellings(get_schema_chunks(self.dsn), default_schema=self.default_schema)
 
-    def column_names(self) -> frozenset[str]:
-        """Every user table's column names, lowercased, unioned across tables.
+    def table_columns(self) -> Mapping[str, frozenset[str]]:
+        """Each table spelling mapped to that table's own columns, lowercased.
 
         Never reached by `safety.is_safe_query` for SQLite - both gates in
         front of it (`allowed_functions is not None` and a dialect in
@@ -365,6 +366,6 @@ SQLITE DIALECT (must follow):
         """
         from ..schema import get_schema_chunks
 
-        return frozenset(
-            column.lower() for chunk in get_schema_chunks(self.dsn) for column in chunk.columns
+        return table_column_spellings(
+            get_schema_chunks(self.dsn), default_schema=self.default_schema
         )

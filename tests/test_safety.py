@@ -456,3 +456,123 @@ def test_is_safe_query_rejects_an_unrecognised_function_in_any_position() -> Non
     engine = DuckDBEngine("unused.duckdb")
     assert not agent.is_safe_query("SELECT totally_made_up_function(a) FROM t", engine=engine)
     assert not agent.is_safe_query("SELECT * FROM totally_made_up_function(a)", engine=engine)
+
+
+class _FakePostgresEngine:
+    """A PostgreSQL-dialect engine with a hostile column, and no server.
+
+    `is_safe_query` reads six attributes off an engine, so the qualified-column
+    resolution model can be pinned without a live PostgreSQL: the live proof
+    lives in `tests/test_engine_postgres.py`, which skips wherever
+    `AIPA_TEST_POSTGRES_DSN` is unset, and this is what keeps the model itself
+    covered everywhere else.
+
+    `other.audit` is the shape that caused the 2026-09-26 regression: a table
+    outside the default schema whose column is named after a single-argument
+    catalogue function (`lo_get`). Task 6 widened the engines from one schema
+    to every readable schema, and while the validator resolved a qualifier
+    against a flat union of every advertised column, that one column re-armed
+    PostgreSQL's `alias.name` -> `name(alias)` bypass for every function scan
+    in the database.
+    """
+
+    name = "fake-postgres"
+    sqlglot_dialect = "postgres"
+    default_schema = "public"
+    internal_prefixes: tuple[str, ...] = ("pg_",)
+    internal_names = frozenset({"information_schema"})
+    allowed_functions: frozenset[str] | None = frozenset({"count", "sum", "generate_series"})
+
+    def table_names(self) -> frozenset[str]:
+        return frozenset({"customers", "public.customers", "other.audit"})
+
+    def table_columns(self) -> dict[str, frozenset[str]]:
+        customers = frozenset({"customer_id", "name"})
+        return {
+            "customers": customers,
+            "public.customers": customers,
+            "other.audit": frozenset({"lo_get", "note"}),
+        }
+
+
+# Each case is (accepted, sql). The resolution model under test: a qualifier
+# bound to a real table resolves against that table's columns; one bound to a
+# function scan resolves against the function's own output name alone; a CTE,
+# derived table or unbound qualifier falls back to the columns of the tables
+# this statement references plus the names it binds - never to every column in
+# the database, which is what the regression turned the universe into.
+_QUALIFIED_COLUMN_RESOLUTION_CASES: list[tuple[bool, str, str]] = [
+    (
+        False,
+        "function_scan_borrowing_another_schemas_column",
+        "SELECT g.lo_get FROM generate_series(1,5) g",
+    ),
+    (
+        False,
+        "function_scan_beside_the_hostile_table",
+        "SELECT g.lo_get FROM other.audit a, generate_series(1,5) g",
+    ),
+    (False, "base_table_borrowing_another_tables_column", "SELECT c.lo_get FROM customers c"),
+    # Nearest scope wins in both directions: the qualifier is resolved where
+    # PostgreSQL resolves it, not by whichever relation in the statement
+    # happens to share the alias.
+    (
+        False,
+        "inner_scope_must_not_lend_its_table_to_an_outer_function_scan",
+        "SELECT g.lo_get FROM generate_series(1,5) g WHERE EXISTS (SELECT 1 FROM other.audit g)",
+    ),
+    (
+        True,
+        "inner_function_scan_must_not_shadow_an_outer_real_table",
+        "SELECT a.name FROM customers a WHERE EXISTS (SELECT 1 FROM generate_series(1,5) a)",
+    ),
+    (True, "its_own_tables_column", "SELECT a.lo_get FROM other.audit a"),
+    (
+        True,
+        "function_scans_own_output_column",
+        "SELECT g.generate_series FROM generate_series(1,5) g",
+    ),
+    (True, "function_scan_alias_list", "SELECT g.n FROM generate_series(1,5) AS g(n)"),
+    (
+        True,
+        "derived_table_over_the_referenced_table",
+        "SELECT t.lo_get FROM (SELECT * FROM other.audit) t",
+    ),
+    (
+        True,
+        "cte_over_the_referenced_table",
+        "WITH t AS (SELECT * FROM other.audit) SELECT t.lo_get FROM t",
+    ),
+    (
+        True,
+        "schema_qualified_reference_to_a_bare_from",
+        "SELECT public.customers.name FROM customers",
+    ),
+    (
+        True,
+        "correlated_reference_to_the_outer_scope",
+        "SELECT c.name FROM customers c WHERE EXISTS "
+        "(SELECT 1 FROM other.audit a WHERE a.lo_get = c.customer_id)",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("accepted", "label", "sql"),
+    _QUALIFIED_COLUMN_RESOLUTION_CASES,
+    ids=[label for _, label, _ in _QUALIFIED_COLUMN_RESOLUTION_CASES],
+)
+def test_qualified_column_resolution_is_scoped_to_the_referenced_tables(
+    accepted: bool, label: str, sql: str
+) -> None:
+    """Both halves of the 2026-09-26 scoping fix, server-free.
+
+    The rejections are the bypass: PostgreSQL reads `alias.name` as
+    `name(alias)` wherever `name` is not a column the qualifier can supply, so
+    a function scan must not be able to borrow one from a table elsewhere in
+    the database. The acceptances are its price, and the reason the fix is
+    scoped rather than a blanket refusal of unresolved qualifiers - a false
+    rejection costs a user an answerable question.
+    """
+    engine = _FakePostgresEngine()
+    assert agent.is_safe_query(sql, engine=engine) is accepted, f"{label}: {sql!r}"
