@@ -22,7 +22,7 @@ import text_to_sql_agent as agent
 from text_to_sql_agent.engines import EngineUnreachableError
 
 
-@pytest.fixture(params=["sqlite", "duckdb"])
+@pytest.fixture(params=["sqlite", "duckdb", "postgres"])
 def engine_dsn(request: pytest.FixtureRequest, tmp_path: Path) -> str:
     """A populated database's DSN, one per engine under test.
 
@@ -44,6 +44,15 @@ def engine_dsn(request: pytest.FixtureRequest, tmp_path: Path) -> str:
         con.execute("INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob')")
         con.close()
         return f"duckdb://{db}"
+    if request.param == "postgres":
+        # `postgres_dsn` (`tests/conftest.py`) skips with an explicit reason
+        # when `AIPA_TEST_POSTGRES_DSN` is unset or the server is
+        # unreachable - reused here via `getfixturevalue` rather than
+        # duplicating that skip logic. Its `customers` table already holds
+        # exactly (1, 'Alice'), (2, 'Bob') - see `docker/postgres-init.sql` -
+        # so no per-test setup is needed the way sqlite/duckdb above do it.
+        dsn: str = request.getfixturevalue("postgres_dsn")
+        return dsn
     raise AssertionError(f"no fixture for engine {request.param!r}")
 
 

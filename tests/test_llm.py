@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 from unittest.mock import patch
 
 import pytest
 
+from text_to_sql_agent.engines import _ENGINES
 from text_to_sql_agent.engines.sqlite import SQLiteEngine
 from text_to_sql_agent.llm import (
     SQL_TRANSLATION_SYSTEM_PROMPT,
@@ -169,27 +171,46 @@ def test_generate_sql_system_prompt_for_duckdb_has_no_sqlite_instructions() -> N
     assert "SQLite's strftime/date functions" in prompt
 
 
-def _known_engine_classes() -> list[type]:
-    """Every `Engine` implementation this test suite can construct today.
+_UNUSED_DSNS: dict[str, str] = {
+    "sqlite": "unused.db",
+    "duckdb": "unused.duckdb",
+    "postgres": "postgresql://unused/unused",
+}
 
-    **Hand-maintained.** An earlier version of this docstring claimed the
-    list grows automatically; it does not - it names `SQLiteEngine` and
-    conditionally imports `DuckDBEngine`, so an engine added to
-    `open_engine` does not appear here (Codex review, 2026-09-26). The
-    guard below is still written over this list rather than over hardcoded
-    dialect strings, but adding an engine means adding it here too, or
-    `test_assembled_prompt_names_no_other_known_engine` stays green while
-    the new engine repeats the leak it exists to catch. Phase 3b replaces
-    this with the scheme registry `open_engine` itself dispatches on, which
-    is the version that really does grow on its own.
+
+def _known_engine_classes() -> list[type]:
+    """Every `Engine` implementation whose driver is installed, enumerated
+    from the scheme registry `open_engine` itself dispatches on.
+
+    Built from `text_to_sql_agent.engines._ENGINES` (Task 2), deduplicating
+    by `(module, class)` so `postgresql` and `postgres` - both
+    `PostgresEngine` - contribute one entry, not two. An earlier version of
+    this function was a hand-maintained list that named `SQLiteEngine` and
+    conditionally imported `DuckDBEngine`; a Codex review (2026-09-26) found
+    it had already gone stale - `PostgresEngine` existed and was never added
+    - while its own docstring falsely claimed it grew automatically. Reading
+    `_ENGINES` instead means an engine registered there needs no second edit
+    here; `test_known_engine_classes_covers_every_registry_scheme` below
+    pins that guarantee independently of this function's own logic.
+
+    A scheme whose driver extra is not installed (e.g. `duckdb`/`postgres`
+    without the `engines` extra) is skipped rather than failing collection,
+    the same accommodation `pytest.importorskip` makes elsewhere in this
+    module.
     """
-    engines: list[type] = [SQLiteEngine]
-    try:
-        from text_to_sql_agent.engines.duckdb import DuckDBEngine
-    except ModuleNotFoundError:
-        return engines
-    engines.append(DuckDBEngine)
-    return engines
+    classes: list[type] = []
+    seen: set[tuple[str, str]] = set()
+    for module_name, class_name, _extra in _ENGINES.values():
+        key = (module_name, class_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            module = importlib.import_module(module_name, "text_to_sql_agent.engines")
+        except ImportError:
+            continue
+        classes.append(getattr(module, class_name))
+    return classes
 
 
 @pytest.mark.parametrize("engine_cls", _known_engine_classes())
@@ -199,8 +220,7 @@ def test_assembled_prompt_names_no_other_known_engine(engine_cls: type) -> None:
     `prompt_dialect_section` - which is free to name another dialect for
     contrast, as DuckDB's section legitimately does for SQLite.
     """
-    dsn = "unused.db" if engine_cls is SQLiteEngine else "unused.duckdb"
-    engine = engine_cls(dsn)
+    engine = engine_cls(_UNUSED_DSNS[engine_cls.name])
     seen: dict[str, str] = {}
 
     def fake_call(prompt: str, *_a: object, **_k: object) -> str:
@@ -218,3 +238,32 @@ def test_assembled_prompt_names_no_other_known_engine(engine_cls: type) -> None:
             f"{engine_cls.name}'s prompt names {other_cls.prompt_dialect_name!r} "
             "outside its own dialect section"
         )
+
+
+@pytest.mark.parametrize("scheme", sorted(_ENGINES))
+def test_known_engine_classes_covers_every_registry_scheme(scheme: str) -> None:
+    """Every scheme `open_engine` can resolve must produce a class in
+    `_known_engine_classes()`, so the cross-dialect guard above
+    (`test_assembled_prompt_names_no_other_known_engine`) is parametrized
+    over every engine `open_engine` itself would route to - not just
+    whichever ones someone remembered to add by hand. This is the guard
+    Codex's 2026-09-26 review found missing: `PostgresEngine` was already
+    registered in `_ENGINES` and already reachable through `open_engine`,
+    but absent from the old hand-maintained list, so it never joined the
+    no-foreign-dialect check at all.
+
+    Skips a scheme whose driver extra genuinely is not installed - the same
+    exemption `_known_engine_classes()` makes - rather than failing a
+    machine that never installed the `engines` extra.
+    """
+    module_name, class_name, extra = _ENGINES[scheme]
+    try:
+        module = importlib.import_module(module_name, "text_to_sql_agent.engines")
+    except ImportError:
+        pytest.skip(f"install the {extra!r} extra to cover the {scheme!r} scheme")
+    expected_cls = getattr(module, class_name)
+
+    assert expected_cls in _known_engine_classes(), (
+        f"{class_name} is registered for scheme {scheme!r} in _ENGINES but is "
+        "missing from _known_engine_classes()"
+    )

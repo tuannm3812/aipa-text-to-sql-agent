@@ -362,4 +362,30 @@ def test_repair_user_prompt_names_duckdbs_dialect(tmp_path: Path) -> None:
     assert "DuckDB error:" in repair_user_prompt
     assert "corrected DuckDB SELECT query" in repair_user_prompt
     assert "SQLite error:" not in repair_user_prompt
+
+
+def test_repair_user_prompt_names_postgresqls_dialect(postgres_dsn: str) -> None:
+    """Same bug as `test_repair_user_prompt_names_the_engines_dialect` above,
+    proven through a real `PostgresEngine` rather than a stand-in - see
+    `test_repair_user_prompt_names_duckdbs_dialect` for the DuckDB sibling.
+    Uses the `customers` table `docker/postgres-init.sql` seeds for every
+    PostgreSQL test run, rather than creating its own.
+    """
+    user_prompts: list[str] = []
+
+    def fake_call(_prompt: str, user_prompt: str, *_a: object, **_k: object) -> str:
+        user_prompts.append(user_prompt)
+        if len(user_prompts) == 1:
+            return "SELECT nope FROM customers"
+        return "SELECT name FROM customers"
+
+    with patch("text_to_sql_agent.llm._call_provider", side_effect=fake_call):
+        result = agent.ask_database("list customers", db_path=postgres_dsn)
+
+    assert result.ok, result.error
+    assert len(user_prompts) == 2, "one generation plus one repair"
+    repair_user_prompt = user_prompts[1]
+    assert "PostgreSQL error:" in repair_user_prompt
+    assert "corrected PostgreSQL SELECT query" in repair_user_prompt
+    assert "SQLite error:" not in repair_user_prompt
     assert "corrected SQLite SELECT query" not in repair_user_prompt

@@ -700,15 +700,50 @@ class PostgresEngine:
     # not pass `max_vm_steps` explicitly - see that module for the fix.
     default_work_limit: int = DEFAULT_WORK_LIMIT_MS
     schema_header: str = "PostgreSQL schema (DDL)"
-    # Placeholder. Task 7 writes PostgreSQL's real prompt fragments
-    # (`prompt_dialect_section`, `prompt_dialect_name`,
-    # `prompt_engine_rules_block`) - these three exist only so `PostgresEngine`
-    # satisfies the `Engine` protocol today. Deliberately not crafted prompt
-    # text: see `SQLiteEngine`/`DuckDBEngine`'s copies for what the real
-    # versions look like once Task 7 writes PostgreSQL's own.
-    prompt_dialect_section: str = "POSTGRESQL DIALECT: placeholder, written by Task 7.\n"
+    # PostgreSQL's own dialect section - see `SQLiteEngine.prompt_dialect_
+    # section` for the shared-body/per-engine split `_assemble_prompt` fills
+    # this into, and `DuckDBEngine`'s copy for the sibling this deliberately
+    # mirrors in shape.
+    #
+    # Three choices worth recording:
+    # - ILIKE, not `LOWER(col) = LOWER('value')`, for case-insensitive text
+    #   matching. `_PROMPT_BODY`'s shared "CRITICAL TEXT SEARCHING RULES"
+    #   section still tells every engine to use `LOWER(...)`/`LIKE` - it is a
+    #   correct instruction for PostgreSQL too, just not the idiomatic one -
+    #   so this section adds the PostgreSQL-native alternative rather than
+    #   replacing shared text a sha256 test elsewhere pins. `ILIKE` parses to
+    #   `sqlglot.exp.ILike`, which is not an `exp.Func` subclass (verified
+    #   2026-09-26), so `safety._references_disallowed_function` never sees
+    #   it and it needs no entry on `allowed_functions` above.
+    # - EXTRACT/DATE_TRUNC/INTERVAL over strftime: both `"extract"` and
+    #   `"date_trunc"` are already on `allowed_functions`; `strftime` is not
+    #   a PostgreSQL function at all, so telling the model to use it would
+    #   produce SQL PostgreSQL itself rejects, not just SQL the validator
+    #   blocks.
+    # - Double-quoting guidance: PostgreSQL folds an unquoted identifier to
+    #   lowercase and matches a quoted one case-sensitively. The schema text
+    #   the model is shown already carries each identifier's real casing, so
+    #   this just tells the model to copy it rather than invent quoting.
+    prompt_dialect_section: str = """\
+POSTGRESQL DIALECT (must follow):
+- Generate PostgreSQL-compatible SQL only.
+- For dates/timestamps use EXTRACT(field FROM col), DATE_TRUNC('unit', col), and INTERVAL arithmetic (col + INTERVAL '1 day'); do NOT use strftime, date(), or datetime() - those are SQLite functions and do not exist in PostgreSQL.
+- For case-insensitive text matching, prefer `column ILIKE '%value%'` over LOWER(column) = LOWER('value'). ILIKE is PostgreSQL's own case-insensitive operator, not a function call, so it works regardless of the allowed-function list, and it is the idiomatic PostgreSQL spelling.
+- Double-quote an identifier only when the schema below shows it quoted, and copy that casing exactly - PostgreSQL folds an unquoted identifier to lowercase but matches a quoted one case-sensitively.
+"""  # noqa: E501
+    # See `SQLiteEngine.prompt_dialect_name` for what this substitutes into
+    # and why it is a per-engine value. Already correct before this task -
+    # only `prompt_dialect_section` and `prompt_engine_rules_block` were
+    # placeholders.
     prompt_dialect_name: str = "PostgreSQL"
-    prompt_engine_rules_block: str = "Placeholder engine rules, written by Task 7.\n"
+    # PostgreSQL's own internal-catalogue rule, in place of SQLite's
+    # `sqlite_master`/DuckDB's `duckdb_tables()`. Names exactly the two
+    # surfaces `internal_prefixes`/`internal_names` above block (`pg_*` and
+    # `information_schema`), not a generic template.
+    prompt_engine_rules_block: str = """\
+- Do NOT reference pg_catalog, information_schema, or any other internal PostgreSQL system catalog or view.
+- Prefer simple SQL compatible with PostgreSQL.
+"""  # noqa: E501
 
     def __init__(self, dsn: str) -> None:
         """Hold the full PostgreSQL connection URL.
