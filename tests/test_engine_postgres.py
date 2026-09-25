@@ -1166,12 +1166,20 @@ def test_fetch_columns_keys_by_schema_and_table_not_bare_name(postgres_dsn: str)
             conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
 
 
-def test_a_table_outside_public_is_never_advertised(postgres_dsn: str) -> None:
-    """The other half of the `docs/3_decisions.md` scoping: a table living
-    only in a second schema must not appear in `raw_schema()` or `table_
-    names()` - mirrors `test_engine_duckdb.py::
-    test_table_outside_main_is_never_advertised_or_accepted` for the same
-    documented reason, one engine over.
+def test_a_table_outside_public_is_advertised_and_queryable_when_qualified(
+    postgres_dsn: str,
+) -> None:
+    """Task 5's scoping test, updated to Task 6's contract rather than deleted.
+
+    At Task 5 this asserted the opposite - `only_here` in neither
+    `raw_schema()` nor `table_names()` - because `safety.py` accepted no
+    qualifier but `main` and advertising a table the validator would reject
+    is the `docs/3_decisions.md` 2026-09-25 inversion. Task 6 removed that
+    constraint at its source, so the scoping is gone and what replaces it is
+    *agreement*: advertised, accepted qualified, refused bare (because bare
+    resolves against `public`, where no such table exists), and actually
+    executable. The schema is still created and granted exactly as before, so
+    this remains the same live reproduction, now pinning the opposite answer.
     """
     schema = "task5_only_schema"
     with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
@@ -1179,11 +1187,41 @@ def test_a_table_outside_public_is_never_advertised(postgres_dsn: str) -> None:
         conn.execute(f"CREATE SCHEMA {schema}")
         conn.execute(f"GRANT USAGE ON SCHEMA {schema} TO aipa_ro")
         conn.execute(f"CREATE TABLE {schema}.only_here (a INTEGER)")
+        conn.execute(f"INSERT INTO {schema}.only_here VALUES (7)")
         conn.execute(f"GRANT SELECT ON {schema}.only_here TO aipa_ro")
     try:
         engine = open_engine(postgres_dsn)
-        assert "only_here" not in engine.raw_schema()
+        assert "only_here" in engine.raw_schema()
+        assert f"{schema}.only_here" in engine.table_names()
         assert "only_here" not in engine.table_names()
+        assert is_safe_query(f"SELECT a FROM {schema}.only_here", engine=engine)
+        assert not is_safe_query("SELECT a FROM only_here", engine=engine)
+        result = engine.execute(f"SELECT a FROM {schema}.only_here", max_rows=10, work_limit=0)
+        assert result.rows == [(7,)]
+    finally:
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+def test_a_schema_the_role_cannot_use_is_not_advertised(postgres_dsn: str) -> None:
+    """Widening to "every schema" means every schema the *role* may use.
+
+    `_user_schema_names` filters on `has_schema_privilege`, so a schema with
+    no `USAGE` grant to `aipa_ro` is neither read nor advertised - otherwise
+    the model would be shown a table every query against which is refused by
+    PostgreSQL itself, which is the same advertised-then-blocked inversion
+    one layer down.
+    """
+    schema = "task6_ungranted_schema"
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        conn.execute(f"CREATE SCHEMA {schema}")
+        conn.execute(f"CREATE TABLE {schema}.secret_ledger (a INTEGER)")
+    try:
+        engine = open_engine(postgres_dsn)
+        assert "secret_ledger" not in engine.raw_schema()
+        assert f"{schema}.secret_ledger" not in engine.table_names()
+        assert not is_safe_query(f"SELECT a FROM {schema}.secret_ledger", engine=engine)
     finally:
         with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
             conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")

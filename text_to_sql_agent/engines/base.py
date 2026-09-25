@@ -2,9 +2,43 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Protocol, runtime_checkable
 
 from ..types import QueryResult, SchemaChunk
+
+
+def table_name_spellings(chunks: Iterable[SchemaChunk], *, default_schema: str) -> frozenset[str]:
+    """Every spelling of every chunk's table that is valid to query, lowercased.
+
+    The one implementation of `Engine.table_names()`'s contract - see that
+    method's docstring for the rule and why the bare/qualified asymmetry is
+    what it is. Shared rather than repeated per engine deliberately: three
+    layers quietly disagreeing about which table names are real is the exact
+    defect `docs/3_decisions.md`'s 2026-09-25 entry recorded, so the rule
+    lives in one place that every engine calls, unlike read-only enforcement
+    (see `Engine`'s own docstring), where the three mechanisms genuinely have
+    nothing in common to factor out.
+
+    Args:
+        chunks: The engine's schema chunks, each carrying its own
+            `schema_name` (empty for the default schema).
+        default_schema: The engine's `default_schema`.
+
+    Returns:
+        Bare *and* `default_schema`-qualified spellings for a default-schema
+        table; the qualified spelling alone for every other table.
+    """
+    names: set[str] = set()
+    for chunk in chunks:
+        bare = chunk.table_name.lower()
+        schema = chunk.schema_name.lower()
+        if schema:
+            names.add(f"{schema}.{bare}")
+        else:
+            names.add(bare)
+            names.add(f"{default_schema.lower()}.{bare}")
+    return frozenset(names)
 
 
 class EngineError(Exception):
@@ -62,10 +96,11 @@ class Engine(Protocol):
     sqlglot_dialect: str
     # The schema/catalogue a bare, unqualified table name resolves against for
     # this engine - SQLite's and DuckDB's is "main", PostgreSQL's is "public".
-    # Not yet consumed here (Phase 3b Task 6 wires it into `table_names()`'s
-    # qualified identity and `safety.py`'s schema-qualifier check); declared
-    # on the protocol now so every implementation states its own value rather
-    # than one being added later with no engine actually holding it.
+    # Phase 3b Task 6 made this load-bearing: it is what `table_names()` uses
+    # to decide which tables may also be spelled bare, what `SchemaChunk.
+    # schema_name` is resolved against before a chunk records it, and - via
+    # `table_names()` rather than a hardcoded string - what `safety.py`'s
+    # schema-qualifier check now accepts.
     default_schema: str
     # The `work_limit` `execute()` receives when a caller does not pass one
     # explicitly - see `execution.execute_query`. Each engine's `work_limit`
@@ -102,6 +137,14 @@ class Engine(Protocol):
         """Table-level chunks for retrieval.
 
         Must not read row data beyond low-cardinality value hints.
+
+        Every schema the engine can actually query is in scope, not just
+        `default_schema` - a chunk for a table outside it sets
+        `SchemaChunk.schema_name`, so `chunk.qualified_name` is the spelling
+        a query must use and the spelling `table_names()` advertises. What
+        `raw_schema()` shows the model and what `table_names()` accepts must
+        agree table for table: `docs/3_decisions.md`'s 2026-09-25 entry is
+        what happens when they do not.
         """
         ...
 
@@ -110,13 +153,31 @@ class Engine(Protocol):
         ...
 
     def table_names(self) -> frozenset[str]:
-        """Every user table's name, lowercased.
+        """Every spelling of every user table that is valid to query, lowercased.
 
         Used by `safety.is_safe_query`'s default-deny table check
         (`_references_unknown_table`) - only called for an engine whose
         `allowed_functions` is not `None`. Implementations should reuse
         `schema.py`'s fingerprint-keyed schema-chunk cache rather than
         issuing a fresh catalogue query on every call.
+
+        Two spellings, and the asymmetry between them is the contract
+        (Phase 3b Task 6):
+
+        * a table in `default_schema` appears **twice** - bare (`customers`)
+          and qualified (`public.customers`) - because the engine itself
+          resolves both to that table;
+        * a table outside it appears **only** qualified (`analytics.thing`).
+          Its bare name is deliberately absent: a bare name resolves against
+          the engine's default schema, so accepting `thing` would approve a
+          query that then fails at execution. That is the 2026-09-25 failure
+          (`docs/3_decisions.md`) in mirror image, and this set is where it
+          is refused.
+
+        A bare name is therefore never ambiguous, however many schemas share
+        it: it means the default schema's table or nothing, which is what the
+        engine's own search path does. `analytics.shared` and `main.shared`
+        coexist here as two distinct entries.
         """
         ...
 

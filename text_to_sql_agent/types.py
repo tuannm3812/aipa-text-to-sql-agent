@@ -35,11 +35,23 @@ class SchemaChunk:
     """A single table's schema, plus retrieval metadata for RAG scoring.
 
     Attributes:
-        table_name: The table's name.
+        table_name: The table's name, bare.
         ddl: Its `CREATE TABLE` statement.
         columns: Column names.
-        foreign_tables: Names of tables referenced by foreign keys.
+        foreign_tables: Names of tables referenced by foreign keys, spelled
+            the same way `qualified_name` spells this one - bare for a table
+            in the engine's default schema, `schema.table` otherwise - so a
+            foreign-key edge and a chunk's own identity are the same kind of
+            key (`rag.py`'s neighbour graph joins on exactly that).
         search_text: Concatenated text used for lexical/semantic scoring.
+        schema_name: The schema this table lives in, **only when that is not
+            the engine's default schema**; `""` otherwise. Empty is therefore
+            both "the default schema" and "no schema recorded", which is what
+            lets it default and keeps every pre-Phase-3b construction (and
+            `rag.py`, Phase 4's file) correct unchanged. The engine that built
+            the chunk is the one that knows its own `default_schema`, so it
+            resolves the pair before setting this rather than storing the
+            default alongside every chunk.
         value_hints: Sample distinct values per low-cardinality text column.
         score: Relevance score assigned during retrieval; `0.0` until scored.
         matched_terms: Query terms that matched this chunk, once scored.
@@ -51,10 +63,23 @@ class SchemaChunk:
     columns: list[str]
     foreign_tables: list[str]
     search_text: str
+    schema_name: str = ""
     value_hints: dict[str, list[str]] | None = None
     score: float = 0.0
     matched_terms: list[str] | None = None
     match_reasons: list[str] | None = None
+
+    @property
+    def qualified_name(self) -> str:
+        """`schema.table` outside the engine's default schema, else the bare name.
+
+        This is exactly the spelling that is valid to write in SQL against the
+        engine this chunk came from, and exactly the spelling that engine's
+        `table_names()` advertises to `safety.is_safe_query` - one identity,
+        not one per layer, which is what the 2026-09-25 decision
+        (`docs/3_decisions.md`) found the three layers disagreeing about.
+        """
+        return f"{self.schema_name}.{self.table_name}" if self.schema_name else self.table_name
 
 
 @dataclass(frozen=True)
@@ -131,7 +156,7 @@ class SchemaRetrievalResult:
         for chunk in self.chunks:
             terms = ", ".join(chunk.matched_terms or []) or "fallback"
             reasons = "; ".join(chunk.match_reasons or [])
-            lines.append(f"- {chunk.table_name} (score={chunk.score:.2f}; terms={terms})")
+            lines.append(f"- {chunk.qualified_name} (score={chunk.score:.2f}; terms={terms})")
             if reasons:
                 lines.append(f"  {reasons}")
             if chunk.value_hints:

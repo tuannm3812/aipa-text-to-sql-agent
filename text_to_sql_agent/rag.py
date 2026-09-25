@@ -300,6 +300,11 @@ def retrieve_schema_context(
                 columns=chunk.columns,
                 foreign_tables=chunk.foreign_tables,
                 search_text=chunk.search_text,
+                # Phase 3b Task 6: a rescored copy must keep the identity of
+                # the chunk it copies. Dropping `schema_name` here would give
+                # a table outside the engine's default schema the identity of
+                # a same-named table inside it.
+                schema_name=chunk.schema_name,
                 value_hints=chunk.value_hints,
                 score=score,
                 matched_terms=sorted(matched_terms),
@@ -311,9 +316,15 @@ def retrieve_schema_context(
     if all(chunk.score == 0 for chunk in selected):
         selected = sorted(scored, key=lambda c: c.table_name)[:top_k]
 
-    selected_names = {chunk.table_name for chunk in selected}
+    # Keyed by `qualified_name`, not `table_name`, for the same reason
+    # `foreign_tables` now holds qualified names (Phase 3b Task 6): two
+    # schemas may hold a table of the same name, and a bare-name key would
+    # make one chunk's foreign-key edges resolve to the other's chunk. For a
+    # single-schema database the two keys are the same string, so this is a
+    # no-op there.
+    selected_names = {chunk.qualified_name for chunk in selected}
     if include_neighbors > 0:
-        chunk_by_name = {chunk.table_name: chunk for chunk in scored}
+        chunk_by_name = {chunk.qualified_name: chunk for chunk in scored}
         frontier = list(selected)
         for depth in range(include_neighbors):
             next_frontier: list[SchemaChunk] = []
@@ -329,6 +340,7 @@ def retrieve_schema_context(
                                 columns=neighbor_chunk.columns,
                                 foreign_tables=neighbor_chunk.foreign_tables,
                                 search_text=neighbor_chunk.search_text,
+                                schema_name=neighbor_chunk.schema_name,
                                 value_hints=neighbor_chunk.value_hints,
                                 score=max(neighbor_chunk.score, chunk.score * (0.35 / (depth + 1))),
                                 matched_terms=neighbor_chunk.matched_terms or [],

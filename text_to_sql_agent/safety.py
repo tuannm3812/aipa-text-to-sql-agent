@@ -520,8 +520,8 @@ def _references_internal_column_name(
     ordinary `SELECT c.pg_notes FROM customers c`. That is the accepted trade
     here, and it is the same trade `is_safe_query` already makes elsewhere -
     `_references_internals` refuses a table named `pg_anything` on its name
-    alone, and `_references_unknown_table` refuses any schema-qualified
-    reference outside the default schema regardless of what it names. A
+    alone, whether it is the table's own name or its schema qualifier, and
+    does so before any table list is consulted. A
     `pg_`-prefixed user column is vanishingly rare (PostgreSQL's own
     documentation reserves the prefix), and the cost is one unanswerable
     question against a proven remote-code-adjacent leak.
@@ -869,17 +869,31 @@ def _references_unknown_table(
     file). Checking table existence directly is the one rule that covers
     every quoting style, comma joins, and `JOIN`, uniformly.
 
-    A schema-qualified reference is only accepted when the schema is `main`
-    - DuckDB's fixed default schema name for every database this engine
-    opens, verified via `SELECT current_schema()` - or absent entirely. Any
-    other schema (`information_schema`, `pg_catalog`, or anything else) is
-    rejected regardless of whether the bare table name happens to match one
-    of the user's own tables, which is what makes `information_schema.tables`
-    rejected here even though a table literally named `tables` is fine
-    unqualified. A catalog-qualified (three-part) reference is rejected
-    outright rather than resolved: the engine's own catalog name varies per
-    database file and nothing in the LLM's prompt ever teaches a three-part
-    name, so there is no legitimate query this could cost.
+    A schema-qualified reference is checked in its qualified form: the
+    candidate name is `schema.table`, and it must appear in
+    `get_real_table_names()` exactly like a bare one must. Until Phase 3b
+    Task 6 this was a hardcoded `schema == "main"` rule, which was wrong in
+    both directions once a second engine existed - it rejected
+    `public.customers` on PostgreSQL, whose default schema is `public`, and
+    it could never have accepted a legitimate table outside the default
+    schema on any engine. The engine now answers the question instead of a
+    string literal in shared code, through the set it already had to
+    provide: `analytics.thing` validates when that table exists,
+    `analytics.missing` and `no_such_schema.thing` do not, and neither does
+    the *bare* name of a table that lives outside the default schema, since
+    `Engine.table_names()` deliberately does not advertise one (see its
+    docstring - a bare name resolves against the default schema, so
+    approving it would approve a query that then fails at execution).
+
+    `information_schema.tables` is still rejected here regardless of whether
+    a table literally named `tables` exists, because no engine's
+    `table_names()` contains an internals schema - and `_references_
+    internals`, which runs first and consults no table list at all, rejects
+    it on its name before this function is reached. A catalog-qualified
+    (three-part) reference is rejected outright rather than resolved: the
+    engine's own catalog name varies per database file and nothing in the
+    LLM's prompt ever teaches a three-part name, so there is no legitimate
+    query this could cost.
 
     A table-valued function call (`FROM range(5)`, `FROM read_csv(...)`,
     `FROM histogram_values(...)`) also parses to an `exp.Table`, but its
@@ -892,13 +906,15 @@ def _references_unknown_table(
     A CTE alias counts as a real table for this purpose (`WITH totals AS
     (...) SELECT * FROM totals`) only where DuckDB itself would actually
     resolve it to that CTE - see `_visible_cte_names` for the scoping rules
-    and the live-DuckDB proof that unscoped collection is wrong.
+    and the live-DuckDB proof that unscoped collection is wrong. Only an
+    *unqualified* reference can name a CTE: `main.totals` names a table in
+    the `main` schema, which is not where a CTE lives, on every engine here.
 
     `get_real_table_names` is a zero-argument callable rather than an
     already-computed set: it is only invoked once at least one table
     reference has survived the checks above (not a table-valued function,
-    not catalog-qualified, not schema-qualified to anything but `main`) and
-    still needs a real name to compare against. A query with no `FROM`
+    not catalog-qualified, not a visible CTE) and still needs a real name to
+    compare against. A query with no `FROM`
     clause at all (`SELECT current_setting('x')`), or one whose only table
     reference is a table-valued function (`FROM range(5)`), never calls it -
     `Engine.table_names()` does at least a cache-key `Path.stat()`, and
@@ -922,12 +938,10 @@ def _references_unknown_table(
         if (table.catalog or "").lower():
             return True
         schema = (table.db or "").lower()
-        if schema and schema != "main":
-            return True
         name = (table.name or "").lower()
-        if name in _visible_cte_names(table):
+        if not schema and name in _visible_cte_names(table):
             continue
-        candidates.append(name)
+        candidates.append(f"{schema}.{name}" if schema else name)
     if not candidates:
         return False
     real_table_names = get_real_table_names()

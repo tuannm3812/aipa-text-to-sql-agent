@@ -30,21 +30,30 @@ from ..config import (
     DEFAULT_WORK_LIMIT_MS,
 )
 from ..types import QueryResult, SchemaChunk
-from .base import EngineUnreachableError
+from .base import EngineUnreachableError, table_name_spellings
 
 # DuckDB groups tables into schemas ("main" is the default a bare filesystem
-# path connects into, same as PostgreSQL). `safety.py`'s
-# `_references_unknown_table` only accepts an absent or `main` schema
-# qualifier (see the `schema and schema != "main"` check there), so `main` is
-# this engine's whole supported catalogue surface - not a full multi-schema
-# implementation, deliberately deferred to Phase 3b alongside PostgreSQL. See
-# the 2026-09-21 review finding in `docs/6_agent_log.md`: before every
-# catalogue query below was filtered to this schema, a table outside it could
-# either crash schema building outright (a same-named table in another
-# schema, read through an unqualified value-hint query) or be advertised by
-# `raw_schema()`/`schema_chunks()` and then rejected by the validator, which
-# already only ever accepted `main`.
-_MAIN_SCHEMA = "main"
+# path connects into, same as PostgreSQL's "public"). Between 2026-09-25 and
+# Phase 3b Task 6 this engine read `main` and nothing else, because
+# `safety.py` accepted no other qualifier and a table it could not accept
+# must not be advertised (`docs/3_decisions.md`: "DuckDB support is scoped to
+# the `main` schema, consistently across every layer"). Task 6 replaced that
+# placeholder: every schema of the opened database is read, each table keeps
+# its schema in `SchemaChunk.schema_name`, and `table_names()` advertises the
+# `schema.table` spelling the validator now accepts - so the two failures the
+# 2026-09-21 review found stay closed by *agreement* between the layers
+# rather than by narrowing all three. Both remain pinned by
+# `tests/test_engine_duckdb.py`'s cross-schema regression tests.
+_DEFAULT_SCHEMA = "main"
+
+# Schemas that belong to DuckDB itself rather than to the user's data. They
+# are not in `duckdb_tables()`'s output for a file database (probed
+# 2026-09-26: only the opened catalogue's own schemas appear), so this is a
+# second, explicit guard rather than the load-bearing one - the same
+# belt-and-braces reasoning `internal_prefixes` below is kept for. A table
+# reference into either is refused by `safety._references_internals` on its
+# name, whatever this module reads.
+_INTERNAL_SCHEMAS = ("information_schema", "pg_catalog")
 
 
 def _connect_read_only(db_path: str) -> duckdb.DuckDBPyConnection:
@@ -68,11 +77,10 @@ def _quote_qualified(schema_name: str, table_name: str) -> str:
     An unqualified quoted table name resolves against DuckDB's search path
     (`main` by default), which is exactly how a value-hint query for one
     `main`-schema table silently read a same-named table in another schema -
-    see `_MAIN_SCHEMA`'s module docstring note. Every catalogue query this
-    module runs is already filtered to `schema_name = 'main'`, so this only
-    ever qualifies with `main` today, but qualifying explicitly (rather than
-    relying on the filter alone) means a value-hint query can never resolve
-    to a different schema's table even if that filter is ever loosened.
+    see `_DEFAULT_SCHEMA`'s comment. Since Task 6 reads every schema, this is
+    no longer belt-and-braces alongside a `main`-only filter: it is the whole
+    guard. A value-hint query for `analytics.shared` must read exactly that
+    table, never `main.shared`, whichever the search path would have found.
     """
     return _quote_identifier(schema_name) + "." + _quote_identifier(table_name)
 
@@ -132,10 +140,10 @@ class DuckDBEngine:
 
     name: str = "duckdb"
     sqlglot_dialect: str = "duckdb"
-    # See `Engine.default_schema`. Same value as `_MAIN_SCHEMA` above - kept
-    # as a separate protocol-facing attribute rather than aliased to it, so
-    # this class's public surface doesn't depend on a module-private name.
-    default_schema: str = _MAIN_SCHEMA
+    # See `Engine.default_schema`. Same value as `_DEFAULT_SCHEMA` above -
+    # kept as a separate protocol-facing attribute rather than aliased to it,
+    # so this class's public surface doesn't depend on a module-private name.
+    default_schema: str = _DEFAULT_SCHEMA
     # Milliseconds, like PostgreSQL's - see `Engine.default_work_limit`. This
     # is the fix for the pre-Task-5 bug where `execution.execute_query`
     # passed SQLite's 100_000-VM-step figure straight through as
@@ -545,74 +553,116 @@ DUCKDB DIALECT (must follow):
         finally:
             conn.close()
 
-    def raw_schema(self) -> str:
-        """Extract CREATE TABLE statements for every user table in `main`.
+    def _display_name(self, schema_name: str, table_name: str) -> str:
+        """`schema.table` outside `default_schema`, the bare name inside it.
 
-        Tables outside `main` are deliberately excluded - see `_MAIN_SCHEMA`'s
-        module-level comment for why `main` is this engine's whole supported
-        catalogue surface.
+        The same rule `SchemaChunk.qualified_name` applies, used here for the
+        one place a chunk cannot apply it for itself: the names in
+        `foreign_tables`, which must be spelled the way the referenced
+        table's own chunk spells itself or `rag.py`'s neighbour graph cannot
+        join the two.
+        """
+        return table_name if schema_name == self.default_schema else f"{schema_name}.{table_name}"
+
+    def raw_schema(self) -> str:
+        """Extract CREATE TABLE statements for every user table, every schema.
+
+        DuckDB's own stored DDL already spells each table the way a query
+        must: `CREATE TABLE analytics.sales(...)` for a table outside the
+        default schema and bare `CREATE TABLE orders(...)` for one inside it
+        (probed 2026-09-26 against `duckdb_tables().sql`). So the text the
+        model is shown already agrees, table for table, with what
+        `table_names()` accepts - which is the whole point of Task 6, and
+        what the 2026-09-25 narrowing achieved by showing less instead.
 
         Returns:
             The `CREATE TABLE` statements, one per table, semicolon-terminated
-            and separated by blank lines, in table-name order.
+            and separated by blank lines, ordered by schema then table name.
         """
         conn = _connect_read_only(self.dsn)
         try:
             rows = conn.execute(
-                "SELECT table_name, sql FROM duckdb_tables() "
-                "WHERE schema_name = ? ORDER BY table_name",
-                [_MAIN_SCHEMA],
+                "SELECT schema_name, table_name, sql FROM duckdb_tables() "
+                "WHERE database_name = current_database() "
+                "AND schema_name NOT IN (?, ?) "
+                "ORDER BY schema_name, table_name",
+                list(_INTERNAL_SCHEMAS),
             ).fetchall()
         finally:
             conn.close()
-        return "\n\n".join(sql.strip().rstrip(";") + ";" for _, sql in rows)
+        return "\n\n".join(sql.strip().rstrip(";") + ";" for _, _, sql in rows)
 
     def schema_chunks(self) -> list[SchemaChunk]:
         """Build table-level schema chunks for retrieval without reading row data.
 
-        Every catalogue query here is filtered to `main` - see `_MAIN_SCHEMA`'s
-        module-level comment. A table in another schema is never included, so
-        it can never be keyed by a bare `table_name` that collides with a
-        `main`-schema table of the same name (the reviewer's live
-        `BinderException` reproduction), and it can never be advertised here
-        only for `safety.py`'s `main`-only validator to reject it.
+        Every catalogue query reads every schema of the opened database, and
+        every intermediate map is keyed by `(schema_name, table_name)` rather
+        than by bare `table_name`. That keying is what the 2026-09-25 review
+        finding was really about: with a bare-name key, `main.shared` and
+        `analytics.shared` merge into one entry, and the value-hint query for
+        the merged result asks for a column only one of them has - the live
+        `BinderException`. `_value_hints_for_table` additionally qualifies its
+        own `FROM` (`_quote_qualified`), so it cannot resolve through the
+        search path to the other table even if this keying were wrong.
+
+        A chunk records `schema_name` only when the table is outside
+        `default_schema`, so `chunk.qualified_name` is exactly the spelling
+        `table_names()` advertises and `safety.py` accepts.
         """
         conn = _connect_read_only(self.dsn)
         try:
             table_rows = conn.execute(
-                "SELECT table_name, sql FROM duckdb_tables() "
-                "WHERE schema_name = ? ORDER BY table_name",
-                [_MAIN_SCHEMA],
+                "SELECT schema_name, table_name, sql FROM duckdb_tables() "
+                "WHERE database_name = current_database() "
+                "AND schema_name NOT IN (?, ?) "
+                "ORDER BY schema_name, table_name",
+                list(_INTERNAL_SCHEMAS),
             ).fetchall()
             all_columns = conn.execute(
-                "SELECT table_name, column_name, data_type FROM information_schema.columns "
-                "WHERE table_schema = ? ORDER BY table_name, ordinal_position",
-                [_MAIN_SCHEMA],
+                "SELECT table_schema, table_name, column_name, data_type "
+                "FROM information_schema.columns "
+                "WHERE table_catalog = current_database() "
+                "ORDER BY table_schema, table_name, ordinal_position",
             ).fetchall()
+            # DuckDB refuses a foreign key across schemas outright ("Binder
+            # Error: Creating foreign keys across different schemas or
+            # catalogs is not supported", probed 2026-09-26), so a
+            # constraint's referenced table is always in the constraint's own
+            # schema and `schema_name` identifies both sides.
             all_fks = conn.execute(
-                "SELECT table_name, referenced_table FROM duckdb_constraints() "
+                "SELECT schema_name, table_name, referenced_table "
+                "FROM duckdb_constraints() "
                 "WHERE constraint_type = 'FOREIGN KEY' AND referenced_table IS NOT NULL "
-                "AND schema_name = ?",
-                [_MAIN_SCHEMA],
+                "AND database_name = current_database()",
             ).fetchall()
 
-            columns_by_table: dict[str, list[tuple[str, str]]] = {}
-            for table_name, column_name, data_type in all_columns:
-                columns_by_table.setdefault(table_name, []).append((column_name, data_type))
+            columns_by_table: dict[tuple[str, str], list[tuple[str, str]]] = {}
+            for schema_name, table_name, column_name, data_type in all_columns:
+                columns_by_table.setdefault((schema_name, table_name), []).append(
+                    (column_name, data_type)
+                )
 
-            fk_by_table: dict[str, set[str]] = {}
-            for table_name, referenced_table in all_fks:
-                fk_by_table.setdefault(table_name, set()).add(referenced_table)
+            fk_by_table: dict[tuple[str, str], set[str]] = {}
+            for schema_name, table_name, referenced_table in all_fks:
+                fk_by_table.setdefault((schema_name, table_name), set()).add(
+                    self._display_name(schema_name, referenced_table)
+                )
 
             chunks: list[SchemaChunk] = []
-            for table_name, ddl in table_rows:
-                typed_columns = columns_by_table.get(table_name, [])
+            for schema_name, table_name, ddl in table_rows:
+                typed_columns = columns_by_table.get((schema_name, table_name), [])
                 columns = [c for c, _ in typed_columns]
-                foreign_tables = sorted(fk_by_table.get(table_name, set()))
-                value_hints = _value_hints_for_table(conn, _MAIN_SCHEMA, table_name, typed_columns)
+                foreign_tables = sorted(fk_by_table.get((schema_name, table_name), set()))
+                value_hints = _value_hints_for_table(conn, schema_name, table_name, typed_columns)
                 value_text = " ".join(value for values in value_hints.values() for value in values)
+                # The chunk's own qualified spelling leads `search_text`, not
+                # the bare name: for a default-schema table the two are the
+                # same string, so single-schema retrieval scoring is
+                # unchanged, while a table elsewhere contributes its schema
+                # as a term a question can legitimately match on.
+                display_name = self._display_name(schema_name, table_name)
                 search_text = " ".join(
-                    [table_name, ddl or "", *columns, *foreign_tables, value_text]
+                    [display_name, ddl or "", *columns, *foreign_tables, value_text]
                 )
                 chunks.append(
                     SchemaChunk(
@@ -621,6 +671,7 @@ DUCKDB DIALECT (must follow):
                         columns=columns,
                         foreign_tables=foreign_tables,
                         search_text=search_text,
+                        schema_name="" if schema_name == self.default_schema else schema_name,
                         value_hints=value_hints,
                     )
                 )
@@ -639,7 +690,12 @@ DUCKDB DIALECT (must follow):
         return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
 
     def table_names(self) -> frozenset[str]:
-        """Every user table's name, lowercased, via the cached schema chunks.
+        """Every valid spelling of every user table, lowercased, via the cache.
+
+        A table in `main` is accepted bare and as `main.<table>`; a table in
+        any other schema is accepted only as `<schema>.<table>`, never bare -
+        see `Engine.table_names` for the rule and
+        `base.table_name_spellings` for the one implementation of it.
 
         This is what `safety.is_safe_query`'s default-deny table check
         (`_references_unknown_table`) calls to tell a real table from a
@@ -661,8 +717,9 @@ DUCKDB DIALECT (must follow):
         """
         from ..schema import get_schema_chunks
 
-        chunks = get_schema_chunks(f"duckdb://{self.dsn}")
-        return frozenset(chunk.table_name.lower() for chunk in chunks)
+        return table_name_spellings(
+            get_schema_chunks(f"duckdb://{self.dsn}"), default_schema=self.default_schema
+        )
 
     def column_names(self) -> frozenset[str]:
         """Every user table's column names, lowercased, unioned across tables.

@@ -21,30 +21,23 @@ allowlist, matching `DuckDBEngine`'s Task 6b work - see that attribute's own
 comment for how it was built and verified.
 
 Task 5 (2026-09-26) hardened the schema-extraction methods below without
-widening what they expose: every catalogue query still filters to `public`
-(`default_schema`) alone, the same single-schema scope `DuckDBEngine` was
-deliberately narrowed to on 2026-09-25
-(`docs/3_decisions.md`: "DuckDB support is scoped to the `main` schema,
-consistently across every layer"). That entry's own reasoning is why
-PostgreSQL stays scoped too: "PostgreSQL forces the same question for both
-engines in Phase 3b ... so doing it once there [Task 6] beats doing it
-twice" - advertising a table outside `public` via `raw_schema()`/
-`schema_chunks()` before `safety.py`'s schema-qualifier check (which still
-only accepts `main`/absent, Task 6's job to fix) would reproduce exactly the
-"advertised then blocked" inversion that decision closed for DuckDB: a model
-correctly qualifying a non-default-schema table gets rejected, while the
-unqualified form validates and fails at execution.
-
-What *did* change: `_fetch_columns`/`_fetch_primary_keys`/`_fetch_
-foreign_keys` all key by `(schema_name, table_name)`, never bare
-`table_name` - the 2026-09-25 DuckDB fix (`duckdb.py`'s module docstring) is
-what a bare-name key crashes on the moment a query result ever spans two
-schemas sharing a table name. Every one of those helpers takes a list of
-schema names for exactly that reason (Task 6 widens the one-element list
-this module passes today, `[default_schema]`, without needing to touch the
-keying itself), and the value-hint query has always qualified its table
-reference (`_quote_qualified`) so it cannot silently resolve to a same-named
-table in a schema this module does not even query.
+widening what they expose - every catalogue query filtered to `public` alone,
+because `safety.py` accepted no other qualifier and advertising a table the
+validator would reject is exactly the inversion `docs/3_decisions.md`'s
+2026-09-25 entry closed for DuckDB. Task 6 removed that constraint at its
+source: the validator now takes its schema rule from `table_names()`, so
+`_user_schema_names` below reads **every** schema this role can actually use
+(never `pg_catalog`, `information_schema` or any other `pg_*`), and each
+table keeps its schema through `SchemaChunk.schema_name` all the way to the
+validator. Task 5's keying is what made that a widening rather than a
+rewrite: `_fetch_columns`/`_fetch_primary_keys`/`_fetch_foreign_keys` were
+already keyed by `(schema_name, table_name)`, never bare `table_name` - what
+a bare-name key does the moment two schemas share a table name is the live
+`BinderException` the 2026-09-25 DuckDB review found - and already took a
+list of schema names, so Task 6 widens that list and touches nothing else in
+them. The value-hint query has always qualified its table reference
+(`_quote_qualified`), so it resolves to the table asked for rather than to
+whatever `search_path` finds first.
 """
 
 from __future__ import annotations
@@ -62,16 +55,15 @@ from ..config import (
     DEFAULT_WORK_LIMIT_MS,
 )
 from ..types import QueryResult, SchemaChunk
-from .base import EngineUnreachableError
+from .base import EngineUnreachableError, table_name_spellings
 
 _CONNECT_TIMEOUT_SECONDS = 5
 
 # See `PostgresEngine.default_schema`. This is what a bare, unqualified table
-# name resolves against, and the only schema `safety.py`'s qualifier check
-# accepts today (Task 6 is what wires `default_schema` through that check for
-# every engine). It is also the only schema `raw_schema()`/`schema_chunks()`/
-# `schema_fingerprint()` read - see the module docstring for why that scope
-# is deliberate, not a leftover from Task 2.
+# name resolves against for a role whose `search_path` is PostgreSQL's
+# default, and the only schema whose tables `table_names()` also advertises
+# under their bare names. It is no longer the only schema the catalogue reads
+# - see `_user_schema_names`.
 _PUBLIC_SCHEMA = "public"
 
 
@@ -98,6 +90,34 @@ def _quote_identifier(name: str) -> str:
 
 def _quote_qualified(schema_name: str, table_name: str) -> str:
     return _quote_identifier(schema_name) + "." + _quote_identifier(table_name)
+
+
+def _user_schema_names(conn: psycopg.Connection[tuple[Any, ...]]) -> list[str]:
+    """Every schema this connection's role may use, PostgreSQL's own excluded.
+
+    `pg_catalog`, `pg_toast`, any `pg_temp_*`/`pg_toast_temp_*` and
+    `information_schema` are PostgreSQL's internals, not the user's data, and
+    `safety.py` refuses a reference into them by name whatever this returns
+    (`internal_prefixes = ("pg_",)`, `internal_names = {"information_
+    schema"}`). Reading them here would therefore advertise to the model
+    exactly the tables the validator is guaranteed to reject - the
+    "advertised then blocked" inversion `docs/3_decisions.md`'s 2026-09-25
+    entry exists to prevent - so the exclusion is part of the identity
+    contract, not a tidiness preference.
+
+    `has_schema_privilege` is what keeps the rest honest: `aipa_ro` is a
+    least-privilege role, and a schema it holds no `USAGE` on is one whose
+    tables it could not read even if they were advertised. Asking the
+    catalogue rather than assuming `public` is what makes this engine work
+    against a real database whose tables live in several schemas.
+    """
+    rows = conn.execute(
+        "SELECT nspname FROM pg_namespace "
+        "WHERE nspname <> 'information_schema' AND nspname NOT LIKE 'pg\\_%' "
+        "AND has_schema_privilege(nspname, 'USAGE') "
+        "ORDER BY nspname"
+    ).fetchall()
+    return [name for (name,) in rows]
 
 
 def _fetch_columns(
@@ -225,6 +245,21 @@ def _fetch_foreign_keys(
             )
         )
     return fk_by_table
+
+
+def _plain_table(schema_name: str, table_name: str, default_schema: str) -> str:
+    """`schema.table` outside `default_schema`, the bare name inside it, unquoted.
+
+    The same rule `SchemaChunk.qualified_name` applies, for the two places a
+    chunk cannot apply it for itself: the names it lists in `foreign_tables`
+    (which must match how the referenced table's own chunk spells itself, or
+    `rag.py`'s neighbour graph cannot join the two) and the leading term of
+    its `search_text`. `_display_table` below is the quoted form of the same
+    rule, for DDL text.
+    """
+    if schema_name == default_schema:
+        return table_name
+    return f"{schema_name}.{table_name}"
 
 
 def _display_table(schema_name: str, table_name: str, default_schema: str) -> str:
@@ -610,7 +645,13 @@ class PostgresEngine:
             conn.close()
 
     def raw_schema(self) -> str:
-        """Extract synthesised `CREATE TABLE` statements for every table in `public`.
+        """Extract synthesised `CREATE TABLE` statements for every readable table.
+
+        Every schema this role may use, not `public` alone - see
+        `_user_schema_names`. A table outside `public` is written
+        schema-qualified (`_display_table`), which is both how a query must
+        spell it and how `table_names()` advertises it, so nothing is shown
+        here that the validator would refuse.
 
         Reads through the same read-only, least-privilege connection
         `execute()` uses (`_connect_read_only`) rather than a plain
@@ -621,10 +662,10 @@ class PostgresEngine:
 
         Returns:
             The `CREATE TABLE` statements, one per table, semicolon-terminated
-            and separated by blank lines, in table-name order.
+            and separated by blank lines, ordered by schema then table name.
         """
-        schema_names = [self.default_schema]
         with _connect_read_only(self.dsn) as conn:
+            schema_names = _user_schema_names(conn)
             columns_by_table = _fetch_columns(conn, schema_names)
             pk_by_table = _fetch_primary_keys(conn, schema_names)
             fk_by_table = _fetch_foreign_keys(conn, schema_names)
@@ -643,20 +684,23 @@ class PostgresEngine:
     def schema_chunks(self) -> list[SchemaChunk]:
         """Build table-level schema chunks for retrieval without reading row data.
 
-        Filtered to `public` (`default_schema`) alone - see the module
-        docstring for why that scope is deliberate. `_fetch_columns`/`_fetch_
-        primary_keys`/`_fetch_foreign_keys` still key everything by
-        `(schema, table)` rather than bare `table_name`: a single-schema
-        filter means today's query results can never actually collide, but
-        keying by the pair is what keeps that true if Task 6 ever widens
-        `schema_names` beyond one element, rather than relying on the filter
-        alone the way the pre-Task-5 version implicitly did.
+        Covers every schema this role may use - see `_user_schema_names`.
+        `_fetch_columns`/`_fetch_primary_keys`/`_fetch_foreign_keys` key
+        everything by `(schema, table)` rather than bare `table_name`, which
+        is what makes that widening safe: two schemas sharing a table name
+        stay two entries with their own columns, keys and value hints, where
+        a bare-name key would silently merge them (`duckdb.py`'s module
+        docstring records what that merge did in practice).
+
+        A chunk records `schema_name` only when the table is outside
+        `default_schema`, so `chunk.qualified_name` is exactly the spelling
+        `table_names()` advertises and `safety.py` accepts.
 
         Reads through `_connect_read_only`, the same connection `execute()`
         uses - see `raw_schema()`'s docstring for why.
         """
-        schema_names = [self.default_schema]
         with _connect_read_only(self.dsn) as conn:
+            schema_names = _user_schema_names(conn)
             columns_by_table = _fetch_columns(conn, schema_names)
             pk_by_table = _fetch_primary_keys(conn, schema_names)
             fk_by_table = _fetch_foreign_keys(conn, schema_names)
@@ -667,7 +711,18 @@ class PostgresEngine:
                 columns = [c for c, _, _ in typed_columns]
                 pk_columns = pk_by_table.get((schema_name, table_name), [])
                 foreign_keys = fk_by_table.get((schema_name, table_name), [])
-                foreign_tables = sorted({fk.ref_table for fk in foreign_keys})
+                # Spelled the way the referenced table's own chunk spells
+                # itself (bare inside `default_schema`, qualified outside),
+                # so a foreign-key edge and a chunk identity are the same
+                # kind of key - PostgreSQL, unlike DuckDB, does allow a
+                # foreign key to cross schemas, so `fk.ref_schema` is read
+                # rather than assumed.
+                foreign_tables = sorted(
+                    {
+                        _plain_table(fk.ref_schema, fk.ref_table, self.default_schema)
+                        for fk in foreign_keys
+                    }
+                )
                 ddl = _table_ddl(
                     schema_name,
                     table_name,
@@ -679,7 +734,11 @@ class PostgresEngine:
                 untyped_columns = [(c, t) for c, t, _ in typed_columns]
                 value_hints = _value_hints_for_table(conn, schema_name, table_name, untyped_columns)
                 value_text = " ".join(value for values in value_hints.values() for value in values)
-                search_text = " ".join([table_name, ddl, *columns, *foreign_tables, value_text])
+                # The chunk's own qualified spelling leads `search_text`: for
+                # a table in `default_schema` it is the same string as the
+                # bare name, so single-schema retrieval scoring is unchanged.
+                display_name = _plain_table(schema_name, table_name, self.default_schema)
+                search_text = " ".join([display_name, ddl, *columns, *foreign_tables, value_text])
                 chunks.append(
                     SchemaChunk(
                         table_name=table_name,
@@ -687,6 +746,7 @@ class PostgresEngine:
                         columns=columns,
                         foreign_tables=foreign_tables,
                         search_text=search_text,
+                        schema_name="" if schema_name == self.default_schema else schema_name,
                         value_hints=value_hints,
                     )
                 )
@@ -695,8 +755,9 @@ class PostgresEngine:
     def schema_fingerprint(self) -> tuple[object, ...]:
         """Hash table names, column names/types and foreign keys into a cache key.
 
-        Filtered to `public` (`default_schema`) alone, matching `raw_schema()`/
-        `schema_chunks()` - see the module docstring. Nothing row-derived
+        Covers the same schemas `raw_schema()`/`schema_chunks()` do
+        (`_user_schema_names`), so a table appearing in or vanishing from any
+        of them invalidates `schema.py`'s cache. Nothing row-derived
         goes into the hash - no row count, no value-hint query - which is
         what `tests/test_engine_postgres.py::
         test_the_fingerprint_changes_on_ddl_but_not_on_insert` proves
@@ -713,8 +774,8 @@ class PostgresEngine:
         Reads through `_connect_read_only`, the same connection `execute()`
         uses - see `raw_schema()`'s docstring for why.
         """
-        schema_names = [self.default_schema]
         with _connect_read_only(self.dsn) as conn:
+            schema_names = _user_schema_names(conn)
             column_rows = conn.execute(
                 "SELECT table_schema, table_name, column_name, data_type, "
                 "is_nullable, ordinal_position "
@@ -750,7 +811,12 @@ class PostgresEngine:
         return (self.default_schema, digest)
 
     def table_names(self) -> frozenset[str]:
-        """Every user table's name, lowercased, via the cached schema chunks.
+        """Every valid spelling of every user table, lowercased, via the cache.
+
+        A table in `public` is accepted bare and as `public.<table>`; a table
+        in any other schema is accepted only as `<schema>.<table>`, never
+        bare - see `Engine.table_names` for the rule and
+        `base.table_name_spellings` for the one implementation of it.
 
         Routed through `schema.get_schema_chunks` so this shares `schema.py`'s
         single fingerprint-keyed cache rather than a second, driftable one
@@ -762,8 +828,7 @@ class PostgresEngine:
         """
         from ..schema import get_schema_chunks
 
-        chunks = get_schema_chunks(self.dsn)
-        return frozenset(chunk.table_name.lower() for chunk in chunks)
+        return table_name_spellings(get_schema_chunks(self.dsn), default_schema=self.default_schema)
 
     def column_names(self) -> frozenset[str]:
         """Every user table's column names, lowercased, unioned across tables.

@@ -1296,18 +1296,22 @@ def test_cte_scoping_fix_is_load_bearing(monkeypatch, engine_with_table_t):
     )
 
 
-# --- Non-`main`-schema regression tests (Codex review, 2026-09-21) ---
+# --- Cross-schema regression tests (Codex review, 2026-09-21) ---
 #
-# DuckDB groups tables into schemas, `main` being the default a bare filesystem
-# path connects into. `safety.py`'s `_references_unknown_table` (see the
-# `schema and schema != "main"` check above) already only accepts an absent or
-# `main` schema qualifier, so `main`-only is the project's decided, documented
-# scope for DuckDB (see `docs/6_agent_log.md`'s 2026-09-21 entry and
-# `docs/3_decisions.md`). These two tests pin the two concrete failures a
-# non-`main` table caused before `raw_schema()`/`schema_chunks()` were also
-# filtered to `main`: a `BinderException` while building the schema at all,
-# and an "advertised then blocked" inversion where the model was shown a table
-# the validator would never accept.
+# These two fixtures are the reviewer's live reproductions of the two failures
+# a non-`main` table caused: a `BinderException` while building the schema at
+# all (a duplicate table name across schemas, read through an unqualified
+# value-hint query), and an "advertised then blocked" inversion where the
+# model was shown a table the validator would never accept.
+#
+# The 2026-09-25 fix answered both by narrowing every layer to `main`
+# (`docs/3_decisions.md`), and these tests then asserted that narrow contract.
+# Phase 3b Task 6 replaced it with schema-qualified identity, so they are
+# **updated, not deleted**: the fixtures are unchanged, and what they now
+# assert is that the crash still does not happen and that both tables are
+# reachable under their qualified names. Preserving the crash reproduction is
+# the point - a future refactor of the value-hint or chunk-keying code must
+# still hit it here.
 
 
 @pytest.fixture
@@ -1333,29 +1337,52 @@ def cross_schema_duplicate_name_db(tmp_path):
 def test_duplicate_table_name_across_schemas_does_not_crash_schema_building(
     cross_schema_duplicate_name_db,
 ):
-    """At BASE: `engine.table_names()` (which routes through `schema_chunks()`)
-    raised `duckdb.BinderException: Referenced column "analytics_only" not
-    found in FROM clause!` while querying value hints for the unqualified,
-    ambiguous `shared` table. Filtering every catalogue query to `main` and
-    qualifying the value-hint query removes `analytics.shared` from
-    consideration entirely, so only `main.shared`'s own column is ever read.
+    """At BASE (pre-2026-09-25): `engine.table_names()` (which routes through
+    `schema_chunks()`) raised `duckdb.BinderException: Referenced column
+    "analytics_only" not found in FROM clause!` while querying value hints for
+    the unqualified, ambiguous `shared` table.
+
+    It still must not, and now for a reason that keeps both tables: every
+    catalogue map is keyed by `(schema, table)` so the two never merge, and
+    `_value_hints_for_table` qualifies its own `FROM` so it reads the table it
+    was asked about rather than whichever the search path finds first. Both
+    `shared` tables are present, each with its own columns and hints, and each
+    reachable under exactly one spelling: `main.shared` also answers to bare
+    `shared` (the engine resolves it that way), `analytics.shared` does not.
     """
-    names = cross_schema_duplicate_name_db.table_names()
-    assert names == frozenset({"shared"})
-    chunks = {c.table_name: c for c in cross_schema_duplicate_name_db.schema_chunks()}
+    engine = cross_schema_duplicate_name_db
+    names = engine.table_names()
+    assert names == frozenset({"shared", "main.shared", "analytics.shared"})
+
+    chunks = {c.qualified_name: c for c in engine.schema_chunks()}
+    assert set(chunks) == {"shared", "analytics.shared"}
     assert chunks["shared"].columns == ["main_only"]
+    assert chunks["shared"].schema_name == ""
+    assert chunks["analytics.shared"].columns == ["analytics_only"]
+    assert chunks["analytics.shared"].schema_name == "analytics"
+    # The value hint proves the qualified read landed on the right table: `x`
+    # is a row of `analytics.shared` only, and asking `main.shared` for
+    # `analytics_only` is the exact `BinderException` this test reproduces.
     assert chunks["shared"].value_hints == {}
+    assert chunks["analytics.shared"].value_hints == {"analytics_only": ["x"]}
+
+    assert is_safe_query("SELECT main_only FROM shared", engine=engine)
+    assert is_safe_query("SELECT main_only FROM main.shared", engine=engine)
+    assert is_safe_query("SELECT analytics_only FROM analytics.shared", engine=engine)
+    assert engine.execute(
+        "SELECT analytics_only FROM analytics.shared", max_rows=10, work_limit=0
+    ).rows == [("x",)]
 
 
 @pytest.fixture
 def non_main_schema_only_db(tmp_path):
     """`analytics.sales` exists; `main.sales` does not.
 
-    Reproduces the reviewer's second failure: before the fix, `raw_schema()`
-    advertised `sales` to the model and `table_names()` returned it, but the
-    validator (`main`-only) rejected both the qualified query the model should
-    have needed and, after wrongly approving the unqualified form, the query
-    failed against the real database anyway.
+    Reproduces the reviewer's second failure: before the 2026-09-25 fix,
+    `raw_schema()` advertised `sales` to the model and `table_names()`
+    returned it, but the validator (`main`-only) rejected the qualified query
+    the model should have needed and, after wrongly approving the unqualified
+    form, the query failed against the real database anyway.
     """
     db = tmp_path / "nonmain.duckdb"
     con = duckdb.connect(str(db))
@@ -1366,21 +1393,37 @@ def non_main_schema_only_db(tmp_path):
     return open_engine(f"duckdb://{db}")
 
 
-def test_table_outside_main_is_never_advertised_or_accepted(non_main_schema_only_db):
-    """At BASE: `raw_schema()` mentioned `sales` and `table_names()` returned
-    it, yet `is_safe_query("SELECT amt FROM analytics.sales", ...)` was
-    `False` (the correct, schema-qualified query blocked) while
-    `is_safe_query("SELECT amt FROM sales", ...)` was wrongly `True` even
-    though executing it raises `CatalogException` (no `main.sales` exists).
-    After the fix, a non-`main` table is invisible everywhere: not in
-    `raw_schema()`, not in `table_names()`, and no spelling of a query against
-    it is accepted.
+def test_table_outside_main_is_advertised_and_accepted_only_when_qualified(
+    non_main_schema_only_db,
+):
+    """At BASE (pre-2026-09-25): `raw_schema()` mentioned `sales` and
+    `table_names()` returned it, yet `is_safe_query("SELECT amt FROM
+    analytics.sales", ...)` was `False` (the correct, schema-qualified query
+    blocked) while `is_safe_query("SELECT amt FROM sales", ...)` was wrongly
+    `True` even though executing it raises `CatalogException` (no `main.sales`
+    exists). 2026-09-25 answered that by hiding the table; Task 6 answers it
+    by making all three layers agree on one spelling.
+
+    The inversion is what must never come back, in either direction: the
+    spelling that is advertised is the spelling that validates *and* runs, and
+    the spelling that cannot run is the one refused. `docs/3_decisions.md`'s
+    stated cost - "a DuckDB database whose tables all live outside `main` now
+    presents an empty schema and answers `UNANSWERABLE_WITH_GIVEN_SCHEMA`" -
+    is paid off by the first two assertions.
     """
     engine = non_main_schema_only_db
-    assert "sales" not in engine.raw_schema()
+    assert "sales" in engine.raw_schema()
+    assert "analytics.sales" in engine.table_names()
     assert "sales" not in engine.table_names()
-    assert not is_safe_query("SELECT amt FROM analytics.sales", engine=engine)
+    assert is_safe_query("SELECT amt FROM analytics.sales", engine=engine)
+    assert engine.execute("SELECT amt FROM analytics.sales", max_rows=10, work_limit=0).rows == [
+        (10,)
+    ]
+    # The bare form stays refused because it stays unrunnable: DuckDB resolves
+    # it against `main`, which has no `sales`.
     assert not is_safe_query("SELECT amt FROM sales", engine=engine)
+    with pytest.raises(duckdb.CatalogException):
+        engine.execute("SELECT amt FROM sales", max_rows=10, work_limit=0)
 
 
 def test_duckdb_default_work_limit_is_5000_ms() -> None:

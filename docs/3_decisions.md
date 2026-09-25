@@ -2,7 +2,71 @@
 
 Newest first. Each entry states what was chosen and what it ruled out.
 
+## 2026-09-26 — schema-qualified table identity, carried through every engine
+
+**Supersedes** the 2026-09-25 entry below, which was explicitly a placeholder
+for this work.
+
+**Chosen:** One identity, produced by the engine and consumed unchanged by
+every layer. `SchemaChunk` gains `schema_name`, set only when the table is
+outside the engine's `default_schema`, and `qualified_name` renders it
+(`analytics.thing` outside, bare `customers` inside). DuckDB and PostgreSQL
+read every schema they can actually query — PostgreSQL through
+`_user_schema_names`, which asks `has_schema_privilege`, and neither reads
+`pg_catalog`, `information_schema` or any other `pg_*`. `Engine.table_names()`
+returns two spellings for a default-schema table (bare *and* qualified) and
+exactly one for every other (qualified only), via the single shared
+implementation `engines/base.py::table_name_spellings`. `safety.py`'s
+hardcoded `schema == "main"` rule is gone: a qualified reference is checked in
+its qualified form against that same set.
+
+**Ruled out — accepting a bare name for a table outside the default schema.**
+This is the ambiguity question `search_path` answers on a real server, and
+answering it any other way reintroduces one of the two 2026-09-25 failures.
+Accepting `thing` for `analytics.thing` would approve a query the engine then
+fails to resolve (`CatalogException`), which is the "advertised then blocked"
+inversion in mirror image; and where two schemas share a name, it would
+validate a column list belonging to whichever table the guess picked. A bare
+name therefore means the default schema's table or nothing — exactly what the
+engine itself does — so it is never ambiguous, and `main.shared` and
+`analytics.shared` coexist as two distinct entries.
+
+**Ruled out — a second schema for SQLite.** SQLite's only route to one is
+`ATTACH DATABASE`, which this project has no shape for: a SQLite DSN is a
+single file path, and the read-only authorizer denies `SQLITE_ATTACH`
+outright. SQLite therefore keeps its catalogue reads exactly as they were and
+only learns the `main.<table>` spelling it already accepts. Parity here would
+have been fiction; `tests/test_schema_identity.py::
+test_sqlite_has_exactly_one_schema_because_attach_is_denied` pins the real
+shape instead.
+
+**Why:** The 2026-09-25 decision closed the inversion by narrowing all three
+layers to agree on `main`, at a stated cost — "a DuckDB database whose tables
+all live outside `main` now presents an empty schema and answers
+`UNANSWERABLE_WITH_GIVEN_SCHEMA`". PostgreSQL makes that cost untenable:
+`public` is only a default and multi-schema databases are ordinary. The layers
+still have to agree, so the agreement moved from "show less" to "one spelling,
+produced once": what `raw_schema()` shows the model is what `table_names()`
+accepts is what the engine runs. The two 2026-09-25 failure reproductions were
+kept and inverted rather than deleted
+(`tests/test_engine_duckdb.py`'s two cross-schema tests), because a future
+refactor of value-hint or chunk-keying code must still hit the
+`BinderException` they were written for.
+
+**Cost:** the table and column universes the default-deny validator checks
+against are now larger — every schema the role may use, not one. That is the
+same set the engine would execute against, so it is not a widening relative to
+reality, and the internals rules (`pg_catalog.*`, `information_schema.*`,
+`sqlite_*`) are name rules that consult no table list and are unaffected.
+`tests/test_schema_identity.py::test_the_closed_bypasses_stay_closed_with_a_
+second_schema` re-runs this phase's closed bypasses against a database that
+has a second real schema in it.
+
 ## 2026-09-25 — DuckDB support is scoped to the `main` schema, consistently across every layer
+
+**Superseded by the 2026-09-26 entry above.** It was always a placeholder for
+Phase 3b Task 6; the two failure modes it records are still the ones to avoid,
+and are still pinned by the same two tests.
 
 **Chosen:** Every DuckDB catalogue query — `raw_schema()`, `schema_chunks()`,
 and the value-hint query beneath them — filters to `schema_name = 'main'`

@@ -18,7 +18,7 @@ from ..config import (
     DEFAULT_VALUE_HINT_MAX_CARDINALITY,
 )
 from ..types import QueryResult, SchemaChunk
-from .base import EngineUnreachableError
+from .base import EngineUnreachableError, table_name_spellings
 
 
 def _sqlite_read_only_authorizer(action: int, *_args: Any) -> int:
@@ -127,8 +127,19 @@ class SQLiteEngine:
     name: str = "sqlite"
     sqlglot_dialect: str = "sqlite"
     # See `Engine.default_schema`. SQLite's implicit catalogue is "main" -
-    # what an unqualified table name resolves against, and the only schema
-    # `safety.py`'s qualifier check accepts today.
+    # what an unqualified table name resolves against.
+    #
+    # Unlike DuckDB's and PostgreSQL's, this is not a *scope* decision: it is
+    # the whole engine. SQLite's only route to a second schema is `ATTACH
+    # DATABASE`, and this project has no shape for one - a SQLite DSN is a
+    # single file path, and `_sqlite_read_only_authorizer` above denies
+    # `SQLITE_ATTACH` outright, so no connection this module opens can ever
+    # have a second schema to read. Phase 3b Task 6 therefore leaves SQLite's
+    # catalogue reads exactly as they were and only teaches `table_names()`
+    # the qualified spelling `main.<table>`, which SQLite itself accepts.
+    # `tests/test_schema_identity.py::
+    # test_sqlite_has_exactly_one_schema_because_attach_is_denied` pins that
+    # reasoning rather than faking a second schema.
     default_schema: str = "main"
     # SQLite's own unit: a VM-instruction count, unchanged by Phase 3b's
     # PostgreSQL work - see `Engine.default_work_limit`.
@@ -316,7 +327,12 @@ SQLITE DIALECT (must follow):
         return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
 
     def table_names(self) -> frozenset[str]:
-        """Every user table's name, lowercased, via the cached schema chunks.
+        """Every valid spelling of every user table, lowercased, via the cache.
+
+        Every SQLite table is in `main` (see `default_schema`), so every one
+        of them appears both bare and as `main.<table>` - the same two
+        spellings SQLite itself resolves. No table can appear qualified-only
+        here, because no table can live anywhere else.
 
         `is_safe_query`'s default-deny table check never actually reaches
         this for SQLite - `SQLiteEngine.allowed_functions` is `None`, so
@@ -334,7 +350,7 @@ SQLITE DIALECT (must follow):
         """
         from ..schema import get_schema_chunks
 
-        return frozenset(chunk.table_name.lower() for chunk in get_schema_chunks(self.dsn))
+        return table_name_spellings(get_schema_chunks(self.dsn), default_schema=self.default_schema)
 
     def column_names(self) -> frozenset[str]:
         """Every user table's column names, lowercased, unioned across tables.
