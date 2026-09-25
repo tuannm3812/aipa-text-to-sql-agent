@@ -35,6 +35,23 @@ Carried over from Phase 3a, closed out or newly found:
    worse.
 3. **Value hints can go stale on a coarse-mtime filesystem.** Predates Phase
    3a.
+4. **Schema-qualified table identity, decided once for both engines.** DuckDB
+   is currently scoped to the `main` schema across every layer (see
+   `docs/3_decisions.md`, 2026-09-25); a DuckDB database whose tables live
+   outside `main` presents an empty schema and answers
+   `UNANSWERABLE_WITH_GIVEN_SCHEMA`. PostgreSQL cannot take the same
+   shortcut for long — schemas are intrinsic there, `public` is merely the
+   default, and multi-schema databases are normal — so 3b is where the
+   qualified identity should be carried through DDL, chunks, value hints,
+   foreign keys, `table_names()` and safety validation, for both engines at
+   once. Changing one layer alone leaves the contract inconsistent, which is
+   the exact defect the 2026-09-25 fix closed.
+5. **`schema_fingerprint()` is file-level, not schema-scoped.** For DuckDB it
+   is `(path, mtime_ns, size)` over the whole file, so adding or dropping a
+   table outside `main` moves the schema-chunks cache key even though what is
+   advertised to the model cannot change. Measured, not fixed: the cost is a
+   redundant recompute, never a wrong result. Worth folding into the
+   qualified-identity work above rather than fixing alone.
 
 ## Phase 4 — Real RAG
 

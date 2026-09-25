@@ -2,6 +2,68 @@
 
 Newest first. Each entry states what was chosen and what it ruled out.
 
+## 2026-09-25 — DuckDB support is scoped to the `main` schema, consistently across every layer
+
+**Chosen:** Every DuckDB catalogue query — `raw_schema()`, `schema_chunks()`,
+and the value-hint query beneath them — filters to `schema_name = 'main'`
+(`table_schema` for `information_schema.columns`), and the value-hint query
+is schema-qualified so it cannot resolve to another schema's same-named
+table. `safety.py`'s existing "absent or `main`" rule is left untouched and
+is now the layer the others agree with.
+
+**Ruled out:** Carrying schema-qualified table identity through DDL, chunks,
+value hints, foreign keys, `table_names()` and safety validation. Deferred to
+Phase 3b.
+
+**Why:** Codex's 2026-09-21 review (logged in `docs/6_agent_log.md`) found
+the three layers disagreeing about the supported surface, and both failure
+modes reproduced. A duplicate table name across schemas crashed schema
+building with a `BinderException` before any question reached the model,
+because the value-hint query asked unqualified `shared` — resolving to
+`main.shared` — for a column only `analytics.shared` has. A table living
+only outside `main` was advertised to the model by `raw_schema()` and then
+rejected by the validator when the model correctly qualified it, while the
+unqualified form passed validation and failed at execution. Every route
+failed, and the user saw `BLOCKED_UNSAFE_SQL` or a repair loop.
+
+Filtering consistently removes the inversion at the source: a table outside
+`main` is never advertised, so the model is never shown something it is not
+allowed to query. Full schema-qualified identity is the better end state,
+but PostgreSQL forces the same question for both engines in Phase 3b — where
+schemas are unavoidable, `public` being the default and multi-schema
+databases normal — so doing it once there beats doing it twice. The cost of
+this decision is explicit: a DuckDB database whose tables all live outside
+`main` now presents an empty schema and answers
+`UNANSWERABLE_WITH_GIVEN_SCHEMA`. That is a documented limit, not a bug, until
+3b lifts it.
+
+## 2026-09-25 — dialect-dependent prompt instructions are engine-owned, parameterised rather than reworded
+
+**Chosen:** `_PROMPT_BODY` in `llm.py` carries three placeholders —
+`{{DIALECT_SECTION}}`, `{{DIALECT_NAME}}` and `{{ENGINE_RULES_BLOCK}}` —
+filled from engine attributes (`prompt_dialect_section`,
+`prompt_dialect_name`, `prompt_engine_rules_block`). `_repair_sql` in
+`pipeline.py` interpolates the same dialect name into the repair *user*
+prompt.
+
+**Ruled out:** Rewording the shared body into dialect-neutral prose (e.g.
+"a single read-only SELECT query", "SQL `=` is case-sensitive").
+
+**Why:** Phase 3a split the prompt but left four SQLite instructions in the
+supposedly shared half, so every DuckDB generation was told to write "a
+SINGLE SQLite SELECT query" and to avoid `sqlite_master`, and every DuckDB
+repair reported a "SQLite error" and asked for a "corrected SQLite SELECT
+query" — found by Codex on 2026-09-21 and reproduced. Neutral rewording is
+the cleaner long-term shape, but it necessarily changes the bytes of the
+shared body and therefore of the assembled SQLite prompt, whose sha256
+(`89d91c…`) is pinned precisely so this refactor cannot alter SQLite's
+behaviour. Per-engine substitution reproduces SQLite's wording byte for byte
+while naming DuckDB correctly. The case-insensitivity rule is engine-owned
+for the same reason even though the underlying claim holds for both engines:
+its attribution, not its content, was wrong. If the sha256 pin is ever
+deliberately retired, collapsing these back to neutral wording is the
+preferred shape.
+
 ## 2026-09-19 — per-engine read-only enforcement, no shared mechanism
 
 **Chosen:** Each `Engine` implementation proves its own read-only guarantee
