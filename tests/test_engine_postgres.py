@@ -137,6 +137,7 @@ _FILESYSTEM_AND_PROGRAM_PROBES: list[tuple[str, str]] = [
     ("pg_stat_file_absolute", "SELECT * FROM pg_stat_file('/etc/passwd')"),
     ("pg_shadow", "SELECT usename, passwd FROM pg_shadow"),
     ("copy_to_program", "COPY (SELECT 1) TO PROGRAM 'touch /tmp/aipa-task3-pwned'"),
+    ("current_setting_data_directory", "SELECT current_setting('data_directory')"),
     # Beyond the brief's own list: pg_ls_waldir and a *relative* path (inside
     # the data directory, not an absolute path like /etc/passwd) for the
     # file-reading functions - a role could plausibly be denied absolute
