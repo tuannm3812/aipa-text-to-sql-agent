@@ -28,6 +28,20 @@ from ..config import DEFAULT_VALUE_HINT_LIMIT, DEFAULT_VALUE_HINT_MAX_CARDINALIT
 from ..types import QueryResult, SchemaChunk
 from .base import EngineUnreachableError
 
+# DuckDB groups tables into schemas ("main" is the default a bare filesystem
+# path connects into, same as PostgreSQL). `safety.py`'s
+# `_references_unknown_table` only accepts an absent or `main` schema
+# qualifier (see the `schema and schema != "main"` check there), so `main` is
+# this engine's whole supported catalogue surface - not a full multi-schema
+# implementation, deliberately deferred to Phase 3b alongside PostgreSQL. See
+# the 2026-09-21 review finding in `docs/6_agent_log.md`: before every
+# catalogue query below was filtered to this schema, a table outside it could
+# either crash schema building outright (a same-named table in another
+# schema, read through an unqualified value-hint query) or be advertised by
+# `raw_schema()`/`schema_chunks()` and then rejected by the validator, which
+# already only ever accepted `main`.
+_MAIN_SCHEMA = "main"
+
 
 def _connect_read_only(db_path: str) -> duckdb.DuckDBPyConnection:
     """Open a read-only DuckDB connection with filesystem access disabled.
@@ -44,8 +58,24 @@ def _quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _quote_qualified(schema_name: str, table_name: str) -> str:
+    """Quote `schema_name.table_name` so it can only ever resolve to that table.
+
+    An unqualified quoted table name resolves against DuckDB's search path
+    (`main` by default), which is exactly how a value-hint query for one
+    `main`-schema table silently read a same-named table in another schema -
+    see `_MAIN_SCHEMA`'s module docstring note. Every catalogue query this
+    module runs is already filtered to `schema_name = 'main'`, so this only
+    ever qualifies with `main` today, but qualifying explicitly (rather than
+    relying on the filter alone) means a value-hint query can never resolve
+    to a different schema's table even if that filter is ever loosened.
+    """
+    return _quote_identifier(schema_name) + "." + _quote_identifier(table_name)
+
+
 def _value_hints_for_table(
     conn: duckdb.DuckDBPyConnection,
+    schema_name: str,
     table_name: str,
     columns: list[tuple[str, str]],
     *,
@@ -53,7 +83,7 @@ def _value_hints_for_table(
     limit: int = DEFAULT_VALUE_HINT_LIMIT,
 ) -> dict[str, list[str]]:
     hints: dict[str, list[str]] = {}
-    quoted_table = _quote_identifier(table_name)
+    quoted_table = _quote_qualified(schema_name, table_name)
     for column_name, column_type in columns:
         if column_type and not any(
             token in column_type.upper() for token in ("CHAR", "TEXT", "CLOB")
@@ -502,7 +532,11 @@ DUCKDB DIALECT (must follow):
             conn.close()
 
     def raw_schema(self) -> str:
-        """Extract CREATE TABLE statements for all user tables in DuckDB.
+        """Extract CREATE TABLE statements for every user table in `main`.
+
+        Tables outside `main` are deliberately excluded - see `_MAIN_SCHEMA`'s
+        module-level comment for why `main` is this engine's whole supported
+        catalogue surface.
 
         Returns:
             The `CREATE TABLE` statements, one per table, semicolon-terminated
@@ -511,26 +545,41 @@ DUCKDB DIALECT (must follow):
         conn = _connect_read_only(self.dsn)
         try:
             rows = conn.execute(
-                "SELECT table_name, sql FROM duckdb_tables() ORDER BY table_name"
+                "SELECT table_name, sql FROM duckdb_tables() "
+                "WHERE schema_name = ? ORDER BY table_name",
+                [_MAIN_SCHEMA],
             ).fetchall()
         finally:
             conn.close()
         return "\n\n".join(sql.strip().rstrip(";") + ";" for _, sql in rows)
 
     def schema_chunks(self) -> list[SchemaChunk]:
-        """Build table-level schema chunks for retrieval without reading row data."""
+        """Build table-level schema chunks for retrieval without reading row data.
+
+        Every catalogue query here is filtered to `main` - see `_MAIN_SCHEMA`'s
+        module-level comment. A table in another schema is never included, so
+        it can never be keyed by a bare `table_name` that collides with a
+        `main`-schema table of the same name (the reviewer's live
+        `BinderException` reproduction), and it can never be advertised here
+        only for `safety.py`'s `main`-only validator to reject it.
+        """
         conn = _connect_read_only(self.dsn)
         try:
             table_rows = conn.execute(
-                "SELECT table_name, sql FROM duckdb_tables() ORDER BY table_name"
+                "SELECT table_name, sql FROM duckdb_tables() "
+                "WHERE schema_name = ? ORDER BY table_name",
+                [_MAIN_SCHEMA],
             ).fetchall()
             all_columns = conn.execute(
                 "SELECT table_name, column_name, data_type FROM information_schema.columns "
-                "ORDER BY table_name, ordinal_position"
+                "WHERE table_schema = ? ORDER BY table_name, ordinal_position",
+                [_MAIN_SCHEMA],
             ).fetchall()
             all_fks = conn.execute(
                 "SELECT table_name, referenced_table FROM duckdb_constraints() "
-                "WHERE constraint_type = 'FOREIGN KEY' AND referenced_table IS NOT NULL"
+                "WHERE constraint_type = 'FOREIGN KEY' AND referenced_table IS NOT NULL "
+                "AND schema_name = ?",
+                [_MAIN_SCHEMA],
             ).fetchall()
 
             columns_by_table: dict[str, list[tuple[str, str]]] = {}
@@ -546,7 +595,7 @@ DUCKDB DIALECT (must follow):
                 typed_columns = columns_by_table.get(table_name, [])
                 columns = [c for c, _ in typed_columns]
                 foreign_tables = sorted(fk_by_table.get(table_name, set()))
-                value_hints = _value_hints_for_table(conn, table_name, typed_columns)
+                value_hints = _value_hints_for_table(conn, _MAIN_SCHEMA, table_name, typed_columns)
                 value_text = " ".join(value for values in value_hints.values() for value in values)
                 search_text = " ".join(
                     [table_name, ddl or "", *columns, *foreign_tables, value_text]

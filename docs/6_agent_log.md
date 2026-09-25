@@ -827,3 +827,77 @@ with argparse status 2 before running; it was rerun with the script's actual
 `--out-dir` option as shown above. Outputs went to `/private/tmp`, so no tracked
 evaluation result needed restoration. `git status --short` was empty immediately
 before this log-only edit.
+
+## 2026-09-25 — Claude's fix for Codex finding 2: DuckDB non-`main` schemas
+
+**Decision (already made by the project owner, implemented here):** restrict
+DuckDB support to the `main` schema, consistently across every layer, rather
+than build schema-qualified table identity. `safety.py`'s
+`_references_unknown_table` already only ever accepted an absent or `main`
+schema qualifier; that stays the consistent layer. Full multi-schema support
+is deliberately deferred to Phase 3b, where PostgreSQL forces the same
+question for both engines at once.
+
+**Changed:** `text_to_sql_agent/engines/duckdb.py`. `raw_schema()` and
+`schema_chunks()` now filter every catalogue query — `duckdb_tables()`
+(`schema_name`), `information_schema.columns` (`table_schema`), and
+`duckdb_constraints()` (`schema_name`) — to `'main'` (new `_MAIN_SCHEMA`
+constant). `_value_hints_for_table` now takes a `schema_name` argument and
+queries through a new `_quote_qualified` helper (`"main"."table"`) instead of
+an unqualified quoted table name, so a value-hint query can never resolve to a
+different schema's same-named table even if the catalogue filter above were
+ever loosened. No change to `safety.py`.
+
+**Reproduced both failure modes at BASE (`b278c7a`)** before fixing, via
+`git stash` of the source change with the new tests kept:
+- `main.shared(main_only INTEGER)` + `analytics.shared(analytics_only
+  VARCHAR)`: `engine.table_names()` raised `duckdb.BinderException:
+  Referenced column "analytics_only" not found in FROM clause! Candidate
+  bindings: "main_only"` while building schema chunks.
+- `analytics.sales(amt INTEGER)` with no `main.sales`: `raw_schema()`
+  advertised `sales`; `assert "sales" not in engine.raw_schema()` failed.
+
+Both are pinned as regression tests in `tests/test_engine_duckdb.py`:
+`test_duplicate_table_name_across_schemas_does_not_crash_schema_building` and
+`test_table_outside_main_is_never_advertised_or_accepted` (the latter also
+checks `table_names()` and both `is_safe_query` spellings — qualified
+`analytics.sales`, unqualified `sales` — are rejected post-fix).
+
+**Conformance-suite decision:** kept DuckDB-specific, in
+`tests/test_engine_duckdb.py`, not added to
+`tests/test_engine_conformance.py`. That suite is deliberately one fixture
+parametrised over every engine with no per-engine assertions (see
+`docs/0_coding_standards.md` §3); "a non-`main` schema exists but is not
+advertised" has no equivalent for `SQLiteEngine`, which has no comparable
+default-schema-vs-other-schema ambiguity for a bare-file DSN, so a
+conformance case would need per-engine branching that suite's design
+deliberately avoids. This mirrors why the DuckDB filesystem-access tests
+already live in this same file rather than in conformance — see that file's
+own module docstring.
+
+**Noted, not fixed:** `schema_fingerprint()` — `(path, mtime_ns, size)` — is
+not scoped to `main`. Live-checked: creating or dropping a table in a
+non-`main` schema changes the underlying `.duckdb` file's `mtime_ns` (and, on
+creation, `size`), so the fingerprint changes even though nothing `main`-scoped
+(and therefore nothing advertised to the model) changed. Harmless today — it
+only causes an extra cache recompute of an unchanged visible schema — but
+worth Phase 3b's attention alongside the rest of schema identity.
+
+**Verified:**
+
+```
+$ uv run pytest
+447 passed in 3.39s
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+71 files already formatted
+
+$ uv run mypy
+Success: no issues found in 30 source files
+```
+
+`git status --short` before this change showed only the user's pre-existing,
+untouched `.devcontainer/devcontainer.json` edit.

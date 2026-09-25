@@ -1171,3 +1171,90 @@ def test_cte_scoping_fix_is_load_bearing(monkeypatch, engine_with_table_t):
         "reviewer's reproduction - if this fails, the fix may no longer be load-bearing "
         "for this case"
     )
+
+
+# --- Non-`main`-schema regression tests (Codex review, 2026-09-21) ---
+#
+# DuckDB groups tables into schemas, `main` being the default a bare filesystem
+# path connects into. `safety.py`'s `_references_unknown_table` (see the
+# `schema and schema != "main"` check above) already only accepts an absent or
+# `main` schema qualifier, so `main`-only is the project's decided, documented
+# scope for DuckDB (see `docs/6_agent_log.md`'s 2026-09-21 entry and
+# `docs/3_decisions.md`). These two tests pin the two concrete failures a
+# non-`main` table caused before `raw_schema()`/`schema_chunks()` were also
+# filtered to `main`: a `BinderException` while building the schema at all,
+# and an "advertised then blocked" inversion where the model was shown a table
+# the validator would never accept.
+
+
+@pytest.fixture
+def cross_schema_duplicate_name_db(tmp_path):
+    """`main.shared` and `analytics.shared`, same table name, disjoint columns.
+
+    Reproduces the reviewer's live probe: a value-hint query for
+    `analytics.shared`'s `analytics_only` column, issued unqualified, resolves
+    to `main.shared` (found first on the default search path) and raises
+    `duckdb.BinderException` because that column does not exist there.
+    """
+    db = tmp_path / "dup.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE main.shared (main_only INTEGER)")
+    con.execute("INSERT INTO main.shared VALUES (1)")
+    con.execute("CREATE SCHEMA analytics")
+    con.execute("CREATE TABLE analytics.shared (analytics_only VARCHAR)")
+    con.execute("INSERT INTO analytics.shared VALUES ('x')")
+    con.close()
+    return open_engine(f"duckdb://{db}")
+
+
+def test_duplicate_table_name_across_schemas_does_not_crash_schema_building(
+    cross_schema_duplicate_name_db,
+):
+    """At BASE: `engine.table_names()` (which routes through `schema_chunks()`)
+    raised `duckdb.BinderException: Referenced column "analytics_only" not
+    found in FROM clause!` while querying value hints for the unqualified,
+    ambiguous `shared` table. Filtering every catalogue query to `main` and
+    qualifying the value-hint query removes `analytics.shared` from
+    consideration entirely, so only `main.shared`'s own column is ever read.
+    """
+    names = cross_schema_duplicate_name_db.table_names()
+    assert names == frozenset({"shared"})
+    chunks = {c.table_name: c for c in cross_schema_duplicate_name_db.schema_chunks()}
+    assert chunks["shared"].columns == ["main_only"]
+    assert chunks["shared"].value_hints == {}
+
+
+@pytest.fixture
+def non_main_schema_only_db(tmp_path):
+    """`analytics.sales` exists; `main.sales` does not.
+
+    Reproduces the reviewer's second failure: before the fix, `raw_schema()`
+    advertised `sales` to the model and `table_names()` returned it, but the
+    validator (`main`-only) rejected both the qualified query the model should
+    have needed and, after wrongly approving the unqualified form, the query
+    failed against the real database anyway.
+    """
+    db = tmp_path / "nonmain.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE SCHEMA analytics")
+    con.execute("CREATE TABLE analytics.sales (amt INTEGER)")
+    con.execute("INSERT INTO analytics.sales VALUES (10)")
+    con.close()
+    return open_engine(f"duckdb://{db}")
+
+
+def test_table_outside_main_is_never_advertised_or_accepted(non_main_schema_only_db):
+    """At BASE: `raw_schema()` mentioned `sales` and `table_names()` returned
+    it, yet `is_safe_query("SELECT amt FROM analytics.sales", ...)` was
+    `False` (the correct, schema-qualified query blocked) while
+    `is_safe_query("SELECT amt FROM sales", ...)` was wrongly `True` even
+    though executing it raises `CatalogException` (no `main.sales` exists).
+    After the fix, a non-`main` table is invisible everywhere: not in
+    `raw_schema()`, not in `table_names()`, and no spelling of a query against
+    it is accepted.
+    """
+    engine = non_main_schema_only_db
+    assert "sales" not in engine.raw_schema()
+    assert "sales" not in engine.table_names()
+    assert not is_safe_query("SELECT amt FROM analytics.sales", engine=engine)
+    assert not is_safe_query("SELECT amt FROM sales", engine=engine)
