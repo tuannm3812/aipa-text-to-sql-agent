@@ -16,6 +16,9 @@ what any validator in front of it does or doesn't catch.
 
 from __future__ import annotations
 
+import time
+from pathlib import Path
+
 import pytest
 import sqlglot
 from sqlglot import exp
@@ -26,6 +29,7 @@ from text_to_sql_agent import is_safe_query  # noqa: E402
 from text_to_sql_agent import safety as _safety  # noqa: E402
 from text_to_sql_agent.engines import open_engine  # noqa: E402
 from text_to_sql_agent.engines.duckdb import DuckDBEngine  # noqa: E402
+from text_to_sql_agent.execution import execute_query  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -1377,3 +1381,36 @@ def test_table_outside_main_is_never_advertised_or_accepted(non_main_schema_only
     assert "sales" not in engine.table_names()
     assert not is_safe_query("SELECT amt FROM analytics.sales", engine=engine)
     assert not is_safe_query("SELECT amt FROM sales", engine=engine)
+
+
+def test_duckdb_default_work_limit_is_5000_ms() -> None:
+    """DuckDB's budget is wall-clock milliseconds, not SQLite's VM-step count.
+
+    Pinned because `execute_query` resolves a caller-omitted limit from this
+    attribute: before `Engine.default_work_limit` existed, every engine got
+    SQLite's `DEFAULT_MAX_VM_STEPS` (100_000) verbatim, which a millisecond
+    engine reads as a 100-second timeout. PostgreSQL and SQLite both carry
+    the same pin; this one closes the third corner.
+    """
+    assert DuckDBEngine.default_work_limit == 5000
+
+
+def test_a_slow_duckdb_query_aborts_near_5_seconds_not_100(tmp_path: Path) -> None:
+    """The default resolves end-to-end through `execute_query`, not just as an
+    attribute. A query with no row cap to hit and no error to raise must come
+    back as a typed abort code well inside the old 100-second budget.
+    """
+    db = tmp_path / "slow.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE t AS SELECT * FROM range(3000000) AS r(i)")
+    con.close()
+
+    started = time.monotonic()
+    result = execute_query(
+        f"duckdb://{db}",
+        "SELECT COUNT(*) FROM t a JOIN t b ON a.i % 7 = b.i % 7",
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.error == "QUERY_ABORTED_AFTER_5000_MS", result.error
+    assert elapsed < 30, f"took {elapsed:.1f}s - the default did not apply"
