@@ -1,59 +1,10 @@
 # Next Steps
 
-Phases 1, 2, and 3a are complete. Phases 3b-5 are specced in
+Phases 1, 2, 3a, and 3b are complete. Phases 4-5 are specced in
 `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`; this file is the
 prioritised working view.
 
-## Phase 3b — PostgreSQL (next)
-
-Third `Engine` implementation, added to the `text_to_sql_agent/engines/`
-package Phase 3a built. It inherits the reachability, schema-dispatch, and
-dialect-prompt plumbing Phase 3a landed ahead of DuckDB for exactly this
-reason, and must pass the same `tests/test_engine_conformance.py` suite with
-no changes to the suite's assertions. Per `docs/3_decisions.md`, there is no
-shared read-only mechanism to reuse from SQLite or DuckDB — PostgreSQL proves
-its own guarantee, most likely via a read-only transaction, and the
-conformance suite is what holds it to the same bar. Must precede Phase 4 —
-schema chunking is engine-specific.
-
-Carried over from Phase 3a, closed out or newly found:
-
-1. **`ui/chat.py` does not catch an exception from `ask_database_with_sql`.**
-   If a database becomes unreachable between the sidebar's check and the
-   question being asked, Streamlit renders the raw traceback and
-   `redact_dsn` never sees that text. Harmless today — no current engine's
-   error text contains a password — but it must be closed before a
-   PostgreSQL driver error (which commonly echoes the DSN it failed to
-   reach) can land on the page unredacted. **New in Phase 3a, important for
-   3b.**
-2. **The schema cache keys on the raw DSN, not a normalised one.** A
-   relative and an absolute path to the same SQLite/DuckDB file produce two
-   separate `lru_cache` entries under `(dsn, fingerprint)` keying (see
-   `docs/3_decisions.md`), since nothing canonicalises the DSN string before
-   it becomes half the cache key. Low impact today; worth resolving before a
-   PostgreSQL DSN's equivalent aliasing (e.g. host vs. `127.0.0.1`) makes it
-   worse.
-3. **Value hints can go stale on a coarse-mtime filesystem.** Predates Phase
-   3a.
-4. **Schema-qualified table identity, decided once for both engines.** DuckDB
-   is currently scoped to the `main` schema across every layer (see
-   `docs/3_decisions.md`, 2026-09-25); a DuckDB database whose tables live
-   outside `main` presents an empty schema and answers
-   `UNANSWERABLE_WITH_GIVEN_SCHEMA`. PostgreSQL cannot take the same
-   shortcut for long — schemas are intrinsic there, `public` is merely the
-   default, and multi-schema databases are normal — so 3b is where the
-   qualified identity should be carried through DDL, chunks, value hints,
-   foreign keys, `table_names()` and safety validation, for both engines at
-   once. Changing one layer alone leaves the contract inconsistent, which is
-   the exact defect the 2026-09-25 fix closed.
-5. **`schema_fingerprint()` is file-level, not schema-scoped.** For DuckDB it
-   is `(path, mtime_ns, size)` over the whole file, so adding or dropping a
-   table outside `main` moves the schema-chunks cache key even though what is
-   advertised to the model cannot change. Measured, not fixed: the cost is a
-   redundant recompute, never a wrong result. Worth folding into the
-   qualified-identity work above rather than fixing alone.
-
-## Phase 4 — Real RAG
+## Phase 4 — Real RAG (next)
 
 Decompose `retrieve_schema_context`'s 182-line body into named, individually
 testable signal functions with weights in config. Replace the hashed
@@ -61,6 +12,43 @@ pseudo-embedding with real sentence embeddings behind an optional dependency
 group, falling back to the lexical path so the hosted demo stays light. Persist
 the index keyed by schema hash. Add recall@k and MRR to the evaluation harness so
 the academic report's RAG claims become measurable.
+
+Carried over from Phase 3b, still open:
+
+1. **The schema cache keys on the raw DSN, not a normalised one.** A relative
+   and an absolute path to the same SQLite/DuckDB file, or two equivalent
+   spellings of the same PostgreSQL host (`localhost` vs `127.0.0.1`), still
+   produce two separate `lru_cache` entries under `(dsn, fingerprint)` keying
+   (see `docs/3_decisions.md`), since nothing canonicalises the DSN string
+   before it becomes half the cache key. Low impact today — a wrong cache
+   entry recomputes rather than serves stale data, because the fingerprint
+   still has to match — but worth resolving alongside any RAG-layer caching
+   work in this phase.
+2. **Value hints can go stale on a coarse-mtime filesystem**, for SQLite and
+   DuckDB specifically — both fingerprint by file `(path, mtime_ns, size)`,
+   which some filesystems report at whole-second resolution. PostgreSQL does
+   not have this problem: its `schema_fingerprint()` hashes a live catalogue
+   read instead of a file stat (`docs/3_decisions.md`, 2026-09-26), at the
+   cost of one catalogue query per cache check. Predates Phase 3a.
+3. **`PostgresEngine.raw_schema()` loses column type precision.**
+   `information_schema.columns.data_type` reports the bare type name
+   (`numeric`, not `numeric(10,2)`); the synthesised `CREATE TABLE` DDL sent
+   to the model is therefore less precise than the server's real schema.
+   Low impact today — nothing in the demo corpus depends on numeric
+   precision for correct SQL generation — but worth fixing if a future
+   evaluation case needs it (`information_schema.columns.numeric_precision`/
+   `numeric_scale` carry the missing detail).
+4. **`execution.execute_query`'s `max_vm_steps` parameter is misleadingly
+   named for DuckDB and PostgreSQL.** Both hold a millisecond budget there,
+   not a VM-instruction count; the name is documented as back-compatible in
+   the parameter's own docstring, but a rename (with the SQLite call sites
+   updated too) would remove the need for that caveat.
+5. **The PostgreSQL conformance fixture's cleanup only runs at test setup.**
+   `tests/test_engine_conformance.py` drops any stray table before each
+   PostgreSQL test starts, so a real read-only bypass still fails loudly in
+   its own test, but leaves no artifact for the next run to inspect — unlike
+   SQLite/DuckDB, which get a fresh `tmp_path` file per test. Worth adding a
+   post-test snapshot if a bypass is ever suspected but not reproduced.
 
 ## Phase 5 — Agent loop
 
@@ -91,5 +79,8 @@ case.
 
 Nothing is currently deferred with a `# noqa: ... # Phase N` or
 `# type: ignore[...] # Phase N` marker comment. Check with
-`grep -rn "Phase [0-9]" --include="*.py" .` — treat an empty result as
-"nothing deferred", not as a hidden backlog.
+`grep -rn "noqa:.*Phase\|type: ignore.*Phase" --include="*.py" .` — treat an
+empty result as "nothing deferred", not as a hidden backlog. (A bare
+`grep -rn "Phase [0-9]"` is no longer a useful proxy for this check: Phase 3b
+left dozens of comments and docstrings narrating what it changed and why,
+none of which are deferral markers.)

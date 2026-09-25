@@ -1089,3 +1089,228 @@ the sandbox's network restriction; it was rerun with approved dependency
 download access and then completed. Gold outputs went only to `/private/tmp`.
 After this log-only edit, the sole non-log working-tree change remains the
 pre-existing `.devcontainer/devcontainer.json` edit.
+
+## 2026-09-26 — Phase 3b: PostgreSQL as the third engine, closed out
+
+Tasks 1-8 of `docs/superpowers/plans/2026-09-26-phase-3b-postgresql.md`,
+commits `6c33993..27e050b` (21 commits). Per-task reports are in
+`.superpowers/sdd/task-1-report.md` through `task-7-report.md`, plus
+`decisions-scope-and-role-report.md`, `fix-identity-boundaries-report.md`
+and `fix-operator-rejections-report.md` for review-driven fixes that landed
+between tasks. `.superpowers/sdd/progress.md`'s `== PHASE 3b ==` section is
+the running ledger this entry summarises. This is Task 8's
+documentation/verification close-out; it does not repeat every fix already
+narrated in those reports, only what changed at the phase level, the two
+pieces of verbatim evidence the brief asked to carry forward, and what this
+task itself re-verified today with real command output.
+
+**Changed, phase level:**
+
+- New `text_to_sql_agent/engines/postgres.py`: `PostgresEngine`, the third
+  `Engine` implementation, behind an optional `postgres` extra (`psycopg[binary]`).
+  `engines/__init__.py` now dispatches through a module-level `_ENGINES`
+  registry (scheme → module/class/extra) instead of an if/elif chain, and
+  accepts both `postgres://` and `postgresql://`.
+- PostgreSQL's read-only guarantee is two independently load-bearing
+  mechanisms (a least-privilege `aipa_ro` role, a read-only transaction per
+  statement) — each proven separately load-bearing against the live
+  container, not merely both present.
+- Default-deny SQL validation extended to PostgreSQL (a 74-name allowlist,
+  `safety.py`'s existing default-deny mechanism), then hardened through four
+  rounds of bypass-and-fix against real PostgreSQL grammar sugar that a
+  name-based, `exp.Func`-only check could not see: `(expr).name` field
+  notation, `::regclass`-family OID casts, `alias.name` column-call sugar,
+  and a regression in that fix's own `column_names()` that briefly re-armed
+  the third. A separate, unrelated false-rejection bug was also found and
+  fixed: `AND`/`OR`/`EXISTS` were being rejected as unlisted "functions" on
+  both DuckDB and PostgreSQL (sqlglot 27 models them as `exp.Func`
+  subclasses) — live on DuckDB since Phase 3a and missed until this phase's
+  corpora happened to combine two `WHERE` conditions.
+- Schema-qualified table identity carried through every engine (`SchemaChunk
+  .schema_name`/`qualified_name`), superseding the 2026-09-25 DuckDB-only
+  `main`-scoping decision. A follow-up review found and closed four
+  identity-boundary gaps at the PostgreSQL-specific case-sensitive/case-fold
+  boundary (an internal-looking schema advertised then rejected, two ways to
+  collide two schemas onto one flat spelling, and a hardcoded `"public"`
+  default that didn't match the server's own `current_schema()`) — all now
+  fail closed (`AmbiguousTableIdentityError`) rather than guessing. Two owner
+  decisions followed: schema scope is opt-in via `AIPA_EXTRA_SCHEMAS`
+  (reading every schema the role can see would have silently widened what
+  reaches the LLM provider), and PostgreSQL fails closed
+  (`EngineForbiddenError`) on a superuser or file/program-privileged
+  connecting role, since PostgreSQL has no connection-level filesystem guard
+  the way DuckDB's `enable_external_access=False` is one.
+- A DEFAULT_MAX_VM_STEPS (100,000, a SQLite VM-instruction count) unit bug
+  was found and fixed: it had been passed verbatim as a millisecond work
+  limit to DuckDB and PostgreSQL, giving both a ~100-second timeout instead
+  of the design's intended 5 seconds. Each engine now carries its own
+  `default_work_limit`.
+- Two credential-leak paths were closed before the engine whose errors
+  commonly echo a DSN could reach them: `ui/chat.py`'s `_run_query` now
+  wraps `ask_database_with_sql` the same way the sidebar path already did,
+  and `ui/evaluation.py`/`scripts/evaluate_text_to_sql.py` now redact a
+  DSN password before writing a row to the page or to a CSV.
+- CI (`.github/workflows/tests.yml`) gained a `postgres:16` service
+  container, applying `docker/postgres-init.sql` via `psql` (a service
+  container takes no volumes) and connecting the whole suite as `aipa_ro` —
+  not the container's superuser bootstrap account — because
+  `check_reachable()` now refuses a superuser DSN. A grep-for-`SKIPPED` step
+  turns a silently-skipped PostgreSQL conformance test back into a build
+  failure, the same guard Phase 3a added for `duckdb`.
+- Docs: this task added six dated 2026-09-26 entries to `docs/3_decisions.md`
+  (the two-mechanism read-only model, default-deny validation and its four
+  leaks, the structural pure-syntax exemption, the catalogue-hash
+  fingerprint and its cost, per-engine `default_work_limit`, and
+  `AIPA_TEST_POSTGRES_DSN`-or-skip with CI asserting no skip) alongside the
+  three already written mid-phase (schema scope opt-in, fail-closed
+  over-privileged role, schema-qualified identity superseding 2026-09-25);
+  updated `docs/0_coding_standards.md` §3 (PostgreSQL in the engines
+  convention, `EngineForbiddenError`, the `_MS` abort-code family now
+  covering two engines); `docs/2_architecture.md`'s implementation-flow and
+  verification-status sections; `README.md` (a "Running the PostgreSQL
+  tests" section, `postgres.py` and `docker/` in the Project Structure
+  tree); `docs/4_next_steps.md` (now leads with Phase 4, schema-qualified
+  identity and the `ui/chat.py` gap removed as closed, five still-open items
+  carried forward — three from Phase 3a's list, two new minors deferred
+  during this phase); and `AGENTS.md`'s "Current state".
+
+**Task 3's privilege probe output, carried forward verbatim** (run live
+against `aipa_ro` at `postgresql://aipa_ro:aipa_ro_pw@127.0.0.1:55432/aipa`,
+2026-09-26, via `engine.execute` — i.e. bypassing `is_safe_query` entirely,
+to test what the connection/role itself refuses):
+
+```
+SELECT pg_read_file('/etc/passwd')            -> refused, InsufficientPrivilege
+SELECT pg_ls_dir('/')                         -> refused, InsufficientPrivilege
+SELECT lo_import('/etc/passwd')               -> refused, InsufficientPrivilege
+SELECT * FROM pg_stat_file('/etc/passwd')     -> refused, InsufficientPrivilege
+SELECT current_setting('data_directory')      -> refused, InsufficientPrivilege
+SELECT * FROM pg_settings LIMIT 1             -> ALLOWED (configuration, not a file;
+                                                  closed by Task 4's allowlist, not here)
+SELECT usename, passwd FROM pg_shadow         -> refused, InsufficientPrivilege
+COPY (SELECT 1) TO PROGRAM 'touch /tmp/pwned' -> refused, InsufficientPrivilege
+SELECT * FROM pg_ls_waldir()                  -> refused, InsufficientPrivilege
+pg_read_binary_file('PG_VERSION') (relative)  -> refused, InsufficientPrivilege
+pg_stat_file('PG_VERSION') (relative)         -> refused, InsufficientPrivilege (same as absolute)
+COPY customers TO '/tmp/out.csv'              -> refused, InsufficientPrivilege
+COPY customers FROM '/etc/passwd'             -> refused, InsufficientPrivilege
+CREATE EXTENSION dblink (via engine.execute)  -> refused, ReadOnlySqlTransaction
+CREATE EXTENSION postgres_fdw (via engine.execute) -> refused, ReadOnlySqlTransaction
+CREATE EXTENSION dblink (raw conn, read_only unset) -> refused, InsufficientPrivilege
+CREATE EXTENSION postgres_fdw (raw conn, read_only unset) -> refused, InsufficientPrivilege
+```
+
+Role-membership catalogue query (`aipa_ro` holds none of the three
+file/program roles):
+
+```
+ pg_execute_server_program | f
+ pg_read_server_files      | f
+ pg_write_server_files     | f
+```
+
+Sixteen probes refused, one allowed (and the one allowance is configuration
+metadata, not a file or program surface — recorded as intentionally out of
+this probe's scope, closed by the function allowlist instead). Every refusal
+traces to `aipa_ro` holding none of `pg_read_server_files`,
+`pg_write_server_files`, `pg_execute_server_program`, or superuser — a
+deployment/provisioning guarantee this codebase does not itself enforce at
+connect time. That gap is exactly what the later `EngineForbiddenError`
+owner decision closed.
+
+**Task 4's catalogue count, reproduced live in this task** (not merely
+copied from the report — re-run today against the same live container):
+
+```
+$ uv run python -c "
+import psycopg
+with psycopg.connect('postgresql://aipa_ro:aipa_ro_pw@127.0.0.1:55432/aipa') as conn:
+    with conn.cursor() as cur:
+        cur.execute('''
+            SELECT count(*) FROM pg_proc p
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname IN ('pg_catalog', 'public')
+        ''')
+        print(cur.fetchone())
+"
+(3286,)
+```
+
+3,286 functions across `pg_catalog`+`public`, visible to `aipa_ro` — far too
+large to blocklist by name, the same conclusion Phase 3a reached for DuckDB
+at 945. This is what justified switching `PostgresEngine.allowed_functions`
+from `None` (blocklist-only) to a 74-name default-deny allowlist, confirmed
+today: `len(PostgresEngine("...").allowed_functions) == 74`.
+
+**Verified today, with real command output** (`uv sync --extra engines` run
+first; `docker compose -f docker/postgres.yml up -d` already healthy;
+`AIPA_TEST_POSTGRES_DSN=postgresql://aipa_ro:aipa_ro_pw@127.0.0.1:55432/aipa`):
+
+```
+$ uv run pytest
+750 passed, 6 skipped in 17.10s
+
+$ uv run pytest -rs   (same run, to identify the 6 skips)
+SKIPPED [6] tests/test_schema_identity.py:153: sqlite has exactly one schema
+in this project's DSN model ...
+```
+
+The 6 skips are the deliberate SQLite-`ATTACH`-is-denied exemption from the
+schema-identity suite, not a PostgreSQL gap.
+
+```
+$ uv run pytest -m conformance -rs
+36 passed, 720 deselected in 0.97s
+(12 per engine x 3 engines - sqlite, duckdb, postgres - 0 SKIPPED lines)
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+79 files already formatted
+
+$ uv run mypy
+Success: no issues found in 32 source files
+
+$ uv run python -c "import app"
+(no output, exit 0)
+
+$ uv run pytest -k "end_to_end" -v 2>&1 | tail -3
+tests/test_end_to_end_engines.py ..............                          [100%]
+14 passed, 742 deselected in 0.68s
+
+$ ls text_to_sql_agent/engines/*.py | wc -l
+5   (__init__.py, base.py, duckdb.py, postgres.py, sqlite.py)
+
+$ uv run python scripts/evaluate_text_to_sql.py --mode gold
+Evaluated 12 cases. Exact result match: 12/12
+$ git checkout evaluation/results/
+```
+
+**Also run: the suite without `AIPA_TEST_POSTGRES_DSN` set**, since that is
+what a contributor without Docker sees:
+
+```
+$ unset AIPA_TEST_POSTGRES_DSN && uv run pytest -rs
+503 passed, 253 skipped in 8.04s
+```
+
+All 253 skips resolve to `set AIPA_TEST_POSTGRES_DSN to a reachable
+PostgreSQL DSN` messages across `tests/test_engine_postgres.py` (bulk of the
+count — round-trip, corpus, bypass, and internals parametrisations),
+`tests/test_schema_identity.py`, `tests/test_engine_conformance.py`,
+`tests/test_pipeline.py`, and `tests/test_end_to_end_engines.py` — no
+unexplained skip and no failure. `uv run pytest` still exits `0` and still
+passes every test that does not need a live server.
+
+**Not re-verified in this task, and why:** the per-task bypass/corpus probes
+(the 4 dot-call/OID-cast/column-call bypass rounds, the 35/61-query
+analytics corpora, the AND/OR/EXISTS 35-query battery, the four
+identity-boundary live reproductions) were not re-derived from scratch here
+— they are already pinned as regression tests in `tests/test_engine_postgres.py`,
+`tests/test_engine_duckdb.py` and `tests/test_schema_identity.py`, all of
+which pass in the `750 passed` figure above. This entry's own verification is
+the full gate plus conformance plus the end-to-end matrix plus gold plus
+both DSN states, not a re-run of every probe that produced those numbers.
+CI (`gh run list`/`gh run watch`) was checked after pushing this task's
+commits; see the push record for the run URL and conclusion.

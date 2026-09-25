@@ -46,7 +46,21 @@ Project-specific rules and deliberate overrides: @docs/0_coding_standards.md
   tests, `12` per engine (SQLite, DuckDB), `0` skipped. Both CI jobs now
   `uv sync --extra engines` and `test` fails the build if any conformance
   test is skipped. `duckdb` stays out of `requirements.txt` — it is an
-  optional extra. Phase 3b (PostgreSQL) is next; see `docs/4_next_steps.md`.
+  optional extra.
+- 2026-09-26: Phase 3b (PostgreSQL as the third engine, schema-qualified
+  table identity carried through all three) complete. `750` tests pass with
+  `uv run pytest` (`uv sync --extra engines` first, `AIPA_TEST_POSTGRES_DSN`
+  set against a live `docker compose -f docker/postgres.yml up -d`
+  container); the 6 skips left even with the DSN set are a deliberate SQLite
+  exemption (`ATTACH` is denied), not a gap. Without the DSN, the same
+  command reports `503` passed, `253` skipped. The engine conformance suite
+  (`uv run pytest -m conformance -rs`) runs `36` tests, `12` per engine
+  (SQLite, DuckDB, PostgreSQL), `0` skipped. CI runs a `postgres:16` service
+  container and fails the build if any conformance test is skipped, the same
+  guard Phase 3a added for `duckdb`. `psycopg` stays out of
+  `requirements.txt`, like `duckdb` — both are optional extras (`postgres`,
+  or `engines` for both together). Phase 4 (real RAG) is next; see
+  `docs/4_next_steps.md`.
 
 ## Open risks
 

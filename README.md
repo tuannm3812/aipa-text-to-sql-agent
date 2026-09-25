@@ -180,6 +180,31 @@ python -c "import text_to_sql_agent as a; a.write_university_db('data/university
 uv run pytest
 ```
 
+### Running the PostgreSQL tests
+
+`text_to_sql_agent/engines/postgres.py` is the third `Engine` implementation
+(alongside SQLite and DuckDB). Its tests, and the PostgreSQL third of the
+engine conformance suite, need a real server and are skipped by default:
+
+```bash
+docker compose -f docker/postgres.yml up -d
+export AIPA_TEST_POSTGRES_DSN=postgresql://aipa_ro:aipa_ro_pw@127.0.0.1:55432/aipa
+uv sync --extra engines
+uv run pytest
+uv run pytest -m conformance -rs   # 36 passed, 0 skipped, with the DSN set
+```
+
+`docker/postgres.yml` provisions `aipa_ro`, a least-privilege role with no
+write or DDL grants, and the same `customers`/`sales` fixtures the tests
+pin — connect as `aipa_ro`, not the compose file's `postgres` superuser
+account: `PostgresEngine.check_reachable()` deliberately refuses a superuser
+DSN (see `docs/3_decisions.md`). Without `AIPA_TEST_POSTGRES_DSN` set (or
+without Docker running), `uv run pytest` still passes; it just skips the
+PostgreSQL-only tests, printing why each one skipped with `-rs`. CI runs
+these tests against a `postgres:16` service container and fails the build if
+any conformance test is skipped, so a contributor without Docker still gets
+full coverage on push.
+
 ## Run Evaluation
 
 The evaluation harness compares generated SQL results with gold SQL results.
@@ -221,6 +246,9 @@ python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemi
 |   |-- retail_analytics.db         # Retail sample DB
 |   |-- sales.csv                   # Small CSV sample
 |   `-- university_agent.db         # Demo university DB
+|-- docker/
+|   |-- postgres.yml                # Local PostgreSQL container (aipa_ro role, demo fixtures)
+|   `-- postgres-init.sql           # Role/schema/fixture setup applied by postgres.yml and CI
 |-- docs/
 |   |-- 0_coding_standards.md       # Project-specific rules and deliberate overrides
 |   |-- 1_brief.md                  # What/for whom/done-looks-like/constraints
@@ -255,10 +283,11 @@ python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemi
 |   |-- config.py                   # Defaults, model names, RAG constants
 |   |-- data_setup.py               # Demo university database generation
 |   |-- engines/                    # Engine protocol + per-backend implementations
-|   |   |-- __init__.py              # open_engine(dsn) scheme dispatch
+|   |   |-- __init__.py              # open_engine(dsn) scheme dispatch (registry-based)
 |   |   |-- base.py                  # Engine protocol, EngineError family
 |   |   |-- sqlite.py                # SQLite implementation
-|   |   `-- duckdb.py                # DuckDB implementation (optional `duckdb` extra)
+|   |   |-- duckdb.py                # DuckDB implementation (optional `duckdb` extra)
+|   |   `-- postgres.py              # PostgreSQL implementation (optional `postgres` extra)
 |   |-- env.py                      # Environment loading
 |   |-- evaluation.py               # Gold-vs-generated comparison (shared by app and CLI)
 |   |-- execution.py                # Read-only query execution (dispatches to the engine)

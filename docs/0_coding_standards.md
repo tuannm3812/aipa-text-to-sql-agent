@@ -122,8 +122,11 @@ reworked anyway" — see `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`
   The full set is `BLOCKED_UNSAFE_SQL`, `UNANSWERABLE_WITH_GIVEN_SCHEMA`,
   `RESULT_TRUNCATED_TO_<n>_ROWS`, and an abort-code family sharing the
   `QUERY_ABORTED_AFTER_` prefix: `QUERY_ABORTED_AFTER_<n>_VM_STEPS` for
-  SQLite's VM-instruction budget, `QUERY_ABORTED_AFTER_<n>_MS` for DuckDB's
-  wall-clock budget (Phase 3a; see `docs/3_decisions.md`). `ui/results.py`'s
+  SQLite's VM-instruction budget, `QUERY_ABORTED_AFTER_<n>_MS` for the two
+  wall-clock-budget engines, DuckDB (Phase 3a) and PostgreSQL (Phase 3b) —
+  each engine's `default_work_limit` sets its own unit and magnitude
+  (SQLite 100,000 VM steps; DuckDB and PostgreSQL 5,000 ms each; see
+  `docs/3_decisions.md`). `ui/results.py`'s
   `describe_error` maps each to a message a non-technical reader can act on;
   anything else is passed through `ui/uploads.py`'s `redact_dsn` before
   display, because the backend also puts raw exception text in that field
@@ -132,18 +135,29 @@ reworked anyway" — see `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`
 - **`text_to_sql_agent/engines/` — one module per backend, dispatched by DSN
   scheme.** Each engine implements the `Engine` protocol
   (`engines/base.py`) in its own module, named for the DSN scheme it
-  handles, not the vendor (`sqlite.py`, `duckdb.py` — matching the existing
-  `gemini_manager.py` convention of naming for what the module addresses,
-  not a marketing name). `engines/__init__.py`'s `open_engine(dsn)` is the
-  only place that maps a scheme to an implementation; a bare filesystem path
-  with no `scheme://` prefix means SQLite, so every pre-Phase-3 caller keeps
-  working unchanged. A missing driver (e.g. `duckdb` not installed) raises
-  `EngineUnavailableError` naming the extra to install, never a bare
-  `ImportError`. Every implementation is held to the same guarantees by
-  `tests/test_engine_conformance.py`, parametrised over every available
+  handles, not the vendor (`sqlite.py`, `duckdb.py`, `postgres.py` — matching
+  the existing `gemini_manager.py` convention of naming for what the module
+  addresses, not a marketing name; `postgres.py`, not `postgresql.py`,
+  because `engines/__init__.py`'s dispatch registry accepts both `postgres://`
+  and `postgresql://` as spellings of the same scheme). `engines/__init__.py`'s
+  `open_engine(dsn)` — a module-level `_ENGINES` registry mapping scheme to
+  `(module, class name, optional extra)`, not an if/elif chain — is the only
+  place that maps a scheme to an implementation; a bare filesystem path with
+  no `scheme://` prefix means SQLite, so every pre-Phase-3 caller keeps
+  working unchanged. A missing driver (e.g. `duckdb`/`psycopg` not installed)
+  raises `EngineUnavailableError` naming the extra to install, never a bare
+  `ImportError`. A PostgreSQL role that is a superuser, or holds
+  `pg_read_server_files`/`pg_write_server_files`/`pg_execute_server_program`,
+  raises `EngineForbiddenError` on connect instead — "reachable but refused,"
+  never silently trusted, because unlike DuckDB's `enable_external_access=False`,
+  PostgreSQL's own file-access guarantee has no engine-enforced flag and
+  otherwise rests entirely on how the connecting role was provisioned (see
+  `docs/3_decisions.md`). Every implementation is held to the same guarantees
+  by `tests/test_engine_conformance.py`, parametrised over every available
   engine with no per-engine assertions — see `docs/3_decisions.md` for why
   there is deliberately no shared read-only mechanism to factor out
-  alongside it.
+  alongside it, and for PostgreSQL's own two-mechanism proof (a least-privilege
+  role plus a read-only transaction, each independently load-bearing).
 
 ## 4. Safety Conventions
 

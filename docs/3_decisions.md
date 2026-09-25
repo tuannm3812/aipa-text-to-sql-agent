@@ -155,6 +155,256 @@ reality, and the internals rules (`pg_catalog.*`, `information_schema.*`,
 second_schema` re-runs this phase's closed bypasses against a database that
 has a second real schema in it.
 
+## 2026-09-26 — PostgreSQL's read-only guarantee is two mechanisms, each proven load-bearing alone
+
+**Chosen:** Two independent mechanisms, neither trusted alone: a least-privilege
+`aipa_ro` role (`docker/postgres-init.sql`, no `INSERT`/`UPDATE`/`DELETE`/DDL
+grants) and `conn.read_only = True`, set before the first statement on every
+connection `PostgresEngine._connect_read_only` opens — the read-only
+transaction PostgreSQL itself enforces at parse/rewrite time.
+
+**Ruled out:** The role alone — assumes every deployment provisions `aipa_ro`
+correctly, and a superuser DSN (or any over-privileged role) pasted into the
+sidebar's "Connection string" field would otherwise connect with zero
+filesystem/write protection. The transaction flag alone — a role holding
+`pg_read_server_files`/`pg_write_server_files`/`pg_execute_server_program`
+would still reach those functions from inside a read-only transaction, since
+`read_only` stops writes, not catalogue/file-surface calls. A shared
+read-only mechanism factored out across engines — ruled out already by the
+2026-09-19 entry below; PostgreSQL's pair adds a second, unrelated mechanism
+to that same "nothing to factor out" conclusion.
+
+**Why:** Proven independently load-bearing, not merely both present, against
+the live container. Connecting as `aipa_ro` with `read_only` left unset and
+attempting `INSERT INTO customers VALUES (999, 'Mallory')` raised
+`psycopg.errors.InsufficientPrivilege` — the role's own grants are the only
+thing that stopped it
+(`test_the_role_is_load_bearing_without_the_read_only_transaction`).
+Connecting as the `postgres` superuser with `read_only = True` and attempting
+the identical `INSERT` raised `psycopg.errors.ReadOnlySqlTransaction` instead —
+the transaction flag is what stopped it in that case, with no role privilege
+involved
+(`test_the_transaction_flag_is_load_bearing_for_a_privileged_connection`).
+Removing either mechanism opens exactly the hole the other was silently
+covering. This is the same "neither defence alone is sufficient" shape
+`docs/0_coding_standards.md` §4 states for `is_safe_query` plus the read-only
+authorizer, applied to PostgreSQL's own pair of mechanisms.
+
+## 2026-09-26 — default-deny validation for PostgreSQL, and the four leaks that shaped it
+
+**Chosen:** `PostgresEngine.allowed_functions` switched from `None`
+(blocklist-only) to a 74-name default-deny allowlist — the same mechanism
+`safety._references_disallowed_function`/`_references_unknown_table` already
+enforce for DuckDB — because PostgreSQL registers 3,286 functions across
+`pg_catalog` and `public` (confirmed live against `aipa_ro`'s own catalogue
+view), too large to enumerate as a blocklist, the same conclusion Phase 3a
+reached for DuckDB at 945.
+
+**Ruled out:** A per-name blocklist of known-dangerous functions
+(`pg_read_file`, `dblink`, `lo_import`, ...) — an allowlist only has to be
+complete once; a blocklist has to stay complete forever, against a catalogue
+this large and against every future PostgreSQL extension a deployment might
+install.
+
+**Why, and the four leaks that shaped it:** A name-based default-deny walk
+restricted to `exp.Func` AST nodes turned out to have four independent ways
+past it, each reproduced live before being closed, and each closed by moving
+from "is this node a disallowed function call" to "does this identifier
+*resolve* to a real, permitted name" — a resolution rule, not a name rule:
+
+1. **`(expr).name` field notation.** PostgreSQL grammar sugar for `name(expr)`
+   when `expr`'s type has no field called `name`; sqlglot parses the bare form
+   as `exp.Dot`, never `exp.Func`, invisible to the function walk. Reproduced
+   live: `SELECT ('/etc/passwd').pg_read_file` validated as safe. Closed by
+   `_references_disallowed_dot_call`, gated to `_DOT_CALL_DIALECTS =
+   {"postgres"}` because DuckDB parses the *identical* `exp.Dot` shape for its
+   own legitimate struct/map field access (`(struct_col).field_name`), which
+   is real user data, never a function-call reading — proven inert for DuckDB
+   with a real `STRUCT`-typed column.
+2. **`::regclass`-family OID casts.** PostgreSQL's eleven `reg*` object-identifier
+   types (`regclass`, `regrole`, `regproc`, ...) resolve a string/OID directly
+   against `pg_class`/`pg_authid`/`pg_proc`/... with no function call and no
+   table reference for either existing check to see. Reproduced live:
+   `SELECT ('customers'::regclass).pg_relation_filepath` returned a real
+   on-disk path; a `generate_series` scan cast to `regclass` enumerated 422
+   relation names, `regrole` enumerated 16 role names. Closed by
+   `_casts_to_object_identifier_type`, keyed on sqlglot's own
+   `exp.ObjectIdentifier` cast-target node — a shape only these eleven types
+   ever produce (confirmed inert for DuckDB, which has no `reg*` types and
+   parses the identical cast as plain `exp.DataType`).
+3. **`alias.name` column-call sugar.** PostgreSQL's function-call syntax needs
+   no parentheses: `alias.name`, where `name` is not a real column of
+   `alias`, resolves as `name(alias)`. sqlglot parses this as `exp.Column`
+   — not `exp.Func`, not `exp.Dot`, not `exp.Table` — invisible to every rule
+   above, *including* the `pg_` internals rule. Reproduced live: a query
+   `is_safe_query` approved ran `pg_terminate_backend` against a real backend
+   PID. Closed in two parts: `_references_internal_column_name` extends the
+   existing `internal_prefixes`/`internal_names` rule to a column's own name;
+   `_references_unresolvable_qualified_column` (backed by a new
+   `Engine.column_names()`) requires a *qualified* column name to be a real
+   column of an advertised table or a name the statement itself binds (an
+   `AS` alias, a `TableAlias` column list, a table-valued function's default
+   output column).
+4. **The `column_names()` whole-database union that briefly re-armed leak 3.**
+   The first shipped version of `column_names()` unioned every schema the
+   connection could read, so any column named after a single-argument
+   catalogue function anywhere in that union — e.g. a hostile
+   `ext.audit(lo_get)` sitting in an opted-in schema — re-validated
+   `g.lo_get` regardless of which table `g` actually was, a regression proven
+   `False` before that change and `True` after it. Closed by replacing the
+   flat union with `table_columns()`, scoped to the tables the *statement
+   itself* references, so a function-scan alias contributes no real table's
+   columns.
+
+**The lesson, carried forward:** a resolution rule is only as safe as what it
+resolves *against*. Leak 4 is what happens when a resolution rule is built
+against everything a connection can see rather than everything the query's
+own structure actually binds — the same distinction that makes leak 3's fix
+correct and would, if skipped, make it just as bypassable as the name rule it
+replaced. Every subsequent qualified-column check in this codebase resolves
+against the statement's own referenced tables, never the full catalogue.
+
+## 2026-09-26 — the structural exemption for pure-syntax nodes (`AND`/`OR`/`EXISTS`)
+
+**Chosen:** `_PURE_SYNTAX_FUNC_TYPES = (exp.And, exp.Or, exp.Exists)` in
+`safety.py` — an `isinstance` skip inside `_references_disallowed_function`'s
+`exp.Func` walk, exempting these three specific AST node *classes* from the
+default-deny check, not by adding their resolved names (`"and"`, `"or"`,
+`"exists"`) to either engine's allowlist.
+
+**Ruled out:** Allowlisting `"and"`/`"or"`/`"exists"` as names. Considered and
+rejected because it would change what the allowlist means to a reader — today
+every entry in `PostgresEngine.allowed_functions`/`DuckDBEngine
+.allowed_functions` names a real catalogue dispatch; widening it to also carry
+pure syntax would blur that meaning for no safety benefit, since neither
+keyword can ever reach a catalogue function regardless of whether its name
+sits in the set.
+
+**Why:** sqlglot 27 (27.29.0) models the reserved infix keywords `AND`/`OR`
+and the `EXISTS (...)` predicate as `exp.Func` subclasses (`exp.And`,
+`exp.Or`, `exp.Exists`) as an implementation detail of its own AST, not
+because either engine treats them as catalogue functions. Because
+`_references_disallowed_function` walked every `exp.Func` node and rejected
+any whose resolved name was unlisted, any query with two conditions joined by
+`AND`/`OR`, or containing an `EXISTS` subquery anywhere, was refused with
+`BLOCKED_UNSAFE_SQL` — most real analytical SQL, live on DuckDB since Phase 3a
+and missed by both engines' corpora (58 DuckDB queries, 32 PostgreSQL queries
+at the time) because neither happened to combine two `WHERE` conditions with
+`AND`. Verified live that neither keyword has any spelling under which either
+dialect's grammar treats it as a function call — `and(a, b)` is a
+`ParseError` under both — so there is no catalogue entry either could ever
+dispatch to, and exempting the node type introduces no bypass. The exemption
+is node-scoped, not subtree-scoped: `find_all` still walks every descendant,
+so a disallowed call nested inside an `AND`/`OR`/`EXISTS` is still rejected
+(verified: `WHERE customer_id = 1 AND current_setting('x') = 'y'` stays
+rejected). `exp.Xor` was deliberately left *outside* the exemption as a
+control: under PostgreSQL, `xor(true, false)` is real parenthesised call
+syntax, not an infix keyword, and does reach the catalogue, so it stays
+subject to the ordinary allow/deny check like any other function name — proof
+the exemption is keyed to what the grammar can produce, not to "every
+boolean-sounding node."
+
+## 2026-09-26 — the catalogue-hash fingerprint, and its cost
+
+**Chosen:** `PostgresEngine.schema_fingerprint()` hashes a deterministic
+catalogue read — `sha256(repr(sorted rows))` over `information_schema.columns`
+plus a `pg_constraint`-derived foreign-key row set — rather than a filesystem
+`mtime`, because there is no single file to `stat` for a server-backed
+engine.
+
+**Ruled out:** Hashing only column rows, with no foreign-key row set (the
+first shipped version) — rejected because a foreign key added or dropped with
+no accompanying column-level change would leave the fingerprint, and
+therefore `schema.py`'s `lru_cache` key, unchanged while `raw_schema()`'s
+synthesised DDL and `schema_chunks()`'s neighbour graph both actually
+changed. A server-side "last DDL timestamp" — PostgreSQL exposes no built-in
+equivalent to the mtime SQLite/DuckDB get for free from their own files.
+
+**Why, and the cost:** `schema.py::get_schema_chunks` calls
+`open_engine(dsn).schema_fingerprint()` on *every* call — cache hit or miss —
+because the fingerprint is itself half of the `lru_cache` key, so the engine
+must be asked before the cache can even be consulted. For PostgreSQL that
+means **one live catalogue query against the server per schema-chunk cache
+check**, not only on a genuine miss — a cost SQLite/DuckDB do not pay in the
+same way, since their fingerprint is a local filesystem `stat`. Accepted
+rather than engineered around: the query reads catalogue metadata only (no
+row data), runs once per question rather than once per retrieved chunk, and
+the only honest alternative — trusting an external signal that the catalogue
+changed — has no source a networked PostgreSQL server exposes. The
+fingerprint also folds in `default_schema` and the sorted `AIPA_EXTRA_SCHEMAS`
+opt-in set (see the schema-scope entry above) so a `search_path`/scope change
+invalidates the cache even when the effective table list happens to be
+unchanged.
+
+## 2026-09-26 — per-engine `default_work_limit`, replacing one SQLite-shaped constant
+
+**Chosen:** `Engine.default_work_limit: int` added to the protocol.
+`SQLiteEngine.default_work_limit = DEFAULT_MAX_VM_STEPS` (100,000 VM steps,
+unchanged). `DuckDBEngine.default_work_limit` and `PostgresEngine
+.default_work_limit` both set to a new `DEFAULT_WORK_LIMIT_MS = 5_000`
+(milliseconds). `execution.execute_query`'s `max_vm_steps` parameter default
+changed from `DEFAULT_MAX_VM_STEPS` to `None`, reading `engine
+.default_work_limit` when unset; an explicit value (including `0`, which
+still disables the guard) still passes straight through.
+
+**Ruled out:** Leaving `DEFAULT_MAX_VM_STEPS` as the one shared default and
+converting units at each call site; a single cross-engine constant with no
+per-engine override.
+
+**Why:** `execution.execute_query` passed `DEFAULT_MAX_VM_STEPS` (100,000, a
+SQLite VM-*instruction* count) verbatim as `work_limit` regardless of which
+engine `open_engine` resolved, so DuckDB's `threading.Timer(work_limit /
+1000, ...)` and PostgreSQL's `SET LOCAL statement_timeout = work_limit` both
+received a **~100-second** timeout instead of the design's intended 5 seconds
+(`QUERY_ABORTED_AFTER_5000_MS`, per `docs/superpowers/specs/
+2026-09-14-phase-3-engine-abstraction-design.md` §4.5). A call-site audit
+(`pipeline.py`'s four `execute_query` calls, `evaluation.py`'s one,
+`tests/test_execution.py`'s explicit `max_vm_steps=0` override) found no
+caller that ever passed a value expecting SQLite's unit specifically, so the
+fix is a pure default-value change touching zero call sites. Verified live
+and pinned: `SELECT pg_sleep(20)` with no explicit `max_vm_steps` now returns
+`QUERY_ABORTED_AFTER_5000_MS` in well under 15 seconds
+(`test_a_slow_postgres_query_aborts_near_5_seconds_not_100`, confirmed
+passing against the live container in ~5.5s of wall time including pytest's
+own overhead); SQLite's own `QUERY_ABORTED_AFTER_100000_VM_STEPS` behaviour,
+and its pinning test, are unchanged.
+
+## 2026-09-26 — `AIPA_TEST_POSTGRES_DSN`-or-skip locally, CI asserting no skip
+
+**Chosen:** `tests/conftest.py`'s `postgres_dsn` fixture reads
+`AIPA_TEST_POSTGRES_DSN`; when unset, or the driver/server is unreachable, it
+skips every test that depends on it (`pytest.importorskip`/`pytest.skip`)
+rather than failing. `.github/workflows/tests.yml`'s `test` job runs a
+`postgres:16` GitHub Actions service container, applies
+`docker/postgres-init.sql` (via `psql`, since a service container takes no
+volumes to mount it directly) against the container's superuser bootstrap
+account, sets `AIPA_TEST_POSTGRES_DSN` to the same least-privilege `aipa_ro`
+DSN a real deployment would use, then re-runs `pytest -m conformance -rs` and
+greps its output for a `^SKIPPED` line, failing the build if one is found.
+
+**Ruled out:** Hard-failing PostgreSQL tests locally when Docker isn't
+running — would break the inner loop of every contributor who hasn't started
+`docker/postgres.yml`. Trusting `pytest -m conformance`'s own exit code as
+the CI gate — it exits `0` on an all-skipped run, since "0 tests failed" is
+true whether or not any test actually ran.
+
+**Why:** The same failure mode this project already guards against for
+`duckdb` (`uv sync --extra engines` plus a CI step asserting no conformance
+test skipped — 2026-09-19 entry below) applies identically to a driver that
+needs a *running server* rather than an installed package: silently skipping
+every PostgreSQL conformance test would let the `test` job go green having
+tested nothing new. Running the suite as `aipa_ro` in CI, not the container's
+superuser bootstrap account, is deliberate rather than incidental:
+`PostgresEngine.check_reachable()` now refuses a superuser DSN
+(`EngineForbiddenError`, see above), so testing through the superuser account
+would never exercise the real deployment path and would hide exactly the
+class of gap Task 3's file/program-surface probe work was built to close.
+Verified: with the DSN set, `pytest -m conformance -rs` reports `36 passed,
+0 skipped` (12 per engine × SQLite/DuckDB/PostgreSQL); with it unset, the
+same command reports the PostgreSQL third skipped with a message naming the
+exact env var and the exact compose command to fix it, and CI's grep step
+would fail the build in that state.
+
 ## 2026-09-25 — DuckDB support is scoped to the `main` schema, consistently across every layer
 
 **Superseded by the 2026-09-26 entry above.** It was always a placeholder for
