@@ -25,12 +25,15 @@ _ALLOWED_PREFIX = re.compile(r"(?is)^(select|with)\b")
 
 
 def _no_table_names() -> frozenset[str]:
-    """The `get_real_table_names` default for `engine=None` (SQLite).
+    """The `get_real_table_names`/`get_real_column_names` default for SQLite.
 
     Never called in practice, since `SQLiteEngine.allowed_functions` is
     `None` and `_references_unknown_table` only runs when it isn't - exists
     so the `engine=None` path has a value of the right type to pass down
-    without instantiating `SQLiteEngine` or touching the filesystem.
+    without instantiating `SQLiteEngine` or touching the filesystem. Shared
+    by both catalogue closures: both are `Callable[[], frozenset[str]]`
+    returning "nothing known", and a second identical function would only be
+    a second thing to keep in step.
     """
     return frozenset()
 
@@ -301,6 +304,19 @@ def _references_disallowed_function(
 # does not exist there. Restricting it to dialects where the dual reading is
 # real is what keeps DuckDB's legitimate queries validating while closing
 # the actual PostgreSQL gap.
+#
+# Task 4 bypass 3 (2026-09-26 review round, second fix): this constant now
+# gates *three* rules, not one - `_references_disallowed_dot_call` above plus
+# `_references_internal_column_name` and
+# `_references_unresolvable_qualified_column` below, which handle the
+# parenthesis-free spelling of the same sugar (`alias.name`). All three exist
+# only because PostgreSQL reads dotted notation as a possible function call;
+# all three must therefore be enabled and disabled together, for exactly the
+# reasons spelled out above. `tests/test_safety.py::
+# test_dot_call_dialects_contains_the_postgres_engines_own_dialect` pins this
+# set against `PostgresEngine.sqlglot_dialect` so renaming that attribute's
+# value cannot silently turn all three rules into no-ops with every other
+# test still green.
 _DOT_CALL_DIALECTS: frozenset[str] = frozenset({"postgres"})
 
 
@@ -355,6 +371,247 @@ def _references_disallowed_dot_call(
         if name not in allowed_functions:
             return True
     return False
+
+
+# Task 4 bypass 3 (2026-09-26 review round, second fix): PostgreSQL's
+# function-call sugar does not need the parentheses `_references_disallowed_
+# dot_call` above keys on. `alias.name`, where `name` is not a column of
+# `alias`, is *itself* a call of `name(alias)` - and sqlglot parses that into
+# `exp.Column(this=Identifier(name), table=Identifier(alias))`. Not an
+# `exp.Func`, so `_references_disallowed_function` cannot see it; not an
+# `exp.Dot`, so `_references_disallowed_dot_call` cannot either; not an
+# `exp.Table`, so `_references_internals` cannot. It was invisible to every
+# gate in this file. Reproduced live as `aipa_ro`, each approved by
+# `is_safe_query` before this fix:
+#
+#   SELECT g.pg_relation_filepath FROM generate_series(16384,16400) g
+#       -> 'base/16384/16387' - on-disk relation paths
+#   SELECT g.pg_get_indexdef FROM generate_series(16384,16500) g
+#       -> 'CREATE UNIQUE INDEX customers_pkey ON public...'
+#   SELECT c.pg_column_size FROM customers c          -> 34, 32
+#   SELECT g.pg_sleep FROM generate_series(1,2) g     -> 3.0s elapsed
+#
+# and, proven by the reviewer and deliberately not re-run here,
+# `SELECT g.pg_terminate_backend FROM generate_series(<pid>,<pid>) g`, which
+# killed a live backend.
+#
+# The previous fix missed this because it verified that `t.col` parses to
+# `exp.Column` and is therefore not *falsely rejected*. It never asked
+# whether an `exp.Column` can *be* a call. It can.
+#
+# The reachable surface is narrower than an ordinary call's, and this was
+# confirmed rather than assumed: the implicit argument is the range-table
+# entry's own type, so only single-argument functions accepting that type are
+# reachable - a real table's whole-row `record`, or a function scan's scalar.
+# For the allowlisted `generate_series` that scalar is `integer`, implicitly
+# coercible to `oid`/`regclass`/`regrole`/`regproc`/`bigint`, which is what
+# puts the whole OID-taking catalogue surface plus `pg_sleep`,
+# `pg_terminate_backend`, `pg_cancel_backend` and `pg_advisory_lock` in
+# reach. `text`-taking functions (`pg_read_file`, `current_setting`) are not
+# reachable this way.
+#
+# Two rules below close it, in that order:
+#
+#   1. `_references_internal_column_name` - the engine's own
+#      `internal_prefixes`/`internal_names` rule, applied to an `exp.Column`'s
+#      own name. Covers every case proven above and needs no catalogue read.
+#   2. `_references_unresolvable_qualified_column` - full default-deny: a
+#      *qualified* column's name must resolve to something real.
+#
+# Rule 1 is kept even though rule 2 subsumes it for every schema seen so far:
+# rule 2 depends on a catalogue read that rule 1 does not, and this file's
+# standing principle is that two independent defences are not redundant (see
+# `is_safe_query`'s docstring).
+
+
+def _references_internal_column_name(
+    parsed: sqlglot_exp.Expression,
+    *,
+    dialect: str,
+    internal_prefixes: tuple[str, ...],
+    internal_names: frozenset[str],
+) -> bool:
+    """True if any column reference's own name is an engine-internal name.
+
+    Part 1 of the bypass-3 fix documented above. Only runs for `dialect` in
+    `_DOT_CALL_DIALECTS`, because only there can a column reference also be a
+    function call.
+
+    This is a *name* rule, and it costs a real user column actually named
+    `pg_something`: such a column would be refused even in a perfectly
+    ordinary `SELECT c.pg_notes FROM customers c`. That is the accepted trade
+    here, and it is the same trade `is_safe_query` already makes elsewhere -
+    `_references_internals` refuses a table named `pg_anything` on its name
+    alone, and `_references_unknown_table` refuses any schema-qualified
+    reference outside the default schema regardless of what it names. A
+    `pg_`-prefixed user column is vanishingly rare (PostgreSQL's own
+    documentation reserves the prefix), and the cost is one unanswerable
+    question against a proven remote-code-adjacent leak.
+
+    Unqualified columns are checked too, not just qualified ones. The sugar
+    needs a qualifier, so an unqualified `pg_x` cannot be a call - but a bare
+    `pg_`-named column is equally suspect and nothing legitimate is lost by
+    refusing both, whereas restricting this rule to qualified columns would
+    invite exactly the "which positions did we remember?" reasoning that let
+    this bypass through in the first place.
+
+    Args:
+        parsed: The parsed statement.
+        dialect: The dialect the statement was parsed under.
+        internal_prefixes: The engine's internal name prefixes.
+        internal_names: The engine's internal names.
+
+    Returns:
+        True if the statement must be rejected.
+    """
+    if exp is None:
+        return True
+    if dialect not in _DOT_CALL_DIALECTS:
+        return False
+    for column in parsed.find_all(exp.Column):
+        name = (column.name or "").lower()
+        if not name:
+            continue
+        if name in internal_names or name.startswith(internal_prefixes):
+            return True
+    return False
+
+
+def _query_bound_names(parsed: sqlglot_exp.Expression) -> frozenset[str]:
+    """Every output name the statement binds for itself, lowercased.
+
+    These are the names a qualified column reference can legitimately resolve
+    to without appearing in the engine's catalogue at all - the second half of
+    `_references_unresolvable_qualified_column`'s "resolves to something real"
+    test. Three sources, each verified against live PostgreSQL:
+
+    - `exp.Alias` - every `AS x`, which is what a derived table's or CTE's
+      computed output column is named by (`SELECT t.total FROM (SELECT
+      SUM(amount) AS total FROM sales) t`).
+    - `exp.TableAlias`'s `columns` - an explicit column alias list, on a
+      derived table, a CTE (`WITH t(x, y) AS (...)`) or a function scan
+      (`generate_series(1,5) AS g(n)`).
+    - The resolved name of any table-valued function - a function scan's
+      single output column is named after the function itself, so `SELECT
+      g.generate_series FROM generate_series(1,5) g` is legal PostgreSQL.
+      Admitting these names is safe rather than circular: this function is
+      only ever consulted *after* `_references_disallowed_function` has
+      already rejected the statement if any function name in it is not in
+      `allowed_functions`, so every name this branch contributes is an
+      allowlisted one.
+
+    Collected across the whole statement rather than per scope. A name bound
+    in one scope and referenced in another would already fail to execute, so
+    the looser set costs nothing in safety terms: the question this answers is
+    only "could this name plausibly be a column rather than a function", and
+    a name the query itself introduces is never a catalogue function name.
+
+    Args:
+        parsed: The parsed statement.
+
+    Returns:
+        The lowercased names the statement binds.
+    """
+    if exp is None:
+        return frozenset()
+    names: set[str] = set()
+    for alias in parsed.find_all(exp.Alias):
+        name = (alias.alias or "").lower()
+        if name:
+            names.add(name)
+    for table_alias in parsed.find_all(exp.TableAlias):
+        for column in table_alias.args.get("columns") or []:
+            name = (column.name or "").lower()
+            if name:
+                names.add(name)
+    for table in parsed.find_all(exp.Table):
+        if isinstance(table.this, exp.Func):
+            name = _resolve_function_name(table.this)
+            if name:
+                names.add(name)
+    return frozenset(names)
+
+
+def _references_unresolvable_qualified_column(
+    parsed: sqlglot_exp.Expression,
+    *,
+    dialect: str,
+    get_real_column_names: Callable[[], frozenset[str]],
+) -> bool:
+    """True if a qualified column reference names nothing the query can supply.
+
+    Part 2 of the bypass-3 fix documented above, and the part that is
+    default-deny rather than a name rule. `alias.name` is only accepted when
+    `name` is a column of some advertised table
+    (`Engine.column_names()`) or a name the statement binds for itself
+    (`_query_bound_names`). `g.pg_relation_filepath`, `g.lo_get` and every
+    other catalogue function reached through the sugar is neither, so it is
+    refused whether or not anyone thought to blocklist its name - which is
+    the whole point, given this gate has now leaked three times on names.
+
+    Only *qualified* references are checked. An unqualified `pg_sleep` cannot
+    be the sugar: PostgreSQL's reading requires a range-table entry on the
+    left to pass as the implicit argument. Leaving unqualified columns alone
+    is what keeps the false-rejection surface near zero - every `GROUP BY
+    month`, `ORDER BY total` and `HAVING n > 1` over a select-list alias is
+    unqualified, and none of them reach this check at all. (Rule 1 above
+    still covers unqualified `pg_`-named columns.)
+
+    A qualified star (`d.*`, `exp.Column` whose `this` is `exp.Star`) is
+    skipped: it names no identifier, so there is nothing to resolve, and
+    PostgreSQL never reads it as a call.
+
+    The resolution is a union across tables, not per-qualifier: it asks "is
+    this a real column name anywhere in this database", not "is this a column
+    of the table this alias binds to". That is deliberate. Resolving each
+    qualifier to its own range-table entry would mean re-implementing name
+    resolution through derived tables, CTEs with `SELECT *`, `LATERAL` and
+    `USING` joins, and every gap in that re-implementation becomes a false
+    rejection of a legitimate query. The union costs one residual: a
+    reference like `g.amount` (a real column, but of a different table) is
+    allowed here, so a PostgreSQL function whose name exactly matches one of
+    the user's own column names *and* takes a single argument of the range
+    entry's type would still slip through. Rule 1 covers the entire `pg_`
+    surface of that residual; what is left is a catalogue function sharing a
+    name with a user column, which requires the schema to cooperate with the
+    attack.
+
+    Measured before shipping (2026-09-26): 0 rejections across PostgreSQL's
+    32-query analytics corpus and DuckDB's 58-query corpus, plus a dozen
+    hand-written derived-table, LATERAL, self-join, `WITH t(x, y)` and
+    function-scan-alias shapes - see `.superpowers/sdd/task-4-report.md`.
+
+    `get_real_column_names` is a zero-argument callable for the same reason
+    `_references_unknown_table`'s `get_real_table_names` is: a statement with
+    no qualified column reference at all (`SELECT COUNT(*) FROM sales`) must
+    not pay for a catalogue read to be told so.
+
+    Args:
+        parsed: The parsed statement.
+        dialect: The dialect the statement was parsed under.
+        get_real_column_names: Returns every advertised column name,
+            lowercased - see `Engine.column_names()`.
+
+    Returns:
+        True if the statement must be rejected.
+    """
+    if exp is None:
+        return True
+    if dialect not in _DOT_CALL_DIALECTS:
+        return False
+    candidates: list[str] = []
+    for column in parsed.find_all(exp.Column):
+        if not column.args.get("table"):
+            continue
+        if isinstance(column.this, exp.Star):
+            continue
+        name = (column.name or "").lower()
+        if name:
+            candidates.append(name)
+    if not candidates:
+        return False
+    resolvable = get_real_column_names() | _query_bound_names(parsed)
+    return any(name not in resolvable for name in candidates)
 
 
 # Task 4 bypass 2 (2026-09-26 review round): `"cast"` is allowlisted for
@@ -718,6 +975,7 @@ def _is_safe_ast(
     internal_names: frozenset[str],
     allowed_functions: frozenset[str] | None,
     get_real_table_names: Callable[[], frozenset[str]],
+    get_real_column_names: Callable[[], frozenset[str]],
 ) -> bool:
     """Reject anything that parses to more than one statement or writes data.
 
@@ -770,9 +1028,26 @@ def _is_safe_ast(
             internal_names=internal_names,
         ):
             return False
+        # Both column rules sit here, after the function and dot-call checks
+        # and before the table check, for the same ordering reason the
+        # comment above gives: the internal-name one needs no I/O at all, and
+        # the default-deny one must run after `_references_disallowed_function`
+        # so that `_query_bound_names` can admit a table-valued function's own
+        # output-column name knowing that name is already allowlisted.
+        if _references_internal_column_name(
+            parsed,
+            dialect=dialect,
+            internal_prefixes=internal_prefixes,
+            internal_names=internal_names,
+        ):
+            return False
         if _casts_to_object_identifier_type(parsed):
             return False
         if _references_unknown_table(parsed, get_real_table_names=get_real_table_names):
+            return False
+        if _references_unresolvable_qualified_column(
+            parsed, dialect=dialect, get_real_column_names=get_real_column_names
+        ):
             return False
 
     forbidden = (
@@ -818,7 +1093,9 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
             the internals blocklist, and its `allowed_functions` switches on
             default-deny function *and table* validation when it is a set
             rather than `None`, calling `engine.table_names()` only in that
-            case. Defaults to `None`, meaning SQLite - resolved from
+            case and `engine.column_names()` only when its `sqlglot_dialect`
+            is additionally one where a qualified column can be a function
+            call (`_DOT_CALL_DIALECTS`). Defaults to `None`, meaning SQLite - resolved from
             `SQLiteEngine`'s own class attributes, so this stays a single
             source rather than a second, driftable copy of its blocklist,
             and performs no I/O: `engine=None` never reads a table list,
@@ -848,6 +1125,7 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         internal_names: frozenset[str] = SQLiteEngine.internal_names
         allowed_functions: frozenset[str] | None = SQLiteEngine.allowed_functions
         get_real_table_names: Callable[[], frozenset[str]] = _no_table_names
+        get_real_column_names: Callable[[], frozenset[str]] = _no_table_names
     else:
         dialect = engine.sqlglot_dialect
         internal_prefixes = engine.internal_prefixes
@@ -870,6 +1148,14 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         get_real_table_names = (
             engine.table_names if allowed_functions is not None else _no_table_names
         )
+        # Same closure treatment, same reasons, for the column catalogue -
+        # plus one more gate in front of it: the only check that calls this
+        # (`_references_unresolvable_qualified_column`) also requires the
+        # dialect to be in `_DOT_CALL_DIALECTS`, so DuckDB and SQLite never
+        # read a column list at all.
+        get_real_column_names = (
+            engine.column_names if allowed_functions is not None else _no_table_names
+        )
     return _is_safe_ast(
         s,
         dialect=dialect,
@@ -877,4 +1163,5 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         internal_names=internal_names,
         allowed_functions=allowed_functions,
         get_real_table_names=get_real_table_names,
+        get_real_column_names=get_real_column_names,
     )

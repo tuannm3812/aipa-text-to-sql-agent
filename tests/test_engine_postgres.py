@@ -661,6 +661,172 @@ def test_ordinary_casts_still_validate(engine_with_table_t) -> None:
     assert is_safe_query("SELECT a::TEXT FROM t", engine=engine_with_table_t)
 
 
+# Task 4, Bypass 3: PostgreSQL's function-call sugar does not need
+# parentheses at all. `alias.name`, where `name` is not a column of `alias`,
+# resolves as `name(alias)` - and sqlglot parses that into
+# `exp.Column(this=Identifier(name), table=Identifier(alias))`: not an
+# `exp.Func`, not an `exp.Dot`, not an `exp.Table`, so it was invisible to
+# every gate in `safety.py`, including the `pg_` internals rule. Reproduced
+# live as `aipa_ro` (2026-09-26), `is_safe_query` returning True for each:
+#
+#   SELECT g.pg_relation_filepath FROM generate_series(16384,16400) g
+#       -> 'base/16384/16387'
+#   SELECT g.pg_get_indexdef FROM generate_series(16384,16500) g
+#       -> 'CREATE UNIQUE INDEX customers_pkey ON public...'
+#   SELECT c.pg_column_size FROM customers c   -> 34, 32
+#   SELECT g.pg_sleep FROM generate_series(1,2) g -> executed, 3.0s elapsed
+#
+# and `SELECT g.pg_terminate_backend FROM generate_series(<pid>,<pid>) g`,
+# which the reviewer proved killed a live backend. That last one is
+# deliberately *not* in the list below and deliberately never re-run: it is
+# proven and disruptive. Its shape is covered by `pg_sleep`, which reaches
+# the same `integer`-argument surface.
+#
+# The five positional variants after the four proven cases are the ones the
+# reviewer confirmed also work today: select list, `WHERE`, `ORDER BY`,
+# inside a CTE, and across a `UNION ALL`.
+_COLUMN_CALL_BYPASS_PROBES: list[tuple[str, str]] = [
+    # The four reproduced cases.
+    (
+        "pg_relation_filepath",
+        "SELECT g.pg_relation_filepath FROM generate_series(16384,16400) g",
+    ),
+    ("pg_get_indexdef", "SELECT g.pg_get_indexdef FROM generate_series(16384,16500) g"),
+    ("pg_column_size", "SELECT c.pg_column_size FROM customers c"),
+    ("pg_sleep", "SELECT g.pg_sleep FROM generate_series(1,2) g"),
+    # The five positional variants.
+    ("select_list", "SELECT c.customer_id, c.pg_column_size FROM customers c"),
+    ("in_where", "SELECT * FROM customers c WHERE c.pg_column_size > 0"),
+    ("in_order_by", "SELECT c.customer_id FROM customers c ORDER BY c.pg_column_size"),
+    (
+        "inside_cte",
+        "WITH x AS (SELECT c.pg_column_size AS v FROM customers c) SELECT * FROM x",
+    ),
+    (
+        "across_union_all",
+        "SELECT c.customer_id FROM customers c "
+        "UNION ALL SELECT g.pg_column_size FROM generate_series(1,2) g",
+    ),
+    # Part 2's own reach, beyond what the `pg_` name rule covers: `lo_get`
+    # reads a large object by OID and carries no `pg_` prefix, so only the
+    # default-deny column resolution refuses it.
+    ("lo_get_no_pg_prefix", "SELECT g.lo_get FROM generate_series(16384,16400) g"),
+    ("quoted_identifier", 'SELECT c."pg_column_size" FROM customers c'),
+]
+
+
+@pytest.mark.parametrize(
+    "label,sql", _COLUMN_CALL_BYPASS_PROBES, ids=[label for label, _ in _COLUMN_CALL_BYPASS_PROBES]
+)
+def test_column_call_bypass_is_rejected(engine_with_table_t, label: str, sql: str) -> None:
+    """Every variant of Bypass 3 must be refused post-fix - each one passed
+    `is_safe_query` at BASE (commit 30baa70), before `safety._references_
+    internal_column_name` and `safety._references_unresolvable_qualified_
+    column` existed.
+    """
+    assert not is_safe_query(sql, engine=engine_with_table_t), f"should have rejected: {sql!r}"
+
+
+# The Bypass 3 fix is default-deny over *qualified* column references, so the
+# thing it must not do is reject ordinary analytics SQL that qualifies its
+# columns - which is most real SQL. Beyond `ANALYTICS_CORPUS` below (32
+# queries, all of which both validate and execute), these are the shapes
+# where a qualifier resolves to something other than a plain base table:
+# derived tables, explicit CTE column alias lists, `LATERAL`, self-joins,
+# qualified stars, and a function scan's own output column - each checked
+# because each is a place a naive implementation of this rule would break.
+_LEGITIMATE_QUALIFIED_COLUMN_QUERIES: list[tuple[str, str]] = [
+    ("base_table", "SELECT c.name FROM customers c"),
+    ("derived_table_alias", "SELECT t.total FROM (SELECT SUM(amount) AS total FROM sales) t"),
+    (
+        "derived_table_in_where",
+        "SELECT t.n FROM (SELECT COUNT(*) AS n FROM sales) AS t WHERE t.n > 0",
+    ),
+    ("qualified_star", "SELECT d.* FROM (SELECT * FROM sales) d"),
+    (
+        "cte_column_alias_list",
+        "WITH t(x, y) AS (SELECT category, SUM(amount) FROM sales GROUP BY category) "
+        "SELECT t.x, t.y FROM t",
+    ),
+    ("function_scan_alias_list", "SELECT g.n FROM generate_series(1,5) AS g(n)"),
+    ("function_scan_default_column", "SELECT g.generate_series FROM generate_series(1,5) g"),
+    (
+        "self_join",
+        "SELECT a.name, b.name FROM customers a JOIN customers b ON a.customer_id <> b.customer_id",
+    ),
+    (
+        "uncorrelated_in_subquery",
+        "SELECT s.amount FROM sales s WHERE s.customer_id IN "
+        "(SELECT c.customer_id FROM customers c)",
+    ),
+    (
+        "correlated_scalar_subquery",
+        "SELECT s.amount, (SELECT c.name FROM customers c WHERE c.customer_id = s.customer_id) "
+        "AS who FROM sales s",
+    ),
+    (
+        "lateral",
+        "SELECT c.name FROM customers AS c JOIN LATERAL "
+        "(SELECT s.amount FROM sales s WHERE s.customer_id = c.customer_id) l ON TRUE",
+    ),
+]
+# Two shapes deliberately left out of the list above, because both are
+# already refused at BASE (commit 30baa70) for reasons that have nothing to
+# do with Bypass 3, and listing them here would misattribute a pre-existing
+# limitation to this fix:
+#   - `... WHERE EXISTS (SELECT 1 FROM customers c ...)` - `exp.Exists` is an
+#     `exp.Func` subclass and `"exists"` is not in
+#     `PostgresEngine.allowed_functions`.
+#   - `SELECT public.customers.name FROM public.customers` -
+#     `_references_unknown_table` still hardcodes `"main"` as the only
+#     acceptable schema qualifier; PostgreSQL's is `"public"`
+#     (`PostgresEngine.default_schema`). Phase 3b Task 6 is where
+#     `default_schema` gets wired through that check.
+# Both were re-confirmed False at BASE on 2026-09-26 before being excluded.
+
+
+@pytest.mark.parametrize(
+    "label,sql",
+    _LEGITIMATE_QUALIFIED_COLUMN_QUERIES,
+    ids=[label for label, _ in _LEGITIMATE_QUALIFIED_COLUMN_QUERIES],
+)
+def test_legitimate_qualified_columns_still_validate(
+    postgres_dsn: str, label: str, sql: str
+) -> None:
+    """The other half of Bypass 3's fix: a false rejection costs a user an
+    unanswerable question, so every one of these must still validate. Uses
+    the real `customers`/`sales` tables rather than the `t` fixture so the
+    column names being resolved are the ones a real question would use.
+    """
+    engine = open_engine(postgres_dsn)
+    assert is_safe_query(sql, engine=engine), f"wrongly rejected: {sql!r}"
+
+
+def test_dot_call_dialects_pins_the_postgres_engines_own_dialect() -> None:
+    """`safety._DOT_CALL_DIALECTS` gates all three of PostgreSQL's dotted-
+    notation rules (`_references_disallowed_dot_call`,
+    `_references_internal_column_name`,
+    `_references_unresolvable_qualified_column`). Nothing else connects that
+    hardcoded string to the engine, so renaming `PostgresEngine.
+    sqlglot_dialect` would turn all three into silent no-ops with every
+    other test in this file still green - the rules would simply never run.
+    This is the test that fails instead.
+    """
+    assert PostgresEngine.sqlglot_dialect in _safety._DOT_CALL_DIALECTS
+
+
+def test_postgres_column_names_reports_the_real_columns(postgres_dsn: str) -> None:
+    """`Engine.column_names()` is what `_references_unresolvable_qualified_
+    column` resolves against, so an empty or wrong answer here would turn
+    Part 2 of the Bypass 3 fix into either a no-op or a blanket refusal
+    without any other test necessarily noticing.
+    """
+    engine = open_engine(postgres_dsn)
+    columns = engine.column_names()
+    assert {"customer_id", "name", "amount", "sale_date", "category"} <= columns
+    assert "pg_column_size" not in columns
+
+
 def test_collate_is_allowed(postgres_dsn: str) -> None:
     """`COLLATE` is ordinary SQL grammar, not a `pg_proc` call, but sqlglot's
     `exp.Collate` is an `exp.Func` subclass, so it went through default-deny

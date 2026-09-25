@@ -654,5 +654,23 @@ DUCKDB DIALECT (must follow):
         chunks = get_schema_chunks(f"duckdb://{self.dsn}")
         return frozenset(chunk.table_name.lower() for chunk in chunks)
 
+    def column_names(self) -> frozenset[str]:
+        """Every user table's column names, lowercased, unioned across tables.
+
+        Never reached by `safety.is_safe_query` for DuckDB: the column check
+        that calls this is gated on `safety._DOT_CALL_DIALECTS`, which
+        DuckDB is deliberately not in (DuckDB has no `alias.name` ->
+        `name(alias)` function-call sugar - see
+        `safety._references_unresolvable_qualified_column`). Implemented for
+        real anyway, on the same principle as `table_names`.
+
+        Deferred import for the same circular-import reason as
+        `SQLiteEngine.table_names` - see that method's docstring.
+        """
+        from ..schema import get_schema_chunks
+
+        chunks = get_schema_chunks(f"duckdb://{self.dsn}")
+        return frozenset(column.lower() for chunk in chunks for column in chunk.columns)
+
 
 __all__ = ["DuckDBEngine"]

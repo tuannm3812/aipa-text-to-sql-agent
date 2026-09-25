@@ -537,5 +537,27 @@ class PostgresEngine:
         chunks = get_schema_chunks(self.dsn)
         return frozenset(chunk.table_name.lower() for chunk in chunks)
 
+    def column_names(self) -> frozenset[str]:
+        """Every user table's column names, lowercased, unioned across tables.
+
+        This is what `safety.is_safe_query`'s default-deny column check
+        (`_references_unresolvable_qualified_column`) calls to tell a real
+        qualified column reference from PostgreSQL's `alias.name` ->
+        `name(alias)` function-call sugar. PostgreSQL is the only engine
+        that actually reaches it.
+
+        Routed through `schema.get_schema_chunks` so it shares the same
+        fingerprint-keyed cache `table_names` reads - the two resolve to the
+        same chunk list, so a query that triggers both pays for one
+        catalogue read, not two.
+
+        Deferred import for the same circular-import reason as
+        `SQLiteEngine.table_names` - see that method's docstring.
+        """
+        from ..schema import get_schema_chunks
+
+        chunks = get_schema_chunks(self.dsn)
+        return frozenset(column.lower() for chunk in chunks for column in chunk.columns)
+
 
 __all__ = ["PostgresEngine"]

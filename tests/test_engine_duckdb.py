@@ -1007,6 +1007,56 @@ ANALYTICS_CORPUS = [
 ]
 
 
+# Task 4, Bypass 3 (2026-09-26): the PostgreSQL-only column rules must be
+# provably inert here, not merely assumed to be. DuckDB has no `alias.name`
+# -> `name(alias)` sugar, so applying either rule to DuckDB could only cost
+# false rejections - a DuckDB struct/JSON access legitimately writes
+# `alias.field` for arbitrary user-chosen field names that are not columns of
+# anything.
+
+
+def test_duckdbs_dialect_is_deliberately_outside_the_dot_call_dialects():
+    """The inertness pin, and the reason it is a test rather than a comment:
+    `safety._DOT_CALL_DIALECTS` is what keeps all three of PostgreSQL's
+    dotted-notation rules off DuckDB. Adding `"duckdb"` to that set - or
+    renaming `DuckDBEngine.sqlglot_dialect` to something already in it -
+    would silently subject every DuckDB struct access to a column-existence
+    check it cannot pass.
+    """
+    assert DuckDBEngine.sqlglot_dialect not in _safety._DOT_CALL_DIALECTS
+
+
+def test_duckdb_column_names_reports_the_real_columns(analytics_db):
+    """`Engine.column_names()` is implemented for DuckDB even though
+    `is_safe_query` never calls it here - same principle as `table_names`,
+    and pinned so the implementation cannot rot unnoticed behind the dialect
+    gate above.
+    """
+    columns = analytics_db.column_names()
+    assert {"order_id", "customer_id", "amount", "order_date", "tags"} <= columns
+
+
+def test_duckdb_struct_field_access_is_not_treated_as_a_column_call(tmp_path):
+    """The concrete cost the dialect gate avoids, against a real STRUCT
+    column: `x.s.b` parses to exactly the `exp.Column` shape PostgreSQL's
+    Bypass 3 rules key on, but `b` is a struct field - arbitrary user data,
+    never a column of any table. A blanket column-existence rule would
+    reject it. It must still validate *and* execute here.
+    """
+    db = tmp_path / "structs.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE t (s STRUCT(b INTEGER))")
+    con.execute("INSERT INTO t VALUES ({'b': 7})")
+    con.close()
+    engine = open_engine(f"duckdb://{db}")
+
+    sql = "SELECT x.s.b FROM t x"
+    assert is_safe_query(sql, engine=engine), f"wrongly rejected: {sql!r}"
+    result = engine.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok, result.error
+    assert result.rows == [(7,)]
+
+
 def test_analytics_corpus_size_is_at_least_forty():
     """Guards the corpus itself, not just what it proves - a corpus that
     silently shrank below the brief's stated floor would make every other

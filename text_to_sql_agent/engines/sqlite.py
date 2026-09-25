@@ -328,3 +328,20 @@ SQLITE DIALECT (must follow):
         from ..schema import get_schema_chunks
 
         return frozenset(chunk.table_name.lower() for chunk in get_schema_chunks(self.dsn))
+
+    def column_names(self) -> frozenset[str]:
+        """Every user table's column names, lowercased, unioned across tables.
+
+        Never reached by `safety.is_safe_query` for SQLite - both gates in
+        front of it (`allowed_functions is not None` and a dialect in
+        `safety._DOT_CALL_DIALECTS`) exclude this engine - but implemented
+        for real, not stubbed, for the same reason `table_names` is.
+
+        Deferred import for the same circular-import reason as
+        `SQLiteEngine.table_names` - see that method's docstring.
+        """
+        from ..schema import get_schema_chunks
+
+        return frozenset(
+            column.lower() for chunk in get_schema_chunks(self.dsn) for column in chunk.columns
+        )

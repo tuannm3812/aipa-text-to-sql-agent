@@ -108,3 +108,22 @@ class Engine(Protocol):
         issuing a fresh catalogue query on every call.
         """
         ...
+
+    def column_names(self) -> frozenset[str]:
+        """Every user table's column names, lowercased, unioned across tables.
+
+        Used by `safety.is_safe_query`'s default-deny *column* check
+        (`_references_unresolvable_qualified_column`), which extends
+        default-deny from functions and tables to the qualified-column
+        position PostgreSQL also reads as a function call - see that
+        function's docstring for the bypass it closes and why the union
+        across tables (rather than a per-table resolution) is the right
+        granularity here.
+
+        Only called for an engine whose `allowed_functions` is not `None`
+        *and* whose `sqlglot_dialect` is in `safety._DOT_CALL_DIALECTS`, so
+        SQLite and DuckDB never reach it in practice. Implementations should
+        reuse `schema.py`'s fingerprint-keyed schema-chunk cache the same way
+        `table_names()` does - the two read the same chunks.
+        """
+        ...
