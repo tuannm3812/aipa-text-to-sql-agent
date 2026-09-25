@@ -992,3 +992,100 @@ Evaluated 12 cases. Exact result match: 12/12
 re-verified here: the DuckDB catalogue sweep, allowlist round-trip, analytics
 corpus and SQLite differential from Phase 3a, all still pinned as regression
 tests.
+
+## 2026-09-26 — Codex follow-up review of Claude's Phase 3a fixes
+
+**Scope:** Reviewed `30d9466..6c33993`, covering Claude's response to the
+2026-09-21 review, both implementation fixes, their regression tests, the
+no-`engines` test correction, and the decision/next-steps documentation. The
+pre-existing uncommitted `.devcontainer/devcontainer.json` edit was inspected
+but not changed or included in this review range.
+
+**Disposition of the original findings:**
+
+1. **Dialect-conflicted DuckDB generation and repair — closed.** A direct
+   provider-stub probe found none of the four incompatible SQLite instructions
+   in the assembled DuckDB system prompt, while retaining the one legitimate
+   comparison to SQLite's date functions. The repair user prompt now says
+   `DuckDB error:` and asks for a corrected DuckDB query. The assembled SQLite
+   prompt still hashes to
+   `89d91cbac0ecc8b32b0af647d3d1238f513249cf6cdcc9bf4ff7eb597be333c3`,
+   so the fix did not move the byte-identity invariant the implementation plan
+   required.
+
+2. **Cross-schema DuckDB metadata mixing — closed within the owner's chosen
+   `main`-only scope.** Replaying the original database with
+   `main.shared(main_only)` plus `analytics.shared(analytics_only)` no longer
+   raises: `table_names()` returns only `{'shared'}` and the one chunk contains
+   only `main_only`. A table existing only as `analytics.sales` is absent from
+   `raw_schema()`/`table_names()` and both its qualified and unqualified query
+   forms are rejected, so schema extraction and validation now agree. The
+   limitation and the future multi-schema work are recorded in
+   `docs/3_decisions.md` and `docs/4_next_steps.md` rather than hidden.
+
+3. **No-`engines` test failure Claude found — closed.** In a fresh isolated
+   environment synced without the optional extra, the full suite reports
+   `191 passed, 27 skipped`, with no failure. The SQLite parameter now carries
+   the engine-independent unreachable-target contract, while the DuckDB
+   parameter skips when its optional driver is absent. The count is two passes
+   and two skips higher than the `189/25` figure recorded at commit `870a892`
+   because the later prompt/schema commits added tests; this is expected, not a
+   discrepancy in Claude's historical report.
+
+**One low-priority follow-up for Claude:**
+
+- `tests/test_llm.py::_known_engine_classes()` says it "grows automatically as
+  new engines ... are added", but it is a hand-maintained list containing
+  `SQLiteEngine` plus a conditional import of `DuckDBEngine`. Adding the Phase
+  3b PostgreSQL implementation to `open_engine()` will not put it in this test,
+  so the claimed general guard can silently remain green while PostgreSQL's
+  prompt repeats the same cross-dialect mistake. This does not weaken the
+  current SQLite/DuckDB fix. Either make the test consume a real production
+  engine registry, or state that the list is manual and add updating it to the
+  Phase 3b checklist/tests.
+
+**Uncommitted devcontainer state:** The working-tree edit adds
+`uv sync --extra engines`, which is the right dependency change if the
+devcontainer is meant to run both-engine conformance. The same file also
+contains unrelated Claude-history mount/symlink work that predates or sits
+alongside this fix, so it was preserved untouched. Until the owner decides how
+to land that mixed file, the committed branch still has the old devcontainer
+command; Claude correctly did not fold a user's dirty file into its commits.
+
+**Fresh verification at `6c33993`** used
+`UV_CACHE_DIR=/private/tmp/aipa-review-uv`. The no-extra run used a separate
+`UV_PROJECT_ENVIRONMENT=/private/tmp/aipa-review-noextra-venv` so it did not
+alter the project's normal environment:
+
+```
+$ UV_PROJECT_ENVIRONMENT=/private/tmp/aipa-review-noextra-venv uv run pytest -rs
+191 passed, 27 skipped in 0.83s
+
+$ uv run pytest
+447 passed in 2.80s
+
+$ uv run pytest -m conformance -rs
+24 passed, 423 deselected in 0.43s
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+71 files already formatted
+
+$ uv run mypy
+Success: no issues found in 30 source files
+
+$ uv run python -c "import app; print('ok')"
+ok
+
+$ uv run python scripts/evaluate_text_to_sql.py --mode gold \
+    --out-dir /private/tmp/aipa-claude-followup-gold
+Evaluated 12 cases. Exact result match: 12/12
+```
+
+The first attempt to create the isolated no-extra environment was blocked by
+the sandbox's network restriction; it was rerun with approved dependency
+download access and then completed. Gold outputs went only to `/private/tmp`.
+After this log-only edit, the sole non-log working-tree change remains the
+pre-existing `.devcontainer/devcontainer.json` edit.
