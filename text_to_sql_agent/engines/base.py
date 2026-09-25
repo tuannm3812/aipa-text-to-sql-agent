@@ -47,6 +47,15 @@ class Engine(Protocol):
     `text_to_sql_agent/safety.py`'s `_resolve_function_name` for how a parsed
     call is resolved to a name to check, and `_references_unknown_table` for
     the table rule.
+
+    `prompt_dialect_section`, `prompt_dialect_name` and
+    `prompt_engine_rules_block` are the three engine-owned fragments
+    `llm.py`'s `_assemble_prompt` substitutes into the shared prompt body, so
+    every dialect-dependent instruction in the finished system prompt (not
+    just the labelled dialect section) names the right engine. `pipeline.py`'s
+    `_repair_sql` also reads `prompt_dialect_name` for the same reason in the
+    repair user prompt. See `SQLiteEngine`'s copies for why each one is
+    pinned to its exact legacy wording.
     """
 
     name: str
@@ -55,6 +64,8 @@ class Engine(Protocol):
     internal_names: frozenset[str]
     allowed_functions: frozenset[str] | None
     prompt_dialect_section: str
+    prompt_dialect_name: str
+    prompt_engine_rules_block: str
     schema_header: str
 
     def check_reachable(self) -> None:

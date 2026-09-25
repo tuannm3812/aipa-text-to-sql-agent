@@ -264,6 +264,11 @@ class _StandInEngine:
     internal_names: frozenset[str] = frozenset({"dbstat"})
     allowed_functions: frozenset[str] | None = None
     prompt_dialect_section = "STAND-IN DIALECT (must follow):\n- Definitely not SQLite.\n"
+    prompt_dialect_name = "Stand-In"
+    prompt_engine_rules_block = (
+        "- Do NOT reference any internal Stand-In tables.\n"
+        "- Prefer simple SQL compatible with Stand-In.\n"
+    )
     schema_header = "Stand-in schema (DDL)"
 
     def check_reachable(self) -> None:
@@ -294,3 +299,67 @@ def test_repair_receives_a_non_sqlite_engines_dialect_section(customers_db: str)
     assert result.ok, result.error
     assert len(prompts) == 2, "one generation plus one repair"
     assert all(engine.prompt_dialect_section in p for p in prompts)
+
+
+def test_repair_user_prompt_names_the_engines_dialect(customers_db: str) -> None:
+    """Phase 3a review (2026-09-21): `_repair_sql` hardcoded "SQLite error"
+    and "corrected SQLite SELECT query" into the repair *user* prompt
+    regardless of the target engine. The tests above only ever inspect the
+    system prompt `_call_provider` receives; this inspects the user prompt,
+    which is where those two strings actually lived.
+    """
+    engine = _StandInEngine()
+    user_prompts: list[str] = []
+
+    def fake_call(_prompt: str, user_prompt: str, *_a: object, **_k: object) -> str:
+        user_prompts.append(user_prompt)
+        if len(user_prompts) == 1:
+            return "SELECT nope FROM customers"
+        return "SELECT name FROM customers"
+
+    with (
+        patch("text_to_sql_agent.llm._call_provider", side_effect=fake_call),
+        patch("text_to_sql_agent.pipeline.open_engine", return_value=engine),
+    ):
+        result = agent.ask_database("list customers", db_path=customers_db)
+
+    assert result.ok, result.error
+    assert len(user_prompts) == 2, "one generation plus one repair"
+    repair_user_prompt = user_prompts[1]
+    assert f"{engine.prompt_dialect_name} error:" in repair_user_prompt
+    assert f"corrected {engine.prompt_dialect_name} SELECT query" in repair_user_prompt
+    assert "SQLite error:" not in repair_user_prompt
+    assert "corrected SQLite SELECT query" not in repair_user_prompt
+
+
+def test_repair_user_prompt_names_duckdbs_dialect(tmp_path: Path) -> None:
+    """Same bug as `test_repair_user_prompt_names_the_engines_dialect` above,
+    proven through a real `DuckDBEngine` rather than a stand-in, so the fix is
+    checked against the actual engine every DuckDB user hits, not only a
+    hand-rolled double.
+    """
+    duckdb = pytest.importorskip("duckdb", reason="install the duckdb extra")
+    db_path = tmp_path / "customers.duckdb"
+    con = duckdb.connect(str(db_path))
+    con.execute("CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, name VARCHAR)")
+    con.execute("INSERT INTO customers VALUES (1, 'Alice')")
+    con.close()
+
+    user_prompts: list[str] = []
+
+    def fake_call(_prompt: str, user_prompt: str, *_a: object, **_k: object) -> str:
+        user_prompts.append(user_prompt)
+        if len(user_prompts) == 1:
+            return "SELECT nope FROM customers"
+        return "SELECT name FROM customers"
+
+    with patch("text_to_sql_agent.llm._call_provider", side_effect=fake_call):
+        result = agent.ask_database("list customers", db_path=f"duckdb://{db_path}")
+
+    assert result.ok, result.error
+    assert len(user_prompts) == 2, "one generation plus one repair"
+    repair_user_prompt = user_prompts[1]
+    assert "DuckDB error:" in repair_user_prompt
+    assert "corrected DuckDB SELECT query" in repair_user_prompt
+    assert "SQLite error:" not in repair_user_prompt
+    assert "corrected SQLite SELECT query" not in repair_user_prompt

@@ -12,14 +12,18 @@ from .engines.sqlite import SQLiteEngine
 from .env import load_env
 from .gemini_manager import get_default_gemini_manager
 
-# Placeholder swapped for one engine's `prompt_dialect_section` by
-# `_assemble_prompt`. Unique within `_PROMPT_BODY`, so `str.replace` cannot
-# touch anything else.
+# Placeholders swapped for one engine's prompt fragments by `_assemble_prompt`.
+# Each is unique within `_PROMPT_BODY`, so `str.replace` cannot touch anything
+# else. `_DIALECT_NAME_PLACEHOLDER` appears twice (the job statement and the
+# case-insensitivity rule); `str.replace` substitutes both occurrences with
+# the same engine name, which is what both call sites want.
 _DIALECT_PLACEHOLDER = "{{DIALECT_SECTION}}"
+_DIALECT_NAME_PLACEHOLDER = "{{DIALECT_NAME}}"
+_ENGINE_RULES_PLACEHOLDER = "{{ENGINE_RULES_BLOCK}}"
 
 _PROMPT_BODY = """\
 You are an expert data analyst and SQL translator.
-Your ONLY job is to translate the user's question into a SINGLE SQLite SELECT query.
+Your ONLY job is to translate the user's question into a SINGLE {{DIALECT_NAME}} SELECT query.
 
 {{DIALECT_SECTION}}
 If the question cannot be answered using the schema, output exactly:
@@ -38,11 +42,9 @@ Rules (must follow):
 - Do NOT use any data-modifying statements: INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, REPLACE, TRUNCATE, VACUUM, PRAGMA, ATTACH, DETACH.
 - Do NOT repeat or restate the schema/DDL. Never output CREATE TABLE or column lists.
 - Output must start with SELECT (or WITH) and contain exactly one query.
-- Do NOT reference sqlite_master or any internal SQLite tables.
-- Prefer simple SQL compatible with SQLite.
-
+{{ENGINE_RULES_BLOCK}}
 *** CRITICAL TEXT SEARCHING RULES ***
-1. CASE INSENSITIVITY: SQLite '=' is case-sensitive. Whenever you filter by text, you MUST make it case-insensitive. Use `LOWER(column) = LOWER('value')` or `LIKE`.
+1. CASE INSENSITIVITY: {{DIALECT_NAME}} '=' is case-sensitive. Whenever you filter by text, you MUST make it case-insensitive. Use `LOWER(column) = LOWER('value')` or `LIKE`.
 2. PARTIAL MATCHES: When a user searches for a location, venue, or keyword (e.g., 'bathurst' or 'marine rescue'), assume it is a partial match. ALWAYS use `LIKE '%keyword%'` to search within fields like addresses, names, or descriptions.
 
 ADDITIONAL RULES - DIFFERENCE / DELTA QUESTIONS (must follow):
@@ -61,15 +63,34 @@ ADDITONAL RULES - COMPARATIVE QUESTIONS (must follow):
 """
 
 
-def _assemble_prompt(dialect_section: str) -> str:
-    """Build the system prompt for one engine's dialect."""
-    return _PROMPT_BODY.replace(_DIALECT_PLACEHOLDER, dialect_section)
+def _assemble_prompt(dialect_section: str, dialect_name: str, engine_rules_block: str) -> str:
+    """Build the system prompt for one engine's dialect.
+
+    Args:
+        dialect_section: The engine's `prompt_dialect_section` - its own
+            labelled block (e.g. "SQLITE DIALECT (must follow): ...").
+        dialect_name: The engine's `prompt_dialect_name` (e.g. "SQLite"),
+            substituted everywhere `_PROMPT_BODY` names the target dialect
+            inline, outside the labelled section.
+        engine_rules_block: The engine's `prompt_engine_rules_block` - the
+            internals/compatibility bullet rules that must name the target
+            engine's own internal tables, not another engine's.
+    """
+    return (
+        _PROMPT_BODY.replace(_DIALECT_PLACEHOLDER, dialect_section)
+        .replace(_DIALECT_NAME_PLACEHOLDER, dialect_name)
+        .replace(_ENGINE_RULES_PLACEHOLDER, engine_rules_block)
+    )
 
 
 # SQLite's assembled prompt, unchanged by the split above: a sha256 test pins
 # this exact value because every evaluation figure this project has reported
 # was produced under this text.
-SQL_TRANSLATION_SYSTEM_PROMPT = _assemble_prompt(SQLiteEngine.prompt_dialect_section)
+SQL_TRANSLATION_SYSTEM_PROMPT = _assemble_prompt(
+    SQLiteEngine.prompt_dialect_section,
+    SQLiteEngine.prompt_dialect_name,
+    SQLiteEngine.prompt_engine_rules_block,
+)
 
 
 def _load_gemini_sdk() -> tuple[str, Any, Any | None]:
@@ -218,7 +239,11 @@ def generate_sql(
     system_prompt = (
         SQL_TRANSLATION_SYSTEM_PROMPT
         if engine is None
-        else _assemble_prompt(engine.prompt_dialect_section)
+        else _assemble_prompt(
+            engine.prompt_dialect_section,
+            engine.prompt_dialect_name,
+            engine.prompt_engine_rules_block,
+        )
     )
     schema_header = SQLiteEngine.schema_header if engine is None else engine.schema_header
     user_prompt = f"""\

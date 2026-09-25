@@ -246,6 +246,7 @@ def _repair_sql(
 ) -> str | None:
     if max_repair_attempts < 1:
         return None
+    dialect_name = engine.prompt_dialect_name
     repair_question = f"""\
 Repair the SQL for the original question.
 
@@ -255,10 +256,10 @@ Original question:
 Failed SQL:
 {failed_sql}
 
-SQLite error:
+{dialect_name} error:
 {error_text}
 
-Return only one corrected SQLite SELECT query.
+Return only one corrected {dialect_name} SELECT query.
 """
     try:
         return generate_sql(

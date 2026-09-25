@@ -416,6 +416,23 @@ DUCKDB DIALECT (must follow):
 - DuckDB supports EXTRACT, DATE_TRUNC and INTERVAL; prefer those over SQLite's strftime/date functions.
 - For dates/timestamps use DuckDB functions like: date_trunc('year', col), date_trunc('month', col), CAST(col AS DATE).
 """  # noqa: E501
+    # See `SQLiteEngine.prompt_dialect_name` for what this substitutes into
+    # and why it is a per-engine value rather than dialect-neutral text: the
+    # SQLite prompt's pinned bytes forced that choice, but nothing forces
+    # DuckDB's own copy to say "SQLite" - this is the fix for the Phase 3a
+    # review finding (2026-09-21) that every DuckDB generation and repair was
+    # instructed to write "a SINGLE SQLite SELECT query" and told SQLite's
+    # `=` is case-sensitive.
+    prompt_dialect_name: str = "DuckDB"
+    # DuckDB's own internal-tables rule, in place of SQLite's. Names the
+    # catalogue surfaces a DuckDB read-only connection can actually read
+    # (`duckdb_tables()`, `information_schema`, `pg_catalog` - see
+    # `internal_prefixes`/`internal_names` above for the full validator-level
+    # list) rather than sqlite_master, which does not exist in DuckDB.
+    prompt_engine_rules_block: str = """\
+- Do NOT reference duckdb_tables(), information_schema, pg_catalog, or any other internal DuckDB tables or functions.
+- Prefer simple SQL compatible with DuckDB.
+"""  # noqa: E501
 
     def __init__(self, dsn: str) -> None:
         """Hold the filesystem path to the DuckDB database file.

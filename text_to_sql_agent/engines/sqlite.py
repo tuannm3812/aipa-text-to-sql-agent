@@ -147,6 +147,24 @@ SQLITE DIALECT (must follow):
 - Do NOT use EXTRACT, DATE_TRUNC, ILIKE, INTERVAL, FILTER, DISTINCT ON.
 - For dates/timestamps use SQLite functions like: strftime('%Y', col), strftime('%Y-%m', col), date(col), datetime(col).
 """  # noqa: E501
+    # The dialect name `_PROMPT_BODY` in llm.py substitutes inline wherever it
+    # names the target dialect outside the labelled section above (the job
+    # statement and the case-insensitivity rule). Pinned to "SQLite" - not
+    # reworded to dialect-neutral phrasing - because the sha256 test in
+    # tests/test_llm.py pins the exact bytes of the assembled SQLite prompt,
+    # and this word appears in both spots today. See `DuckDBEngine`'s copy
+    # for the same substitution done correctly for a different engine.
+    prompt_dialect_name: str = "SQLite"
+    # Replaces `_PROMPT_BODY`'s two internals/compatibility bullet rules
+    # in-place (same byte-identity reasoning as `prompt_dialect_name` above).
+    # `Do NOT reference sqlite_master...` is SQLite's actual internal-tables
+    # rule - see `internal_prefixes`/`internal_names` above for what those
+    # are - not a generic template; `DuckDBEngine`'s copy names its own
+    # internals instead of repeating this one.
+    prompt_engine_rules_block: str = """\
+- Do NOT reference sqlite_master or any internal SQLite tables.
+- Prefer simple SQL compatible with SQLite.
+"""
 
     def __init__(self, dsn: str) -> None:
         """Hold the filesystem path to the SQLite database file.
