@@ -14,6 +14,55 @@ from ui.results import render_assistant_turn, result_to_dataframe
 from ui.settings import Settings
 
 
+def _run_query(
+    prompt: str,
+    *,
+    db_path: str,
+    model_name: str,
+    provider: str,
+    use_rag: bool,
+    rag_top_k: int,
+) -> tuple[str, backend.QueryResult]:
+    """Call the backend, turning any exception it raises into a `QueryResult` error.
+
+    `backend.ask_database_with_sql` talks to the configured database driver, and a
+    driver error (a PostgreSQL one, once Phase 3b adds that engine) can embed the
+    DSN it failed to reach, including its password. Left uncaught, that exception
+    would escape to Streamlit's default traceback renderer, which never sees
+    `ui.uploads.redact_dsn`. Catching it here and putting the raw exception text in
+    `QueryResult.error` routes it through the one redaction `ui.results.describe_error`
+    already applies to any unrecognised error code, instead of adding a second
+    redaction path.
+
+    Args:
+        prompt: The user's question.
+        db_path: The database path or DSN to query.
+        model_name: Provider-specific model identifier.
+        provider: `"gemini"` or `"ollama"`.
+        use_rag: Whether to retrieve a relevant schema subset.
+        rag_top_k: Number of schema chunks to retrieve when `use_rag` is set.
+
+    Returns:
+        Whatever `backend.ask_database_with_sql` returns on success, or `("",
+        QueryResult(...))` with the exception's text (not yet redacted) in `.error`
+        if it raised.
+    """
+    try:
+        return backend.ask_database_with_sql(
+            prompt,
+            db_path=db_path,
+            model_name=model_name,
+            provider=provider,
+            use_rag=use_rag,
+            rag_top_k=rag_top_k,
+        )
+    except Exception as exc:  # noqa: BLE001 - any backend/driver failure must reach
+        # the page redacted, not as a raw Streamlit traceback.
+        return "", backend.QueryResult(
+            columns=[], rows=[], sql=None, error=f"{type(exc).__name__}: {exc}"
+        )
+
+
 def render_sample_question(settings: Settings) -> None:
     """Render the active demo's blurb and its one-click sample question.
 
@@ -118,7 +167,7 @@ def render_chat(settings: Settings) -> None:
         st.session_state.messages.append({"role": "user", "content": prompt.strip()})
 
         with st.spinner("Generating SQL and running query..."):
-            sql_text, result = backend.ask_database_with_sql(
+            sql_text, result = _run_query(
                 prompt.strip(),
                 db_path=settings.db_path,
                 model_name=(settings.model_name or "").strip()
