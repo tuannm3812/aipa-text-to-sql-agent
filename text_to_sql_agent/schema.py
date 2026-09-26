@@ -1,7 +1,7 @@
 """Schema extraction: raw DDL and cached, retrieval-ready schema chunks.
 
 Both entry points delegate to the `Engine` resolved from the DSN by
-`open_engine`; today that is always `SQLiteEngine`.
+`open_engine` - SQLite, DuckDB or PostgreSQL, by DSN scheme.
 """
 
 from __future__ import annotations

@@ -15,10 +15,11 @@ read-only role holding no write grant, means a write is refused twice over:
 it, `InsufficientPrivilege` when only the role's grants would have.
 
 `prompt_dialect_section`, `prompt_dialect_name` and `prompt_engine_rules_block`
-are placeholders - Task 7 writes PostgreSQL's real prompt fragments.
-`allowed_functions` (Task 4, 2026-09-26) is PostgreSQL's own default-deny
-allowlist, matching `DuckDBEngine`'s Task 6b work - see that attribute's own
-comment for how it was built and verified.
+are PostgreSQL's own prompt fragments (Task 7), substituted into the shared
+prompt body by `llm.py`'s `_assemble_prompt`. `allowed_functions` (Task 4,
+2026-09-26) is PostgreSQL's own default-deny allowlist, matching
+`DuckDBEngine`'s Task 6b work - see that attribute's own comment for how it
+was built and verified.
 
 Task 5 (2026-09-26) hardened the schema-extraction methods below without
 widening what they expose - every catalogue query filtered to `public` alone,
@@ -808,9 +809,7 @@ POSTGRESQL DIALECT (must follow):
 - To collect several values into one row use string_agg(col, ', ') or array_agg(col); GROUP_CONCAT and LISTAGG do not exist in PostgreSQL.
 """  # noqa: E501
     # See `SQLiteEngine.prompt_dialect_name` for what this substitutes into
-    # and why it is a per-engine value. Already correct before this task -
-    # only `prompt_dialect_section` and `prompt_engine_rules_block` were
-    # placeholders.
+    # and why it is a per-engine value.
     prompt_dialect_name: str = "PostgreSQL"
     # PostgreSQL's own internal-catalogue rule, in place of SQLite's
     # `sqlite_master`/DuckDB's `duckdb_tables()`. Names exactly the two

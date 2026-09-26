@@ -28,10 +28,9 @@ def redact_dsn(text: str) -> str:
     matching substring is replaced, so passing through an arbitrary error
     message is safe.
 
-    No PostgreSQL engine exists yet, but its DSN form
-    (`postgresql://user:password@host/db`) is exactly what this guards
-    against, so Phase 3b inherits working redaction instead of adding it
-    under time pressure.
+    PostgreSQL's DSN form (`postgresql://user:password@host/db`) is the
+    credential-bearing case this guards against: `engines/postgres.py`
+    connects with exactly that string, and a driver error can echo it.
 
     Args:
         text: Text that may contain a DSN with embedded credentials.

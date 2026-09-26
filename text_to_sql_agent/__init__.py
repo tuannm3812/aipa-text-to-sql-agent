@@ -1,4 +1,4 @@
-"""Text-to-SQL agent package: natural language to safe, read-only SQLite queries.
+"""Text-to-SQL agent package: natural language to safe, read-only SQL queries.
 
 Re-exports the public surface used by `app.py` and the evaluation scripts -
 configuration defaults, environment loading, schema retrieval, SQL

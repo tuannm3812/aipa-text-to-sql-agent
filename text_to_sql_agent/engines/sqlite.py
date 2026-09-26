@@ -158,9 +158,9 @@ class SQLiteEngine:
     # split existed. `tests/test_llm.py` pins this exact string.
     schema_header: str = "SQLite schema (DDL)"
     # This block must stay byte-identical to the corresponding lines of
-    # SQL_TRANSLATION_SYSTEM_PROMPT in llm.py: a future task assembles the
-    # prompt from a shared body plus this per-engine section and pins the
-    # result with a sha256 test. The long line is intentionally not
+    # SQL_TRANSLATION_SYSTEM_PROMPT in llm.py: `llm.py`'s `_assemble_prompt`
+    # builds the prompt from a shared body plus this per-engine section, and
+    # `tests/test_llm.py` pins the result with a sha256 test. The long line is intentionally not
     # wrapped - an unexpected mid-sentence newline would be a real change
     # to text the model reads, not just a formatting choice, so line
     # length loses to fidelity here (llm.py carries the same exclusion).
