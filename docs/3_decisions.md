@@ -2,7 +2,178 @@
 
 Newest first. Each entry states what was chosen and what it ruled out.
 
+## 2026-09-27 — PostgreSQL executes under a pinned `search_path`; the engine qualifies tables itself
+
+**Owner-approved design.** Supersedes nothing; closes what the 2026-09-26
+"function identity, not spelling" entry below could not reach.
+
+**The hole.** PostgreSQL resolves functions, **operators** and types through
+`search_path`, and an exact argument-type match in any schema on it beats a
+built-in that needs a cast, whatever the path order. The function-identity fix
+pins a call's *name*; an operator has no name the allowlist can see. Reproduced
+by the owner and re-reproduced by `tests/test_postgres_search_path_pin.py` at
+BASE `3cf40dc`: with a `SECURITY DEFINER public.||(text, integer)` operator
+reading a table `aipa_ro` cannot access, `SELECT name || 1 FROM customers`
+validated and returned `PROBE_SECRET` for every row; a `public.=(text,
+integer)` operator made `WHERE name = 1` match every row.
+
+**Chosen:**
+
+1. **Every connection `PostgresEngine` opens runs `SET LOCAL search_path =
+   pg_catalog`** (`engines/postgres.py::_pin_search_path`) inside its existing
+   read-only transaction - `execute()`, and also the catalogue reads, whose own
+   unqualified `unnest`/`array_agg`/`array_position`/`=` were exposed to the
+   same shadowing. Unqualified functions, operators and types then resolve to
+   built-ins or not at all: the operator bypass returns `Alice1`/`Bob1` from
+   the built-in `||`, the `=` bypass fails with `UndefinedFunction` (no
+   `text = integer` exists in `pg_catalog`), and a bare `lower(customer_id)`
+   against a `public.lower(integer)` overload fails with `UndefinedFunction`
+   even with the validator bypassed.
+2. **The engine schema-qualifies every bare table reference before executing**
+   (`safety.qualify_bare_table_references`), because under the pin the server
+   no longer resolves bare table names at all. The schema comes from
+   `postgres.py::resolve_bare_relation_names` - the same function that decides
+   which chunks are spelled bare - so see the next entry for the resolution
+   model.
+3. **Two validator rules for spellings that name their own schema**, which the
+   pin cannot reach: `_references_non_catalog_operator` refuses
+   `OPERATOR(schema.op)` unless the schema is exactly `pg_catalog`, and
+   `_references_non_catalog_qualified_type` refuses a `::schema.type` /
+   `CAST(x AS schema.type)` (including inside an array type) unless the schema
+   folds to `pg_catalog`. Both gated on `safety._PINNED_SEARCH_PATH_DIALECTS`
+   (`postgres` only), pinned to `PostgresEngine.sqlglot_dialect` by a test.
+   Before this, a qualified cast was refused only by accident - the dot-call
+   rule read `public.sometype` as `(public).sometype` sugar - and a user type
+   named after an allowlisted function (`public.lower`, with a
+   `SECURITY DEFINER` cast from `text`) validated and leaked the secret at
+   BASE.
+4. **`3cf40dc`'s shadowed-function check is kept**, as defence in depth. Under
+   the pin its bare-spelling half is redundant for execution - the overload's
+   schema is no longer searched - but it still refuses the query before it
+   reaches the server and does not depend on the pin being present on every
+   execution path. Its structural half (`public.lower(x)`) is still the only
+   refusal for an explicitly qualified call.
+
+**Splice, not regenerate.** The rewrite inserts `"schema".` immediately before
+each qualifying table identifier at the source offset sqlglot's tokenizer
+recorded, then re-parses the result and requires it to equal the original AST
+with exactly those qualifiers added (`TableQualificationError` otherwise;
+nothing runs). Regenerating the statement from the AST was ruled out: sqlglot's
+generator canonicalises function names, rewrites `::` casts, re-parenthesises
+and moves comments, so the executed text would differ from the validated text
+in exactly the positions `is_safe_query` inspected. A splice leaves every
+function, operator, cast, alias and comment byte-identical and keeps the
+table identifier's own case and quoting. Only nodes `_relation_kind` - the
+validator's own classifier - calls base tables are qualified; never a CTE
+reference (coarsely: any name spelled like a CTE anywhere in the statement,
+because PostgreSQL's `WITH RECURSIVE` lets a CTE see a later sibling), a
+function scan, `unnest`, `ROWS FROM`, `VALUES`, a derived table, or a
+`FOR UPDATE OF` name. A bare name nothing resolves is left bare, which under
+the pin fails closed.
+
+**Fidelity proof.** `tests/test_engine_postgres.py::test_pinned_qualified_
+execution_matches_the_server_unpinned` runs PostgreSQL's 35-query analytics
+corpus and the 12 `_LEGITIMATE_QUALIFIED_COLUMN_QUERIES` both ways - original
+text on `aipa_ro`'s stock path, rewritten text under the pin. 47 queries: 46
+return identical columns and rows, and 1 (`SELECT g.generate_series FROM
+generate_series(1,5) g`, previously only ever validated) is refused by
+PostgreSQL itself on the stock path and is refused with the same SQLSTATE
+under the pin. 43 of the 47 were rewritten, with 51 qualifiers inserted; the
+test also asserts that removing every inserted `"public".` gives back the
+original text exactly.
+
+**Shown SQL is the executed SQL.** `PostgresEngine.execute` returns the
+qualified text in `QueryResult.sql`, and `pipeline.ask_database_with_sql`
+returns `result.sql` once execution returns, so the UI shows the SQL that
+produced the rows beside it. The generated draft was ruled out: it is not what
+ran, and pasted into `psql` under a different `search_path` it can answer
+from a different table. SQLite and DuckDB return exactly the SQL they were
+given, so their shown SQL is unchanged. Gold evaluation compares result rows,
+not SQL, and still scores 12/12.
+
+**Ruled out:**
+
+- **Blocking operator symbols** (the owner's earlier alternative), because
+  extensions such as `citext` (`=`) and `pg_trgm` (`%`) install operators into
+  `public`. See the cost below: the pin does not preserve them either.
+- **Putting `pg_catalog` first** rather than alone: re-verified 2026-09-26
+  that order does not beat an exact-type match in a later schema.
+- **Letting the server keep resolving bare tables** (pinning only functions
+  and operators): impossible - `search_path` is one setting for all four.
+
+**Cost - measured, and not what the owner's rationale assumed.** The pin
+cannot tell an extension's operators in `public` from a hostile one there.
+`tests/test_postgres_search_path_pin.py::test_the_pin_changes_what_extension_
+operators_in_public_mean` records, live: a `citext` column compared with `=`
+returns its row on the stock path and **no rows** under the pin, with no
+error, because `pg_catalog`'s `text = text` is reached through citext's
+implicit cast and is case-sensitive; `pg_trgm`'s `%` fails with
+`UndefinedFunction`. So the pin breaks `pg_trgm` loudly, like symbol-blocking
+would have, and breaks `citext` **silently**, which symbol-blocking would not
+have. No demo database uses either extension. Flagged for an owner decision
+in `docs/6_agent_log.md`'s 2026-09-27 entry.
+
+**Residual, stated plainly.** Behaviour bound to a column's *type* is not
+resolved through `search_path`: a user-defined type's I/O functions and a
+`pg_cast` cast from it run whenever such a column is read or cast. Reaching it
+needs a user-defined type on a column of a table this agent advertises, i.e. a
+principal who can already put arbitrary data in front of the model. The same
+honest precondition as the function-identity entry applies throughout:
+`aipa_ro` cannot create any of these objects itself.
+
+## 2026-09-27 — the search path is PostgreSQL's default: schema scope follows it
+
+**Refines** "schema scope is opt-in, via `AIPA_EXTRA_SCHEMAS`" (2026-09-26,
+below). Resolves Codex's Finding 2.
+
+**Chosen:** `PostgresEngine` reads every schema on the connecting role's
+effective search path, plus `AIPA_EXTRA_SCHEMAS` for schemas **outside** it
+(`engines/postgres.py::_scope_schema_names`, which replaced
+`_user_schema_names`). The path is `pg_catalog.current_schemas(false)`, read
+before the pin - verified live on PostgreSQL 16 to be ordered, `"$user"`
+expanded, and to omit schemas that do not exist, schemas the role holds no
+`USAGE` on, and the implicitly searched `pg_catalog` (an explicitly listed one
+is kept in position). Internal schemas are never in scope, however they
+arrive. A bare name resolves to the **first** path schema holding any
+`pg_class` entry of that name, readable or not
+(`resolve_bare_relation_names`) - what the server's own lookup does - and
+that one function decides which chunks are spelled bare (`SchemaChunk.
+home_schema` records where a bare chunk really lives), what `table_names()`
+advertises bare, and the schema `execute()` writes into the SQL. A shadowed
+table is advertised under its qualified spelling only; a bare name whose first
+match the role cannot read is not advertised bare at all.
+
+**Ruled out:** keeping `current_schema()` (the first path entry only) - the
+validator refused `SELECT * FROM customers` while the server answered it from
+`public` (Codex's probe, reproduced as `tests/test_postgres_search_path_pin.
+py::test_a_bare_name_falls_through_to_a_later_search_path_schema`, which fails
+at BASE); rejecting any multi-schema path outright - it would refuse the stock
+`"$user", public` path the moment a role-named schema exists; parsing
+`SHOW search_path` ourselves - `current_schemas` already applies the server's
+own existence and privilege rules.
+
+**This changes what reaches the LLM**, relative to the 2026-09-26 decision's
+"default schema only": on a path with more than one existing schema, the
+tables of every one of them are now sent, where only the first's were before.
+It is faithful to that decision's reasoning, which was never "one schema" but
+"nothing the deployment did not choose": a schema reaches the provider only
+because it is on the role's search path - a deliberate, per-role server
+setting that already makes its tables answer to bare names in every client -
+or because an operator named it in `AIPA_EXTRA_SCHEMAS`. A schema the role can
+merely read, granted for some unrelated tool, is still invisible. On the stock
+path with no role-named schema, the path is `public` alone and nothing changes.
+
+**Why it had to be one function.** Phase 3b produced the same
+advertised-then-rejected inversion repeatedly, each time from two layers holding
+two answers to "what does this bare name mean". Under the pin the server no
+longer holds an answer at all, so the engine's answer is the only one - used
+by the validator and enforced by the executor.
+
 ## 2026-09-26 — function identity, not spelling: closing the allowlist-overload bypass
+
+**Extended 2026-09-27** by the pinned-`search_path` entry above, which closes
+the operator half this entry could not reach. Both checks chosen here are
+kept; rule 2 is now defence in depth for execution.
 
 **Chosen:** Two independent checks in `safety.py`, both gated the same way
 the existing dot-call rules are (`_DOT_CALL_DIALECTS`, PostgreSQL only), plus
@@ -153,6 +324,11 @@ new tests (`test_check_reachable_refuses_a_superuser_dsn` et al.) call
 itself honest.
 
 ## 2026-09-26 — schema scope is opt-in, via `AIPA_EXTRA_SCHEMAS`
+
+**Refined 2026-09-27** by "the search path is PostgreSQL's default" above: for
+PostgreSQL, "its own default schema" now means every schema on the role's
+effective search path, and `AIPA_EXTRA_SCHEMAS` names schemas outside it. The
+opt-in principle below is unchanged.
 
 **Chosen:** `PostgresEngine`/`DuckDBEngine` read only their own default
 schema (`public`/`main`) plus whatever schema names

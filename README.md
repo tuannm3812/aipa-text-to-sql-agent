@@ -154,11 +154,15 @@ Then select `ollama` in the Streamlit sidebar.
 ### Reading tables outside the default schema
 
 DuckDB and PostgreSQL group tables into schemas. By default this agent reads
-**only** the connection's default schema — `main` for DuckDB, whatever
-`current_schema()` returns for PostgreSQL, normally `public` — so a schema's
-table names, columns and DDL are never sent to the LLM provider just because
-the connecting role happens to be able to read them. To include others, list
-them in `AIPA_EXTRA_SCHEMAS`, comma-separated:
+**only** the connection's default schemas — `main` for DuckDB; for PostgreSQL,
+every schema on the connecting role's effective `search_path` (normally just
+`public`, or `aipa_ro, public` if a schema named after the role exists) — so a
+schema's table names, columns and DDL are never sent to the LLM provider just
+because the connecting role happens to be able to read them. On PostgreSQL a
+bare table name means exactly what it would mean in `psql` as that role: the
+first search-path schema holding that name wins, and a table it shadows is
+shown and accepted only under its `schema.table` spelling. To include schemas
+outside the default ones, list them in `AIPA_EXTRA_SCHEMAS`, comma-separated:
 
 ```bash
 AIPA_EXTRA_SCHEMAS=analytics,reporting
@@ -178,7 +182,16 @@ recognise: check `AIPA_EXTRA_SCHEMAS` first. Set once per deployment, read
 once per engine instance, and included in the schema cache key, so changing it
 re-reads the catalogue rather than serving a stale scope. See
 `docs/3_decisions.md`'s "schema scope is opt-in, via `AIPA_EXTRA_SCHEMAS`"
-entry for what else was considered.
+entry for what else was considered, and its 2026-09-27 "the search path is
+PostgreSQL's default" entry for why PostgreSQL's default is the whole path.
+
+PostgreSQL queries run with `search_path` pinned to `pg_catalog`, so the agent
+schema-qualifies each table itself before running it; the SQL shown beside a
+result is that qualified text (`SELECT name FROM "public".customers`), because
+it is what actually ran. One consequence to know about: operators an extension
+installed on the search path are not used. `citext` columns compare
+case-sensitively (silently — fewer rows, no error) and `pg_trgm`'s `%` fails
+with "operator does not exist". See `docs/3_decisions.md`'s 2026-09-27 entry.
 
 ## Run The App
 
