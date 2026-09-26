@@ -390,3 +390,22 @@ def test_repair_user_prompt_names_postgresqls_dialect(postgres_dsn: str) -> None
     assert "corrected PostgreSQL SELECT query" in repair_user_prompt
     assert "SQLite error:" not in repair_user_prompt
     assert "corrected SQLite SELECT query" not in repair_user_prompt
+
+
+def test_ask_database_with_sql_shows_the_sql_postgresql_actually_ran(postgres_dsn: str) -> None:
+    """Shown-SQL decision (2026-09-27): on PostgreSQL the engine schema-qualifies
+    each bare table before running it under the pinned search path, and the UI
+    shows the SQL that produced the rows - the qualified text, not the model's
+    bare draft. SQLite's and DuckDB's shown SQL is unchanged, since they return
+    exactly what they were given (`test_ask_database_with_sql_returns_generated_sql`).
+    """
+    with patch(
+        "text_to_sql_agent.pipeline.generate_sql",
+        return_value="SELECT name FROM customers ORDER BY customer_id",
+    ):
+        sql, result = agent.ask_database_with_sql("list customers", db_path=postgres_dsn)
+
+    assert result.ok, result.error
+    assert sql == 'SELECT name FROM "public".customers ORDER BY customer_id'
+    assert result.sql == sql
+    assert result.rows == [("Alice",), ("Bob",)]

@@ -115,8 +115,13 @@ def ask_database_with_sql(
     Returns:
         A `(sql, QueryResult)` tuple. `sql` is `""` if generation itself
         failed; otherwise it is the SQL that was attempted (repaired SQL
-        replaces the original once a repair succeeds). See `ask_database`
-        for the `QueryResult.error` values used.
+        replaces the original once a repair succeeds). Once execution
+        returns, it is the SQL the engine reports it actually ran
+        (`QueryResult.sql`) - identical to the generated text on SQLite and
+        DuckDB, and on PostgreSQL the same text with each bare table
+        schema-qualified (2026-09-27, `PostgresEngine.execute`), because that
+        is what produced the rows shown beside it. See `ask_database` for the
+        `QueryResult.error` values used.
 
     Raises:
         EngineUnreachableError: If `db_path` cannot be reached by its engine.
@@ -145,7 +150,8 @@ def ask_database_with_sql(
         return sql, QueryResult(columns=[], rows=[], sql=sql, error="BLOCKED_UNSAFE_SQL")
 
     try:
-        return sql, execute_query(db_path, sql)
+        result = execute_query(db_path, sql)
+        return result.sql or sql, result
     except Exception as e:
         error_text = f"{type(e).__name__}: {e}"
         repaired_sql = _repair_sql(
@@ -160,7 +166,8 @@ def ask_database_with_sql(
         )
         if repaired_sql and is_safe_query(repaired_sql, engine=engine):
             try:
-                return repaired_sql, execute_query(db_path, repaired_sql)
+                repaired_result = execute_query(db_path, repaired_sql)
+                return repaired_result.sql or repaired_sql, repaired_result
             except Exception as repaired_error:
                 error_text = f"{type(repaired_error).__name__}: {repaired_error}"
         return sql, QueryResult(columns=[], rows=[], sql=sql, error=error_text)
