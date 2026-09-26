@@ -45,22 +45,28 @@ from .base import (
 # `safety.py` accepted no other qualifier and a table it could not accept
 # must not be advertised (`docs/3_decisions.md`: "DuckDB support is scoped to
 # the `main` schema, consistently across every layer"). Task 6 replaced that
-# placeholder: every schema of the opened database is read, each table keeps
-# its schema in `SchemaChunk.schema_name`, and `table_names()` advertises the
+# placeholder: a table outside the default schema keeps its schema in
+# `SchemaChunk.schema_name`, and `table_names()` advertises the
 # `schema.table` spelling the validator now accepts - so the two failures the
 # 2026-09-21 review found stay closed by *agreement* between the layers
 # rather than by narrowing all three. Both remain pinned by
-# `tests/test_engine_duckdb.py`'s cross-schema regression tests.
+# `tests/test_engine_duckdb.py`'s cross-schema regression tests. Task 6
+# initially made that scope "every schema of the opened database"; the
+# decision immediately below narrowed it to an opt-in before the phase
+# closed, and the opt-in is what ships - every catalogue query in this module
+# reads `_allowed_schemas()`.
 _DEFAULT_SCHEMA = "main"
 
-# Decision (2026-09-26): reading "every schema of the opened database" (the
-# comment above) is no longer unconditional - it is scoped to `_DEFAULT_
-# SCHEMA` plus whatever `engines/base.py`'s `extra_schemas_from_env()` opts
-# into (`AIPA_EXTRA_SCHEMAS`). Unlike PostgreSQL, DuckDB has no privilege
-# model to fall back on: opening the file grants access to every schema in
-# it, so the opt-in is the *only* gate here, not a second one alongside a
-# `has_schema_privilege` check. See `DuckDBEngine.__init__` and `Postgres
-# Engine`'s module docstring for the shared reasoning.
+# Decision (2026-09-26): reading "every schema of the opened database" (Task
+# 6's first shape, recorded in the comment above) is not what this engine
+# does - scope is `_DEFAULT_SCHEMA` plus whatever `engines/base.py`'s
+# `extra_schemas_from_env()` opts into (`AIPA_EXTRA_SCHEMAS`), resolved by
+# `_allowed_schemas()` and read by every catalogue query below. Unlike
+# PostgreSQL, DuckDB has no privilege model to fall back on: opening the file
+# grants access to every schema in it, so the opt-in is the *only* gate here,
+# not a second one alongside a `has_schema_privilege` check. See
+# `DuckDBEngine.__init__` and `PostgresEngine`'s module docstring for the
+# shared reasoning.
 
 # Schemas that belong to DuckDB itself rather than to the user's data. They
 # are not in `duckdb_tables()`'s output for a file database (probed
@@ -112,10 +118,11 @@ def _quote_qualified(schema_name: str, table_name: str) -> str:
     An unqualified quoted table name resolves against DuckDB's search path
     (`main` by default), which is exactly how a value-hint query for one
     `main`-schema table silently read a same-named table in another schema -
-    see `_DEFAULT_SCHEMA`'s comment. Since Task 6 reads every schema, this is
-    no longer belt-and-braces alongside a `main`-only filter: it is the whole
-    guard. A value-hint query for `analytics.shared` must read exactly that
-    table, never `main.shared`, whichever the search path would have found.
+    see `_DEFAULT_SCHEMA`'s comment. Since a second schema can be opted into
+    (`AIPA_EXTRA_SCHEMAS`), this is no longer belt-and-braces alongside a
+    `main`-only filter: it is the whole guard. A value-hint query for
+    `analytics.shared` must read exactly that table, never `main.shared`,
+    whichever the search path would have found.
     """
     return _quote_identifier(schema_name) + "." + _quote_identifier(table_name)
 
@@ -660,7 +667,7 @@ DUCKDB DIALECT (must follow):
         return table_name if schema_name == self.default_schema else f"{schema_name}.{table_name}"
 
     def raw_schema(self) -> str:
-        """Extract CREATE TABLE statements for every user table, every schema.
+        """Extract CREATE TABLE statements for every user table in scope.
 
         DuckDB's own stored DDL already spells each table the way a query
         must: `CREATE TABLE analytics.sales(...)` for a table outside the
@@ -698,9 +705,10 @@ DUCKDB DIALECT (must follow):
     def schema_chunks(self) -> list[SchemaChunk]:
         """Build table-level schema chunks for retrieval without reading row data.
 
-        Every catalogue query reads every schema of the opened database, and
-        every intermediate map is keyed by `(schema_name, table_name)` rather
-        than by bare `table_name`. That keying is what the 2026-09-25 review
+        Every catalogue query reads `_allowed_schemas()` - `default_schema`
+        plus whatever `AIPA_EXTRA_SCHEMAS` opted into - and every intermediate
+        map is keyed by `(schema_name, table_name)` rather than by bare
+        `table_name`. That keying is what the 2026-09-25 review
         finding was really about: with a bare-name key, `main.shared` and
         `analytics.shared` merge into one entry, and the value-hint query for
         the merged result asks for a column only one of them has - the live

@@ -100,13 +100,24 @@ the validator.
 **Supersedes** the 2026-09-25 entry below, which was explicitly a placeholder
 for this work.
 
+**Partly superseded, same day, by "schema scope is opt-in, via
+`AIPA_EXTRA_SCHEMAS`" above.** What this entry decided — one schema-qualified
+identity, produced by the engine and consumed unchanged by every layer — still
+holds in full and is what ships. Only the *size of the universe* it is applied
+to changed: the two claims marked below described a scope that was widened
+here and then narrowed by owner decision before the phase closed. Neither
+engine reads every schema it can query; both read their own default schema
+plus whatever `AIPA_EXTRA_SCHEMAS` opts into.
+
 **Chosen:** One identity, produced by the engine and consumed unchanged by
 every layer. `SchemaChunk` gains `schema_name`, set only when the table is
 outside the engine's `default_schema`, and `qualified_name` renders it
-(`analytics.thing` outside, bare `customers` inside). DuckDB and PostgreSQL
-read every schema they can actually query — PostgreSQL through
-`_user_schema_names`, which asks `has_schema_privilege`, and neither reads
-`pg_catalog`, `information_schema` or any other `pg_*`. `Engine.table_names()`
+(`analytics.thing` outside, bare `customers` inside). ~~DuckDB and PostgreSQL
+read every schema they can actually query~~ — **superseded, see above:** both
+read their default schema plus the `AIPA_EXTRA_SCHEMAS` opt-in, PostgreSQL
+through `_user_schema_names`, which additionally asks `has_schema_privilege`
+on each opted-in name, and neither reads `pg_catalog`, `information_schema` or
+any other `pg_*`. `Engine.table_names()`
 returns two spellings for a default-schema table (bare *and* qualified) and
 exactly one for every other (qualified only), via the single shared
 implementation `engines/base.py::table_name_spellings`. `safety.py`'s
@@ -147,9 +158,11 @@ refactor of value-hint or chunk-keying code must still hit the
 `BinderException` they were written for.
 
 **Cost:** the table and column universes the default-deny validator checks
-against are now larger — every schema the role may use, not one. That is the
-same set the engine would execute against, so it is not a widening relative to
-reality, and the internals rules (`pg_catalog.*`, `information_schema.*`,
+against are now larger — ~~every schema the role may use, not one~~
+(**superseded, see above:** the default schema plus the `AIPA_EXTRA_SCHEMAS`
+opt-in, so on a deployment that sets nothing the universe is unchanged at one
+schema). That is the same set the engine would execute against, so it is not a
+widening relative to reality, and the internals rules (`pg_catalog.*`, `information_schema.*`,
 `sqlite_*`) are name rules that consult no table list and are unaffected.
 `tests/test_schema_identity.py::test_the_closed_bypasses_stay_closed_with_a_
 second_schema` re-runs this phase's closed bypasses against a database that

@@ -388,13 +388,17 @@ class Engine(Protocol):
 
         Must not read row data beyond low-cardinality value hints.
 
-        Every schema the engine can actually query is in scope, not just
-        `default_schema` - a chunk for a table outside it sets
-        `SchemaChunk.schema_name`, so `chunk.qualified_name` is the spelling
-        a query must use and the spelling `table_names()` advertises. What
-        `raw_schema()` shows the model and what `table_names()` accepts must
-        agree table for table: `docs/3_decisions.md`'s 2026-09-25 entry is
-        what happens when they do not.
+        Scope is `default_schema` plus whatever `AIPA_EXTRA_SCHEMAS` opts
+        into (`extra_schemas_from_env()` above), and nothing else - an
+        engine must not read a schema simply because it is able to. On a
+        deployment that sets nothing, that is one schema. A chunk for a
+        table outside `default_schema` sets `SchemaChunk.schema_name`, so
+        `chunk.qualified_name` is the spelling a query must use and the
+        spelling `table_names()` advertises. What `raw_schema()` shows the
+        model, what `schema_chunks()` yields and what `table_names()` accepts
+        must all resolve the opted-in set the same way and agree table for
+        table: `docs/3_decisions.md`'s 2026-09-25 entry is what happens when
+        they do not.
         """
         ...
 
@@ -450,7 +454,10 @@ class Engine(Protocol):
         one schema to every schema the role can read, which silently widened
         that union to every column in the database and re-armed the bypass -
         a table named after a single-argument catalogue function in any
-        readable schema was enough. The validator now resolves each qualifier
+        readable schema was enough. (That widening was itself narrowed to the
+        `AIPA_EXTRA_SCHEMAS` opt-in later the same day, but the per-table
+        keying stands on its own: an opted-in schema can carry exactly the
+        same hostile column name.) The validator now resolves each qualifier
         against the one table it names, so a function scan (which has no table
         columns at all) can no longer borrow another table's column name. See
         `table_column_spellings`, which every engine implements this with.
