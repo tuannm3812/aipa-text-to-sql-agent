@@ -45,7 +45,7 @@ def engine_with_table_t(tmp_path_factory):
     Module-scoped rather than rebuilt per test: nothing in this file mutates
     the database (`engine.execute` is never called against it - only
     `is_safe_query`, which is read-only validation), so one file safely backs
-    every test that needs it, including the 127-way `test_allowed_function_
+    every test that needs it, including the 129-way `test_allowed_function_
     round_trip` parametrization and the ~1,800-check catalogue sweep.
 
     No column is referenced by name in `is_safe_query`'s own checks - it
@@ -388,13 +388,17 @@ def _round_trip_snippet(name: str) -> str:
         return "current_date"
     if name == "now":
         return "now()"
+    if name == "current_timestamp":
+        return "current_timestamp"
+    if name == "collate":
+        return "a COLLATE NOCASE"
     return f"{name}{_SCALAR_FUNCTION_ARGS[name]}"
 
 
 @pytest.mark.parametrize("name", sorted(DuckDBEngine.allowed_functions))
 def test_allowed_function_round_trip(name, engine_with_table_t):
     """The hardest part of this task, proven directly: for every one of the
-    127 names in `DuckDBEngine.allowed_functions`, a realistic call using
+    129 names in `DuckDBEngine.allowed_functions`, a realistic call using
     that name parses under the DuckDB dialect, and `safety._resolve_function_
     name` resolves the parsed node back to a name that is itself in
     `allowed_functions` - not necessarily the same literal spelling
@@ -1077,6 +1081,55 @@ def test_duckdb_struct_field_access_is_not_treated_as_a_column_call(tmp_path):
     result = engine.execute(sql, max_rows=10, work_limit=0)
     assert result.ok, result.error
     assert result.rows == [(7,)]
+
+
+# Final whole-phase review, 2026-09-26. The PostgreSQL half of this phase
+# added `"collate"` to `PostgresEngine.allowed_functions` with a comment
+# explaining that `exp.Collate` is an `exp.Func` subclass wrongly refused by
+# default-deny. Every word of that applies to DuckDB, which also uses
+# default-deny and also supports `COLLATE` - the entry was simply never
+# mirrored. Sweeping the whole set difference (`PostgresEngine.
+# allowed_functions - DuckDBEngine.allowed_functions`) turned up one more of
+# the same kind, `current_timestamp` (`exp.CurrentTimestamp`, also pure
+# grammar, also an `exp.Func` subclass), and one that is *not*: `initcap`,
+# which DuckDB genuinely does not register (`Catalog Error: Scalar Function
+# with name initcap does not exist`, verified 2026-09-26) and which therefore
+# correctly stays off this list.
+_PURE_GRAMMAR_PARSED_AS_A_FUNCTION: list[tuple[str, str]] = [
+    ("collate", "SELECT name FROM customers ORDER BY name COLLATE NOCASE"),
+    ("current_timestamp", "SELECT CURRENT_TIMESTAMP AS t FROM customers"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,sql",
+    _PURE_GRAMMAR_PARSED_AS_A_FUNCTION,
+    ids=[label for label, _ in _PURE_GRAMMAR_PARSED_AS_A_FUNCTION],
+)
+def test_pure_grammar_parsed_as_a_function_is_allowed(analytics_db, label, sql):
+    """Both spellings are SQL grammar rather than a call to any DuckDB
+    catalogue entry, and DuckDB itself runs both - so a refusal here is a
+    pure false rejection. Validated *and* executed, because the whole reason
+    the gap existed is that nothing previously ran these through the real
+    engine.
+    """
+    assert is_safe_query(sql, engine=analytics_db), f"wrongly rejected ({label}): {sql!r}"
+    result = analytics_db.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok, f"{sql!r} failed to execute: {result.error}"
+
+
+def test_allowlist_parity_with_postgres_is_deliberate():
+    """The set difference above is a decision, not drift. Anything
+    PostgreSQL allows and DuckDB does not must be a name DuckDB genuinely
+    lacks - if a third pure-grammar node ever lands here, this fails rather
+    than silently costing users a legal query.
+    """
+    from text_to_sql_agent.engines.postgres import PostgresEngine
+
+    assert PostgresEngine.allowed_functions is not None
+    assert DuckDBEngine.allowed_functions is not None
+    only_postgres = PostgresEngine.allowed_functions - DuckDBEngine.allowed_functions
+    assert only_postgres == {"initcap"}
 
 
 def test_analytics_corpus_size_is_at_least_forty():

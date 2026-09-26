@@ -425,6 +425,18 @@ class DuckDBEngine:
             "age",
             "current_date",
             "now",
+            # `CURRENT_TIMESTAMP` is SQL grammar, not a call to any DuckDB
+            # catalogue entry, but sqlglot parses it to `exp.CurrentTimestamp`
+            # - an `exp.Func` subclass whose `.sql_name()` resolves to
+            # `"current_timestamp"` - so `find_all(exp.Func)` reaches it and
+            # default-deny refused it, exactly as it refused `COLLATE` below.
+            # Found alongside that entry in the 2026-09-26 final review, which
+            # swept every name `PostgresEngine.allowed_functions` carries that
+            # this list lacks. Verified 2026-09-26: DuckDB itself runs
+            # `SELECT CURRENT_TIMESTAMP` fine, and `now()` being listed here
+            # does not cover it - the two spellings parse to different nodes
+            # (`exp.Anonymous("now")` vs `exp.CurrentTimestamp`).
+            "current_timestamp",
             "strftime",
             "strptime",
             "epoch",
@@ -463,6 +475,19 @@ class DuckDBEngine:
             "case",
             "cast",
             "try_cast",
+            # `ORDER BY name COLLATE NOCASE` is ordinary SQL grammar, not a
+            # call to any DuckDB catalogue entry, but sqlglot's `exp.Collate`
+            # is an `exp.Func` subclass for parsing convenience the same way
+            # `case`/`if`/`cast` are - its own `.sql_name()` resolves to
+            # `"collate"`, so `find_all(exp.Func)` reaches it and default-deny
+            # refused it (verified 2026-09-26: DuckDB itself runs the query).
+            # `PostgresEngine.allowed_functions` carried this entry from the
+            # round that added it; every word of its reasoning applies here
+            # too, since DuckDB also uses default-deny and also supports
+            # `COLLATE`. Safe to allow for the same reason: the right-hand
+            # identifier only ever names a collation, exposing at most whether
+            # that collation exists, never row data or catalogue contents.
+            "collate",
             # -- List and JSON access --
             "list_extract",
             "list_value",
