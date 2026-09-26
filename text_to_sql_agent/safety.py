@@ -47,6 +47,19 @@ def _no_table_columns() -> Mapping[str, frozenset[str]]:
     return {}
 
 
+def _no_shadowed_function_names() -> frozenset[str]:
+    """The `get_shadowed_function_names` default for SQLite and every other engine.
+
+    Same shape as `_no_table_names`/`_no_table_columns`, and never called in
+    practice for the identical reason: `is_safe_query` only ever builds this
+    closure from `Engine.shadowed_function_names` when `allowed_functions is
+    not None`, using this default otherwise (`engine=None`, i.e. SQLite's own
+    default path). Exists so that path has a value of the right type without
+    instantiating an engine or performing catalogue I/O.
+    """
+    return frozenset()
+
+
 # sqlglot parses many function calls into typed classes (`exp.Count`,
 # `exp.Upper`, `exp.TimestampTrunc`, ...) rather than leaving them as
 # `exp.Anonymous`. Each typed class's own `.sql_name()` is sqlglot's
@@ -353,6 +366,182 @@ def _references_disallowed_function(
         if _dispatches_to_disallowed_function(
             function, resolved, allowed_functions=allowed_functions
         ):
+            return True
+    return False
+
+
+# Finding 1 fix (Codex review of the Phase 3b closeout, 2026-09-26): the
+# allowlist pinned a call's *spelling*, never its resolved `pg_proc` identity.
+# `_references_disallowed_function` above accepts any call whose resolved
+# name is in `allowed_functions`, regardless of which schema PostgreSQL's own
+# lookup would actually dispatch it to. Reproduced live: a `public.lower(
+# integer)` overload - reachable both as `public.lower(x)` and as the bare
+# `lower(x)`, since an exact `integer` match beats `pg_catalog.lower(text)`
+# plus an implicit cast - let a `SECURITY DEFINER` function run under the
+# audited name `lower` and read data `aipa_ro` had no grant on at all. Two
+# independent rules close it, mirroring this file's standing "two defences,
+# not one" principle (see `is_safe_query`'s own docstring):
+#
+#   1. `_references_non_catalog_qualified_function` - a *structural* rule,
+#      no catalogue read needed: any call explicitly schema-qualified to
+#      something other than `pg_catalog` is refused outright, regardless of
+#      whether that schema currently holds a shadowing overload. Nothing
+#      legitimate in this agent's prompt ever asks the model to qualify a
+#      function call at all, let alone to `public` specifically.
+#   2. `_references_shadowed_function` - the *identity* rule, and the one
+#      that also closes the bare-spelling half of the reproduction above
+#      (`lower(x)`, no qualifier in sight): `Engine.shadowed_function_names()`
+#      reports which allowlisted names currently have an executable overload
+#      outside `pg_catalog`, and any call resolving to one of those names is
+#      refused, qualified or not.
+#
+# Two facts constrained this design, both re-verified live rather than
+# assumed (see `docs/3_decisions.md`'s 2026-09-26 entry for the full record):
+# reordering `search_path` to put `pg_catalog` first does not stop the
+# overload from winning (an exact argument-type match beats the built-in's
+# cast regardless of search order), and rewriting a call to an explicit
+# `pg_catalog.`-qualified spelling is not a transparent fix either
+# (`pg_catalog.lower(integer)` does not exist - the built-in only accepts
+# `text`, so a blanket rewrite would break real queries rather than merely
+# re-route them).
+_PG_CATALOG_SCHEMA = "pg_catalog"
+
+
+def _explicit_schema_qualifier(function: sqlglot_exp.Func) -> str | None:
+    """The schema name `function` is written with, if it is schema-qualified at all.
+
+    `schema.func(args)` does not fold the qualifier into the `Func` node the
+    way a resolved name might suggest - sqlglot drops it there entirely and
+    instead parses the whole call as `exp.Dot(this=Identifier(schema),
+    expression=Anonymous(func, args))`, verified live 2026-09-26 for both a
+    two-part (`public.lower(...)`) and a longer (`a.b.lower(...)`) chain, and
+    for both quoted and unquoted spellings of the qualifier. This walks the
+    one immediate parent to recover it, the same shape `_resolve_function_
+    name` cannot see by construction since it only ever looks at the `Func`
+    node itself.
+
+    Deliberately distinguished from PostgreSQL's *other* dotted-call sugar -
+    `(expr).method(args)`, which `_references_disallowed_dot_call` above
+    already handles for the bare-identifier (no own parens) spelling and
+    which `_references_disallowed_function`'s own `find_all(exp.Func)` walk
+    already name-checks for the with-parens spelling. That sugar's implicit
+    first argument is always wrapped in its own `Paren` node - `('a,b').
+    split_part(...)`, `(customer_id).lower()` - because writing it bare would
+    be indistinguishable, at the grammar level, from an ordinary qualified
+    call (verified live 2026-09-26: `.this` is `exp.Paren` for every dot-call
+    sugar spelling checked, never a bare `exp.Identifier`). A bare
+    `exp.Identifier` immediately to the left of the dot is therefore always
+    read as a genuine qualifier - a schema name, or (per the same ambiguity
+    PostgreSQL's own grammar carries) a column/alias being fed into a
+    single-argument call the same sugar allows - and this file treats both
+    readings identically: nothing legitimate in this agent's generated SQL
+    ever needs a bare identifier immediately followed by `.name(...)`, so
+    refusing every such shape unless the qualifier is exactly `pg_catalog`
+    cannot cost a real query written the ordinary, prefix-call way.
+
+    Args:
+        function: A parsed `exp.Func` node.
+
+    Returns:
+        The lowercased qualifier when `function` is the direct `.expression`
+        of a `Dot` whose `.this` is a plain `exp.Identifier` (covers both
+        `schema.func(...)` and the ambiguous bare-identifier dot-call sugar
+        above); the literal marker `"<complex>"` when it is so wrapped but
+        `.this` is itself a longer dotted chain (`a.b.func(...)`,
+        `alias.col.method()`) rather than a single identifier - never a
+        legitimate `pg_catalog` spelling, so callers reject it the same as
+        any other non-`pg_catalog` qualifier; `None` when `function` is not
+        wrapped by a `Dot` at all, or is wrapped but the qualifier position is
+        a `Paren` (the dot-call sugar's own implicit-argument shape, already
+        handled elsewhere - see above).
+    """
+    if exp is None:
+        return None
+    parent = function.parent
+    if not (isinstance(parent, exp.Dot) and parent.expression is function):
+        return None
+    qualifier = parent.this
+    if isinstance(qualifier, exp.Identifier):
+        return (qualifier.name or "").lower()
+    if isinstance(qualifier, exp.Paren):
+        return None
+    return "<complex>"
+
+
+def _references_non_catalog_qualified_function(
+    parsed: sqlglot_exp.Expression, *, dialect: str
+) -> bool:
+    """True if any function call is explicitly qualified to a non-`pg_catalog` schema.
+
+    Only runs for `dialect` in `_DOT_CALL_DIALECTS` - the qualifier ambiguity
+    `_explicit_schema_qualifier` documents is a PostgreSQL grammar property,
+    not one DuckDB or SQLite share, matching every other rule gated on that
+    constant.
+
+    Args:
+        parsed: The parsed statement.
+        dialect: The dialect the statement was parsed under.
+
+    Returns:
+        True if the statement must be rejected.
+    """
+    if exp is None:
+        return True
+    if dialect not in _DOT_CALL_DIALECTS:
+        return False
+    for function in parsed.find_all(exp.Func):
+        schema = _explicit_schema_qualifier(function)
+        if schema is not None and schema != _PG_CATALOG_SCHEMA:
+            return True
+    return False
+
+
+def _references_shadowed_function(
+    parsed: sqlglot_exp.Expression,
+    *,
+    get_shadowed_function_names: Callable[[], frozenset[str]],
+) -> bool:
+    """True if any function call resolves to a name currently shadowed by an overload.
+
+    Closes the bare-spelling half of Finding 1's reproduction: `lower(x)`
+    carries no schema qualifier at all for `_references_non_catalog_
+    qualified_function` above to catch, but still dispatches to the same
+    non-`pg_catalog` overload when one exists and its argument type matches
+    more exactly than the built-in's - PostgreSQL resolution, not `search_path`
+    order, decides that once such an overload exists (verified live: putting
+    `pg_catalog` first in `search_path` does not change which one wins).
+
+    Scoped to the names the statement actually resolves, not a blanket
+    refusal the moment anything is shadowed anywhere: `get_shadowed_function_
+    names()` is only consulted, and only once, if the statement contains at
+    least one function call whose name resolves to something non-empty -
+    most statements querying an unrelated function are unaffected by an
+    overload on some other allowlisted name.
+
+    Args:
+        parsed: The parsed statement.
+        get_shadowed_function_names: Returns the engine's own
+            `Engine.shadowed_function_names()` - see that method for what it
+            reports. Only called when this statement has at least one
+            resolvable function call, so an engine that never shadows
+            anything (SQLite, DuckDB - see that method's docstring) pays for
+            the call but the call itself does no catalogue I/O.
+
+    Returns:
+        True if the statement must be rejected.
+    """
+    if exp is None:
+        return True
+    shadowed: frozenset[str] | None = None
+    for function in parsed.find_all(exp.Func):
+        resolved = _resolve_function_name(function)
+        if not resolved:
+            continue
+        if shadowed is None:
+            shadowed = get_shadowed_function_names()
+            if not shadowed:
+                return False
+        if resolved in shadowed:
             return True
     return False
 
@@ -1529,6 +1718,7 @@ def _is_safe_ast(
     allowed_functions: frozenset[str] | None,
     get_real_table_names: Callable[[], frozenset[str]],
     get_real_table_columns: Callable[[], Mapping[str, frozenset[str]]],
+    get_shadowed_function_names: Callable[[], frozenset[str]],
 ) -> bool:
     """Reject anything that parses to more than one statement or writes data.
 
@@ -1572,6 +1762,18 @@ def _is_safe_ast(
     # database backing every `FROM` clause they write.
     if allowed_functions is not None:
         if _references_disallowed_function(parsed, allowed_functions=allowed_functions):
+            return False
+        # Finding 1 fix (2026-09-26): two more identity checks, both after the
+        # name-based gate above and before the dot-call sugar check below -
+        # a call already rejected on name needs neither, and the schema-
+        # qualifier check needs no I/O at all, so it runs before the one that
+        # does. See these two functions' own module-level comment for what
+        # each closes and why neither alone is enough.
+        if _references_non_catalog_qualified_function(parsed, dialect=dialect):
+            return False
+        if _references_shadowed_function(
+            parsed, get_shadowed_function_names=get_shadowed_function_names
+        ):
             return False
         if _references_disallowed_dot_call(
             parsed,
@@ -1646,9 +1848,13 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
             the internals blocklist, and its `allowed_functions` switches on
             default-deny function *and table* validation when it is a set
             rather than `None`, calling `engine.table_names()` only in that
-            case and `engine.table_columns()` only when its `sqlglot_dialect`
-            is additionally one where a qualified column can be a function
-            call (`_DOT_CALL_DIALECTS`). Defaults to `None`, meaning SQLite - resolved from
+            case, `engine.table_columns()` only when its `sqlglot_dialect` is
+            additionally one where a qualified column can be a function call
+            (`_DOT_CALL_DIALECTS`), and `engine.shadowed_function_names()`
+            whenever the statement resolves at least one function call - see
+            `_references_shadowed_function` for what that closes (Finding 1,
+            2026-09-26: an allowlisted name shadowed by a same-named,
+            differently-scoped catalogue entry). Defaults to `None`, meaning SQLite - resolved from
             `SQLiteEngine`'s own class attributes, so this stays a single
             source rather than a second, driftable copy of its blocklist,
             and performs no I/O: `engine=None` never reads a table list,
@@ -1679,6 +1885,7 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         allowed_functions: frozenset[str] | None = SQLiteEngine.allowed_functions
         get_real_table_names: Callable[[], frozenset[str]] = _no_table_names
         get_real_table_columns: Callable[[], Mapping[str, frozenset[str]]] = _no_table_columns
+        get_shadowed_function_names: Callable[[], frozenset[str]] = _no_shadowed_function_names
     else:
         dialect = engine.sqlglot_dialect
         internal_prefixes = engine.internal_prefixes
@@ -1709,6 +1916,18 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         get_real_table_columns = (
             engine.table_columns if allowed_functions is not None else _no_table_columns
         )
+        # Same closure treatment again, for Finding 1's shadowed-name check
+        # (`_references_shadowed_function`): only an engine with default-deny
+        # switched on is ever asked, and `Engine.shadowed_function_names()`
+        # itself is total for every engine (SQLite and DuckDB both return the
+        # empty set unconditionally - see that method's docstring), so this
+        # never raises `AttributeError` the way an unconditional bind of a
+        # genuinely optional method could.
+        get_shadowed_function_names = (
+            engine.shadowed_function_names
+            if allowed_functions is not None
+            else _no_shadowed_function_names
+        )
     return _is_safe_ast(
         s,
         dialect=dialect,
@@ -1717,4 +1936,5 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         allowed_functions=allowed_functions,
         get_real_table_names=get_real_table_names,
         get_real_table_columns=get_real_table_columns,
+        get_shadowed_function_names=get_shadowed_function_names,
     )

@@ -70,6 +70,24 @@ and `"Public"` are two different schemas that fold together only once
 lowercased (finding 2), and the flat, unescaped qualified-name string has the
 same shape of collision between a dotted table name and a qualified one
 (finding 4). See `AmbiguousTableIdentityError`.
+
+A 2026-09-26 Codex review of that Phase 3b closeout found a further, critical
+gap: `allowed_functions` pinned a call's *spelling*, never its resolved
+identity. `public.lower(integer)` - a user-defined overload sharing an
+allowlisted name, reachable both schema-qualified and bare - let a
+`SECURITY DEFINER` function run under an audited name and read data `aipa_ro`
+has no direct grant on. `shadowed_function_names()` below closes it: a
+one-time (per instance) `pg_proc`/`pg_namespace` query reports which
+allowlisted names currently have an executable overload outside
+`pg_catalog`, and `safety.is_safe_query` refuses any query that *uses* one of
+those names - both an explicit non-`pg_catalog` schema qualifier and a name
+this reports as shadowed, regardless of qualification. See
+`docs/3_decisions.md`'s 2026-09-26 entry for why reordering `search_path` and
+rewriting calls to `pg_catalog.`-qualified were both ruled out, and for the
+honest precondition this fix rests on: `aipa_ro` itself cannot `CREATE` in
+any schema it does not own (verified live), so the overload that arms this
+bypass can only come from a different, more privileged principal sharing the
+database - a DBA, or another application's role.
 """
 
 from __future__ import annotations
@@ -265,6 +283,63 @@ def _user_schema_names(
         (candidates,),
     ).fetchall()
     return [name for (name,) in rows]
+
+
+def _fetch_shadowed_function_names(
+    conn: psycopg.Connection[tuple[Any, ...]], *, allowed_functions: frozenset[str]
+) -> frozenset[str]:
+    """Which of `allowed_functions` has an executable overload outside `pg_catalog`.
+
+    Finding 1 fix (Codex review of the Phase 3b closeout, 2026-09-26) - see
+    `Engine.shadowed_function_names` for the vulnerability this closes.
+    `pg_proc`/`pg_namespace` are plain catalog tables, world-readable the
+    same way `allowed_functions`'s own comment already relies on for
+    `pg_constraint` (`_fetch_primary_keys`) - no privilege beyond an
+    ordinary connection is needed to read them.
+
+    `has_function_privilege(oid, 'EXECUTE')` is what makes this a real
+    identity check rather than a name check one level down: PostgreSQL
+    grants `EXECUTE` to `PUBLIC` by default on every function a role
+    creates, which is exactly how the review's reproduction worked without
+    any explicit `GRANT` at all - a `proname` match with no privilege check
+    would both over- and under-report (an overload the role could not
+    actually invoke is not a threat; one it can is, regardless of who owns
+    it).
+
+    Deliberately not scoped to `default_schema`/`extra_schemas`: an overload
+    is reachable by an explicit schema-qualified call (`other_schema.
+    lower(...)`) regardless of whether `other_schema` is one this engine
+    advertises tables from, so restricting the search to opted-in schemas
+    would miss exactly the shape the review used (a schema `aipa_ro` was
+    never granted `USAGE` on at all).
+
+    Args:
+        conn: An open connection - any role.
+        allowed_functions: The engine's own `allowed_functions` - only these
+            names are worth asking about, since only these can pass the
+            other, name-based half of `_references_disallowed_function`
+            first.
+
+    Returns:
+        The lowercased subset of `allowed_functions` with at least one
+        `pg_proc` row outside the `pg_catalog` namespace that
+        `has_function_privilege` says the connecting role may execute.
+        Empty when `allowed_functions` is empty (never true for
+        `PostgresEngine` itself, but keeps this total for any future
+        caller) or when nothing is shadowed.
+    """
+    if not allowed_functions:
+        return frozenset()
+    rows = conn.execute(
+        "SELECT DISTINCT p.proname "
+        "FROM pg_proc p "
+        "JOIN pg_namespace n ON n.oid = p.pronamespace "
+        "WHERE n.nspname <> 'pg_catalog' "
+        "AND p.proname = ANY(%s) "
+        "AND has_function_privilege(p.oid, 'EXECUTE')",
+        (sorted(allowed_functions),),
+    ).fetchall()
+    return frozenset(name for (name,) in rows)
 
 
 def _fetch_columns(
@@ -760,6 +835,10 @@ POSTGRESQL DIALECT (must follow):
         # See the `default_schema` property below - `None` means "not yet
         # asked the server."
         self._default_schema: str | None = None
+        # See `shadowed_function_names` below - `None` means "not yet asked
+        # the server," the same sentinel `_default_schema` uses and for the
+        # same reason (no real answer is ever `None`).
+        self._shadowed_function_names: frozenset[str] | None = None
 
     @property
     def default_schema(self) -> str:
@@ -1181,6 +1260,53 @@ POSTGRESQL DIALECT (must follow):
         return table_column_spellings(
             get_schema_chunks(self.dsn), default_schema=self.default_schema
         )
+
+    def shadowed_function_names(self) -> frozenset[str]:
+        """Which of `allowed_functions` has an executable overload outside `pg_catalog`.
+
+        See `Engine.shadowed_function_names` for what this answers and why,
+        and `_fetch_shadowed_function_names` for the catalogue query.
+
+        **Caching decision (2026-09-26).** Computed at most once per
+        `PostgresEngine` instance, cached in `self._shadowed_function_names`
+        - the same pattern `default_schema` already uses, for the same
+        reason: `schema.py`'s `get_schema_chunks` and every top-level
+        `pipeline.ask_database`/`ask_database_with_sql` call build a fresh
+        engine instance via `open_engine(dsn)` (see `pipeline.py`), so "once
+        per instance" already means "once per question," not a
+        process-lifetime cache that could go stale across questions. Within
+        one question, `is_safe_query` runs at least once (the generated SQL)
+        and up to a second time (`pipeline._repair_sql`'s retry) against the
+        *same* engine instance - both reuse this one query instead of paying
+        for it twice.
+
+        **What happens if an overload is created mid-session.** If a DBA (or
+        another application's role sharing this database - see this
+        engine's module docstring and `docs/3_decisions.md`'s 2026-09-26
+        entry for why that is the honest precondition, since `aipa_ro`
+        itself cannot `CREATE` in any schema it does not own) creates a
+        shadowing overload *after* this instance already cached an answer,
+        that overload is invisible to this instance for the rest of its
+        lifetime - i.e., for the rest of the current question, including its
+        one repair retry. It is visible from the *next* question onward,
+        since that opens a new `PostgresEngine` and pays for a fresh query.
+        This mirrors `default_schema`'s own documented staleness window
+        exactly (a `search_path`-affecting change made mid-connection), and
+        the same argument applies: nothing else in this engine's lifetime
+        (a short-lived, per-question instance) can change a role's function
+        privileges or the catalogue's contents either, so a cache scoped to
+        the instance is not a weaker guarantee than re-querying on every
+        call, only a cheaper one.
+
+        Reads through `_connect_read_only`, the same connection `execute()`
+        uses - see `raw_schema()`'s docstring for why.
+        """
+        if self._shadowed_function_names is None:
+            with _connect_read_only(self.dsn) as conn:
+                self._shadowed_function_names = _fetch_shadowed_function_names(
+                    conn, allowed_functions=self.allowed_functions or frozenset()
+                )
+        return self._shadowed_function_names
 
 
 __all__ = ["PostgresEngine"]

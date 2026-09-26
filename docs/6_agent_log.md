@@ -1577,3 +1577,137 @@ Evaluated 12 cases. Exact result match: 12/12
 parallel quality invocation could not initialise uv's default cache under the
 sandbox (`Operation not permitted`); rerunning the same gates with
 `UV_CACHE_DIR=/private/tmp/aipa-review-uv` produced the passing results above.
+
+## 2026-09-26 — Claude's fix for Codex Finding 1: function-identity bypass
+
+BASE `4f245c7`. Scope: Finding 1 only from the review above (Critical,
+allowlist-overload bypass); Findings 2 and 3 are a separate follow-up and were
+not touched.
+
+**Re-verified the three facts the review's write-up gave, live, before
+designing anything:**
+
+1. Reordering `search_path` to `pg_catalog, public` does not stop an
+   unqualified `lower(customer_id)` from dispatching to a `public.
+   lower(integer)` overload - PostgreSQL's overload resolution picks the
+   exact argument-type match regardless of search order.
+2. Rewriting a call to an explicit `pg_catalog.`-qualified spelling is not a
+   transparent fix: `SELECT pg_catalog.lower(customer_id) FROM customers`
+   fails outright (`UndefinedFunction: pg_catalog.lower(integer) does not
+   exist`), since the built-in only accepts `text`.
+3. `aipa_ro` cannot arm this bypass itself: `CREATE FUNCTION public.probe_fn()
+   ...` as `aipa_ro` fails with `InsufficientPrivilege: permission denied for
+   schema public` (PostgreSQL 16 revokes `CREATE` on `public` from `PUBLIC`).
+   The precondition is a different, more privileged principal sharing the
+   database - stated as such in `docs/3_decisions.md`'s new entry and below,
+   not softened.
+
+**Fix, two independent checks in `safety.py` plus one new `Engine` protocol
+method** (see `docs/3_decisions.md`'s new "function identity, not spelling"
+entry for the full Chosen/Ruled out/Why):
+
+- `_references_non_catalog_qualified_function` - structural: any function
+  call explicitly schema-qualified to something other than `pg_catalog` is
+  refused, no catalogue read needed.
+- `_references_shadowed_function` - identity: `Engine.
+  shadowed_function_names()` (new protocol method, `engines/base.py`) reports
+  which allowlisted names currently have an executable overload outside
+  `pg_catalog` (`pg_proc`/`pg_namespace`, filtered by
+  `has_function_privilege(oid, 'EXECUTE')`), and any call resolving to one of
+  those names is refused, qualified or bare. `PostgresEngine` computes this
+  once per instance, the same per-instance cache `default_schema` already
+  uses (`pipeline.py` opens a fresh engine per question, so this is at most
+  once per question including its one repair retry). `SQLiteEngine`/
+  `DuckDBEngine` both return the empty set unconditionally and are otherwise
+  untouched.
+
+Both gates are wired into `_is_safe_ast` right after the existing name-based
+`_references_disallowed_function` gate and before the dot-call sugar checks,
+matching this file's existing "cheapest check first" ordering discipline.
+
+**Reproduced the bypass live before fixing it, at BASE:** a schema `aipa_ro`
+holds no `USAGE` on, a table in it holding `PROBE_SECRET`, and a
+`SECURITY DEFINER public.lower(integer)` returning that value:
+
+```
+SELECT public.lower(customer_id) FROM customers LIMIT 1
+is_safe_query -> True
+engine (bypassing the validator) -> [('PROBE_SECRET',)]
+
+SELECT lower(customer_id) FROM customers LIMIT 1
+is_safe_query -> True
+
+direct query to the hidden table -> InsufficientPrivilege (correctly refused)
+```
+
+**Live regression test** (`tests/test_engine_postgres.py::
+test_a_same_name_overload_no_longer_shadows_the_allowlisted_function_identity`),
+run against BASE with the fix stashed out (implementation files only - the
+new tests themselves were not stashed) to prove it fails before the fix and
+passes after:
+
+```
+$ git stash push -- text_to_sql_agent/engines/base.py text_to_sql_agent/engines/duckdb.py \
+    text_to_sql_agent/engines/postgres.py text_to_sql_agent/engines/sqlite.py \
+    text_to_sql_agent/safety.py tests/test_safety.py
+$ AIPA_TEST_POSTGRES_DSN=... uv run pytest tests/test_engine_postgres.py \
+    -k "shadow or pg_catalog_qualified or non_catalog_qualified" -v
+FAILED test_a_same_name_overload_no_longer_shadows_the_allowlisted_function_identity
+  AssertionError: 'SELECT public.upper(customer_id) FROM customers LIMIT 1'
+  should be refused while public.upper(integer) exists (security_definer=True)
+  assert not True
+FAILED test_non_catalog_qualified_function_calls_are_refused_structurally
+  AssertionError: assert not True
+2 failed, 3 passed, 223 deselected in 0.64s
+$ git stash pop   # fix restored
+```
+
+The test creates both a `SECURITY DEFINER` and a plain `public.upper(integer)`
+overload in turn (each dropped in its own `finally`, and the outer schema
+dropped in an outer `finally`, so a failed assertion never leaves an object
+behind), asserts both the qualified and unqualified spellings refused for
+each, then recreates the plain overload once more and asserts an unrelated,
+unshadowed name (`lower(name)` on a real text column) still both validates
+and executes - proving the refusal is scoped by name, not blanket. Two more
+new tests (`test_search_path_reordering_does_not_avoid_the_shadow`,
+`test_pg_catalog_qualified_rewrite_is_not_a_transparent_fix`) re-pin facts 1
+and 2 directly against live PostgreSQL rather than merely asserting them in
+prose, and a fourth (`test_non_catalog_qualified_function_calls_are_refused_
+structurally`) pins the schema-qualifier rule server-free against the `t`
+fixture other bypass tests in this file already use.
+
+**Verified:**
+
+```
+$ AIPA_TEST_POSTGRES_DSN=postgresql://aipa_ro:aipa_ro_pw@127.0.0.1:55432/aipa uv run pytest
+790 passed, 6 skipped in 17.91s
+
+$ AIPA_TEST_POSTGRES_DSN=... uv run pytest -m conformance -rs
+36 passed, 760 deselected in 0.88s      (0 skipped)
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+79 files already formatted
+
+$ uv run mypy
+Success: no issues found in 32 source files
+
+$ env -u AIPA_TEST_POSTGRES_DSN uv run pytest
+538 passed, 258 skipped in 8.07s        (0 failed)
+```
+
+790 passed, up from BASE's 786 - 4 new tests, none removed and none relaxed.
+Every previously-closed PostgreSQL bypass (`(expr).name` field notation,
+`::regclass`/`::regrole` OID casts, `alias.name` column sugar, the
+`lo_get`-in-a-readable-schema regression, and the `ROWS FROM`/`unnest`
+relation-kind seam), PostgreSQL's 35-query analytics corpus, DuckDB's
+61-query corpus and all 12 `_LEGITIMATE_QUALIFIED_COLUMN_QUERIES` shapes still
+pass. Post-run superuser check confirms the only non-internal schema is
+`public` holding `brand_new_table`/`customers`/`sales` - the pre-existing
+fixture drift, left alone - and no user-defined function remains in `public`.
+`.devcontainer/devcontainer.json` has uncommitted owner edits and was never
+staged.
+
+Findings 2 and 3 from the review above remain open; not addressed here.

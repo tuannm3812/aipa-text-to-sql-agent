@@ -369,3 +369,14 @@ SQLITE DIALECT (must follow):
         return table_column_spellings(
             get_schema_chunks(self.dsn), default_schema=self.default_schema
         )
+
+    def shadowed_function_names(self) -> frozenset[str]:
+        """Always empty - SQLite has no notion of a shadowing overload.
+
+        Never reached by `safety.is_safe_query` either: `allowed_functions
+        is not None` already excludes SQLite before this would be called -
+        but see `Engine.shadowed_function_names` for why the method still
+        exists and returns a real (if trivially empty) answer rather than
+        being left unimplemented.
+        """
+        return frozenset()

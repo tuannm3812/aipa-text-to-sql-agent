@@ -1596,3 +1596,174 @@ def test_sqlite_default_work_limit_is_unchanged() -> None:
     from text_to_sql_agent.engines.sqlite import SQLiteEngine
 
     assert SQLiteEngine.default_work_limit == 100_000
+
+
+# Finding 1 (Codex review of the Phase 3b closeout, 2026-09-26): `allowed_
+# functions` pinned a call's *spelling*, never its resolved `pg_proc`
+# identity. Reproduced by the review exactly as re-verified here: a
+# `SECURITY DEFINER public.upper(integer)` overload sharing the allowlisted
+# name `upper`, reachable both as `public.upper(x)` and as the bare `upper
+# (x)` - PostgreSQL's own overload resolution picks the exact `integer` match
+# over `pg_catalog.upper(text)` plus an implicit cast regardless of
+# `search_path` order (re-verified below: putting `pg_catalog` first does not
+# change which one wins) - let the function read a row from a schema
+# `aipa_ro` was never granted `USAGE` on. A read-only transaction does not
+# stop a read a `SECURITY DEFINER` function makes on the connecting role's
+# behalf.
+#
+# The fix is two independent checks in `safety.py`
+# (`_references_non_catalog_qualified_function` and `_references_shadowed_
+# function`) plus `Engine.shadowed_function_names()`, which this test proves
+# from the outside: both overload kinds (`SECURITY DEFINER` and plain - the
+# fix is identity-based, not a `SECURITY DEFINER` special case) are refused
+# under both spellings, and an unrelated, unshadowed name stays usable so the
+# refusal is scoped by name rather than blanket.
+_SHADOW_SECRET_SCHEMA = "ext_shadow_secret"
+_SHADOW_FUNCTION = "public.upper(integer)"
+
+
+def test_a_same_name_overload_no_longer_shadows_the_allowlisted_function_identity(
+    postgres_dsn: str,
+) -> None:
+    """Live regression for Finding 1. See the module comment above.
+
+    Every object this test creates is dropped in a `finally`, including when
+    an assertion fails partway through, so a failure never leaves a probe
+    function or schema behind for a later test run.
+    """
+    su_dsn = _as_postgres_superuser(postgres_dsn)
+    try:
+        with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {_SHADOW_SECRET_SCHEMA} CASCADE")
+            conn.execute(f"CREATE SCHEMA {_SHADOW_SECRET_SCHEMA}")
+            conn.execute(f"CREATE TABLE {_SHADOW_SECRET_SCHEMA}.secret (marker TEXT)")
+            conn.execute(f"INSERT INTO {_SHADOW_SECRET_SCHEMA}.secret VALUES ('PROBE_SECRET')")
+            # Deliberately no GRANT USAGE for aipa_ro - the whole point of the
+            # reproduction is that the overload reaches data the role cannot
+            # reach directly.
+
+        engine = open_engine(postgres_dsn)
+        # Sanity: aipa_ro really cannot read the hidden table directly, and
+        # reordering search_path to put pg_catalog first does not change
+        # which overload PostgreSQL's own resolution picks (fact re-verified
+        # live for the review, not assumed) - both are preconditions for the
+        # rest of this test to mean what it claims.
+        direct = f"SELECT marker FROM {_SHADOW_SECRET_SCHEMA}.secret"
+        assert not is_safe_query(direct, engine=engine)
+        with (
+            psycopg.connect(postgres_dsn, connect_timeout=5) as conn,
+            pytest.raises(psycopg.errors.InsufficientPrivilege),
+        ):
+            conn.execute(direct)
+
+        for security_definer in (True, False):
+            with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+                conn.execute(f"DROP FUNCTION IF EXISTS {_SHADOW_FUNCTION}")
+                security = "SECURITY DEFINER" if security_definer else ""
+                conn.execute(
+                    f"CREATE FUNCTION {_SHADOW_FUNCTION} RETURNS text {security} "
+                    f"LANGUAGE sql AS $$ SELECT marker FROM "
+                    f"{_SHADOW_SECRET_SCHEMA}.secret LIMIT 1 $$"
+                )
+            try:
+                engine = open_engine(postgres_dsn)  # fresh instance: no stale cache
+                for sql in (
+                    "SELECT public.upper(customer_id) FROM customers LIMIT 1",
+                    "SELECT upper(customer_id) FROM customers LIMIT 1",
+                ):
+                    assert not is_safe_query(sql, engine=engine), (
+                        f"{sql!r} should be refused while {_SHADOW_FUNCTION} exists "
+                        f"(security_definer={security_definer})"
+                    )
+            finally:
+                with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+                    conn.execute(f"DROP FUNCTION IF EXISTS {_SHADOW_FUNCTION}")
+
+        # Scoping proof: recreate one overload (plain is enough - the
+        # privilege escalation itself is already proven above) so an
+        # unrelated, unshadowed name is checked "while the overload exists",
+        # as the brief requires, then the outer `finally` drops it either
+        # way. `upper` is shadowed; `lower` is not, and reading a genuine
+        # text column through it must still both validate and execute.
+        with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+            conn.execute(
+                f"CREATE FUNCTION {_SHADOW_FUNCTION} RETURNS text "
+                f"LANGUAGE sql AS $$ SELECT marker FROM "
+                f"{_SHADOW_SECRET_SCHEMA}.secret LIMIT 1 $$"
+            )
+        try:
+            engine = open_engine(postgres_dsn)
+            unrelated = "SELECT lower(name) FROM customers ORDER BY customer_id"
+            assert is_safe_query(unrelated, engine=engine), (
+                "an unrelated, unshadowed function name must still validate "
+                "while a different name is shadowed"
+            )
+            result = engine.execute(unrelated, max_rows=10, work_limit=0)
+            assert result.error is None
+            assert sorted(result.rows) == [("alice",), ("bob",)]
+        finally:
+            with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+                conn.execute(f"DROP FUNCTION IF EXISTS {_SHADOW_FUNCTION}")
+    finally:
+        with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {_SHADOW_SECRET_SCHEMA} CASCADE")
+
+
+def test_search_path_reordering_does_not_avoid_the_shadow(postgres_dsn: str) -> None:
+    """Re-verifies the fact the fix's design rests on, independent of the
+    `is_safe_query` proof above: putting `pg_catalog` first in `search_path`
+    does not change which overload an *unqualified* call resolves to, so a
+    fix that only reordered `search_path` (rather than checking identity)
+    would not have closed anything. `engine.execute` is used directly here,
+    bypassing `is_safe_query` entirely - the point is to pin PostgreSQL's own
+    resolution behaviour, not the validator.
+    """
+    su_dsn = _as_postgres_superuser(postgres_dsn)
+    try:
+        with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+            conn.execute(f"DROP FUNCTION IF EXISTS {_SHADOW_FUNCTION}")
+            conn.execute(
+                f"CREATE FUNCTION {_SHADOW_FUNCTION} RETURNS text "
+                "LANGUAGE sql AS $$ SELECT 'SHADOWED' $$"
+            )
+        with psycopg.connect(postgres_dsn, connect_timeout=5) as conn:
+            conn.read_only = True
+            conn.execute("SET search_path = pg_catalog, public")
+            row = conn.execute("SELECT upper(customer_id) FROM customers LIMIT 1").fetchone()
+        assert row == ("SHADOWED",), (
+            "pg_catalog-first search_path should not have avoided the shadow, "
+            f"but resolution returned {row!r}"
+        )
+    finally:
+        with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+            conn.execute(f"DROP FUNCTION IF EXISTS {_SHADOW_FUNCTION}")
+
+
+def test_pg_catalog_qualified_rewrite_is_not_a_transparent_fix(postgres_dsn: str) -> None:
+    """Re-verifies the other fact the fix's design rests on: rewriting a call
+    to an explicit `pg_catalog.`-qualified spelling is not a safe alternative
+    to identity checking, because `pg_catalog.upper(integer)` does not exist
+    - the built-in only accepts `text`. A validator that rewrote calls this
+    way would break real queries rather than merely re-route them around a
+    shadow.
+    """
+    with psycopg.connect(postgres_dsn, connect_timeout=5) as conn:
+        conn.read_only = True
+        with pytest.raises(psycopg.errors.UndefinedFunction):
+            conn.execute("SELECT pg_catalog.upper(customer_id) FROM customers LIMIT 1")
+
+
+def test_non_catalog_qualified_function_calls_are_refused_structurally(
+    engine_with_table_t,
+) -> None:
+    """`_references_non_catalog_qualified_function` needs no catalogue read
+    and no live overload to fire: any call explicitly schema-qualified to
+    something other than `pg_catalog` is refused outright, and a genuine
+    `pg_catalog.count(...)` still validates. Uses the `t` fixture (`a
+    INTEGER`), not a live shadow, since this is the structural half of the
+    fix, independent of `Engine.shadowed_function_names()`.
+    """
+    engine = engine_with_table_t
+    assert not is_safe_query("SELECT public.count(a) FROM t", engine=engine)
+    assert not is_safe_query("SELECT t.a.count() FROM t", engine=engine)
+    assert is_safe_query("SELECT pg_catalog.count(a) FROM t", engine=engine)

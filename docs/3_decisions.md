@@ -2,6 +2,108 @@
 
 Newest first. Each entry states what was chosen and what it ruled out.
 
+## 2026-09-26 — function identity, not spelling: closing the allowlist-overload bypass
+
+**Chosen:** Two independent checks in `safety.py`, both gated the same way
+the existing dot-call rules are (`_DOT_CALL_DIALECTS`, PostgreSQL only), plus
+one new `Engine` protocol method:
+
+1. `_references_non_catalog_qualified_function` - structural, no catalogue
+   read: a function call explicitly schema-qualified to anything other than
+   `pg_catalog` is refused outright (`public.lower(x)`, `a.b.lower(x)`, and
+   the same bare-identifier-before-a-parenthesised-call shape PostgreSQL's
+   own grammar cannot distinguish from a qualifier, e.g. `customer_id.
+   lower()`). Nothing in this agent's prompt ever asks the model to qualify a
+   function call, so this costs no legitimate query.
+2. `_references_shadowed_function` - identity, catalogue-backed: `Engine.
+   shadowed_function_names()` reports which of `allowed_functions` currently
+   has an executable overload outside `pg_catalog` (`pg_proc` joined to
+   `pg_namespace`, filtered by `has_function_privilege(oid, 'EXECUTE')`), and
+   any call resolving to one of those names is refused - qualified or bare.
+   `PostgresEngine` computes this once per instance (the same per-instance
+   cache `default_schema` already uses, since `pipeline.py` opens a fresh
+   engine per question); `SQLiteEngine`/`DuckDBEngine` return the empty set
+   unconditionally, since neither has anything an unprivileged role can
+   overload the same way.
+
+**Ruled out:**
+
+- **Reordering `search_path` to put `pg_catalog` first.** Re-verified live
+  (2026-09-26): with `search_path = pg_catalog, public`, an unqualified
+  `lower(customer_id)` still dispatched to a `public.lower(integer)` overload
+  instead of the built-in. PostgreSQL's overload resolution picks the exact
+  argument-type match over the built-in's `text` parameter plus an implicit
+  cast, regardless of which schema is searched first - search-path order
+  only decides between two otherwise-equal candidates, and this was never
+  one of those.
+- **Rewriting a call to an explicit `pg_catalog.`-qualified spelling.**
+  Re-verified live: `SELECT pg_catalog.lower(customer_id) FROM customers`
+  fails outright with `UndefinedFunction: pg_catalog.lower(integer) does not
+  exist`, because the built-in only accepts `text` and PostgreSQL does not
+  implicitly widen a qualified reference across schemas the way name
+  resolution does. A validator that rewrote calls this way would break real
+  queries, not merely re-route them around a shadow.
+- **A name-only fix (banning `public.<anything>`, or banning any
+  schema-qualified call regardless of target).** Would have caught the
+  qualified spelling but not the bare one - `lower(customer_id)` with no
+  qualifier in sight, which the review's own reproduction showed reaches the
+  same overload. Identity checking is what closes the bare-spelling half.
+- **Re-querying `pg_proc` on every `is_safe_query` call instead of caching.**
+  `pipeline.py` opens a fresh `PostgresEngine` per top-level question, so a
+  per-instance cache already means "at most once per question, including its
+  one repair retry" - re-querying every call would pay real per-query latency
+  for an answer that cannot change mid-question (nothing in this engine's own
+  lifetime can grant or revoke a function privilege or create an overload).
+
+**Why:** `allowed_functions` was reviewed and audited as a set of `pg_catalog`
+entries, but nothing before this fix constrained *which* `pg_proc` row a
+validated call would actually dispatch to. A `public.lower(integer)` overload
+sharing the allowlisted name `lower` was reachable both as `public.lower(x)`
+and as the bare `lower(x)`, and PostgreSQL grants `EXECUTE` to `PUBLIC` by
+default, so no explicit grant was even needed. A `SECURITY DEFINER` version
+of that overload then read data under its *owner's* privileges, not the
+connecting role's - a read-only transaction does not stop a read a
+`SECURITY DEFINER` function makes on the role's behalf. Reproduced live with
+exactly this shape (a schema `aipa_ro` holds no `USAGE` on, a marker row in
+it, and a `SECURITY DEFINER public.lower(integer)` returning that row):
+before this fix, both `is_safe_query('SELECT public.lower(customer_id) FROM
+customers LIMIT 1', engine=engine)` and the bare-call form each returned
+`True`, and executing the query returned the marker value. After the fix,
+both return `False`, while an unrelated, unshadowed name (`upper` in the
+reproduction, `lower` in the regression test's inverse case) still validates
+and executes normally - the refusal is scoped to the names a statement
+actually uses, not a blanket refusal the moment anything anywhere is
+shadowed.
+
+**The honest precondition.** `aipa_ro` itself cannot arm this bypass:
+PostgreSQL 16 revokes `CREATE` on `public` from `PUBLIC` by default, and this
+was re-verified live - `aipa_ro` attempting `CREATE FUNCTION public.probe_fn()
+...` fails with `InsufficientPrivilege: permission denied for schema public`.
+The overload that arms this bypass can only be created by a different, more
+privileged principal sharing the same database: a DBA, or another
+application's role that was granted `CREATE` on a schema on this role's
+reach (schema-qualified calls are checked regardless of `AIPA_EXTRA_SCHEMAS`
+scope - see `_fetch_shadowed_function_names`'s own docstring for why the
+search is not schema-scoped). This is defence-in-depth against a threat this
+agent's own connecting role cannot open by itself, not a hole a question-
+asker could exploit unaided - stated plainly here because the review found a
+critical bug, and overstating what a lower-privileged attacker could reach
+would be its own kind of inaccuracy.
+
+**Live evidence.** `tests/test_engine_postgres.py::
+test_a_same_name_overload_no_longer_shadows_the_allowlisted_function_identity`
+creates both a `SECURITY DEFINER` and a plain `public.upper(integer)`
+overload (dropped in a `finally` regardless of assertion outcome) and proves
+both spellings refused for each; `test_search_path_reordering_does_not_avoid_
+the_shadow` and `test_pg_catalog_qualified_rewrite_is_not_a_transparent_fix`
+re-pin the two ruled-out approaches directly against live PostgreSQL, not
+just describe them here. Every previously-closed PostgreSQL bypass (`(expr).
+name` field notation, `::regclass`/`::regrole` OID casts, `alias.name` column
+sugar, the `lo_get`-in-a-readable-schema regression, and the `ROWS FROM`/
+`unnest` relation-kind seam), PostgreSQL's 35-query analytics corpus,
+DuckDB's 61-query corpus and `_LEGITIMATE_QUALIFIED_COLUMN_QUERIES` all still
+pass unchanged.
+
 ## 2026-09-26 — PostgreSQL fails closed on an over-privileged role
 
 **Chosen:** `PostgresEngine.check_reachable()` now also queries `pg_roles`

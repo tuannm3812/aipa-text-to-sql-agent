@@ -472,3 +472,48 @@ class Engine(Protocol):
             AmbiguousTableIdentityError: See `table_names()`.
         """
         ...
+
+    def shadowed_function_names(self) -> frozenset[str]:
+        """Allowlisted names that resolve to more than the audited built-in.
+
+        Decision (2026-09-26, Codex review of the Phase 3b closeout, Finding
+        1). `allowed_functions` pins a *spelling* - `_references_disallowed_
+        function` accepts a call once its resolved name is in that set - but
+        nothing constrained *which* `pg_proc` row the connecting role's
+        catalogue lookup would actually dispatch to. A user-defined
+        `public.lower(integer)` overload sharing an allowlisted name is
+        reachable both schema-qualified and bare (an exact argument-type
+        match beats the built-in's implicit cast regardless of `search_path`
+        order - reordering it to `pg_catalog, public` does not help, verified
+        live), and a `SECURITY DEFINER` one then reads whatever its owner can
+        read, not what `aipa_ro` can - a read-only transaction does not stop
+        a read a `SECURITY DEFINER` function makes on the connecting role's
+        behalf. This is what closes that gap: `safety.is_safe_query` refuses
+        any query that *uses* a name this reports, rather than trusting the
+        name alone to mean the audited `pg_catalog` entry.
+
+        SQLite and DuckDB have no notion of a same-named catalogue overload
+        shadowing a built-in the way PostgreSQL's schema search path does -
+        neither engine's function surface is pluggable by an unprivileged
+        role the way `CREATE FUNCTION` in a schema on `search_path` is - so
+        both return the empty set unconditionally and this changes nothing
+        about their validation. `PostgresEngine` is the only implementation
+        that ever returns a non-empty set.
+
+        Only called for an engine whose `allowed_functions` is not `None`,
+        the same gate `table_names()`/`table_columns()` are already read
+        behind - an engine that opts out of default-deny is not required to
+        implement anything beyond returning the empty set (see those two
+        methods' own docstrings for the same reasoning applied to them).
+
+        Implementations should cache this rather than querying `pg_proc` on
+        every `is_safe_query` call - see `PostgresEngine.shadowed_function_
+        names` for the caching decision this project made and what it costs
+        if an overload is created mid-session.
+
+        Returns:
+            The lowercased subset of `allowed_functions` that currently has
+            an executable overload outside `pg_catalog` - empty when nothing
+            is shadowed, which is the common case.
+        """
+        ...

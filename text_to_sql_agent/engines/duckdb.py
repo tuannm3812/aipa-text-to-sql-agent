@@ -873,5 +873,18 @@ DUCKDB DIALECT (must follow):
             get_schema_chunks(f"duckdb://{self.dsn}"), default_schema=self.default_schema
         )
 
+    def shadowed_function_names(self) -> frozenset[str]:
+        """Always empty - DuckDB has no notion of a shadowing overload.
+
+        `allowed_functions is not None` already means `safety.is_safe_query`
+        calls this for DuckDB (unlike `table_columns` above), but DuckDB's
+        function catalogue is not something `duckdb_ro` can add an overload
+        to at runtime the way a PostgreSQL role with `CREATE` on a schema
+        can - see `Engine.shadowed_function_names` for the concept this
+        answers and why PostgreSQL is the only engine with anything
+        non-empty to report.
+        """
+        return frozenset()
+
 
 __all__ = ["DuckDBEngine"]

@@ -461,7 +461,7 @@ def test_is_safe_query_rejects_an_unrecognised_function_in_any_position() -> Non
 class _FakePostgresEngine:
     """A PostgreSQL-dialect engine with a hostile column, and no server.
 
-    `is_safe_query` reads six attributes off an engine, so the qualified-column
+    `is_safe_query` reads seven attributes off an engine, so the qualified-column
     resolution model can be pinned without a live PostgreSQL: the live proof
     lives in `tests/test_engine_postgres.py`, which skips wherever
     `AIPA_TEST_POSTGRES_DSN` is unset, and this is what keeps the model itself
@@ -493,6 +493,16 @@ class _FakePostgresEngine:
             "public.customers": customers,
             "other.audit": frozenset({"lo_get", "note"}),
         }
+
+    def shadowed_function_names(self) -> frozenset[str]:
+        """Nothing is shadowed on this fake - see `Engine.shadowed_function_names`.
+
+        Live coverage for a genuinely shadowed name lives in
+        `tests/test_engine_postgres.py`, which needs a real `pg_proc` to
+        create an overload in; this fake exists for the qualified-column
+        resolution tests below, none of which is about function identity.
+        """
+        return frozenset()
 
 
 # Each case is (accepted, sql). The resolution model under test: a qualifier
