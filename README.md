@@ -151,6 +151,35 @@ ollama serve
 
 Then select `ollama` in the Streamlit sidebar.
 
+### Reading tables outside the default schema
+
+DuckDB and PostgreSQL group tables into schemas. By default this agent reads
+**only** the connection's default schema — `main` for DuckDB, whatever
+`current_schema()` returns for PostgreSQL, normally `public` — so a schema's
+table names, columns and DDL are never sent to the LLM provider just because
+the connecting role happens to be able to read them. To include others, list
+them in `AIPA_EXTRA_SCHEMAS`, comma-separated:
+
+```bash
+AIPA_EXTRA_SCHEMAS=analytics,reporting
+```
+
+On PostgreSQL this is one of two gates: a named schema is still only read if
+the connecting role actually holds `has_schema_privilege` on it. On DuckDB it
+is the only gate, since opening the file grants access to every schema in it.
+Either way, `pg_catalog`, `information_schema` and any other internal schema
+are refused however they are named.
+
+**If you point the agent at a database whose tables live outside the default
+schema and do not set this, the schema comes back empty and every question
+answers `UNANSWERABLE_WITH_GIVEN_SCHEMA`** — there is nothing wrong with the
+connection, the tables are simply out of scope. That is the symptom to
+recognise: check `AIPA_EXTRA_SCHEMAS` first. Set once per deployment, read
+once per engine instance, and included in the schema cache key, so changing it
+re-reads the catalogue rather than serving a stale scope. See
+`docs/3_decisions.md`'s "schema scope is opt-in, via `AIPA_EXTRA_SCHEMAS`"
+entry for what else was considered.
+
 ## Run The App
 
 ```bash
