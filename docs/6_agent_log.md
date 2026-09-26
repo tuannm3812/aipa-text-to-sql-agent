@@ -1711,3 +1711,107 @@ fixture drift, left alone - and no user-defined function remains in `public`.
 staged.
 
 Findings 2 and 3 from the review above remain open; not addressed here.
+
+## 2026-09-27 — Claude: pinned `search_path`, engine-qualified tables (Codex Findings 2 and 3; the operator bypass)
+
+BASE `3cf40dc`. Owner-approved design, implemented as specified. Commits:
+`85c67e2` (Finding 3, stale comments), `9ac8eae` (the pin, the qualification,
+the resolution model that closes Finding 2, two validator rules), `5146ada`
+(shown SQL), `650ad79` (decision entries, README).
+
+**What changed.** Every `PostgresEngine` connection runs `SET LOCAL
+search_path = pg_catalog` after reading the role's path through
+`pg_catalog.current_schemas(false)`. `resolve_bare_relation_names` walks that
+path as the server does and is the one answer used for which chunks are spelled
+bare (`SchemaChunk.home_schema` is new) and for the schema
+`safety.qualify_bare_table_references` splices into the SQL before execution.
+Every path schema is now in scope; `AIPA_EXTRA_SCHEMAS` means schemas outside
+the path. New validator rules refuse `OPERATOR(schema.op)` and
+`::schema.type`/`CAST(x AS schema.type)` unless the schema is `pg_catalog`.
+`3cf40dc`'s shadowed-function check is kept as defence in depth.
+`ask_database_with_sql` returns the executed (qualified) SQL.
+
+**Verified live before the fix.** `current_schemas(false)` is ordered, expands
+`"$user"`, omits nonexistent schemas, schemas without `USAGE` and the implicit
+`pg_catalog` (keeps an explicit one in position); a read-only transaction
+refuses `CREATE TEMP TABLE`; no `pg_catalog` relation is named other than
+`pg_*`; every `PostgresEngine.allowed_functions` entry that is a real function
+exists in `pg_catalog` (the 11 that do not are grammar: `case`, `cast`,
+`coalesce`, ...). A qualified cast to a type named after an allowlisted
+function (`::public.lower`) validated at BASE - the old refusal of
+`::public.sometype` came only from the dot-call rule.
+
+**Seven live regressions** (`tests/test_postgres_search_path_pin.py`), each
+asserting against real execution, all failing at BASE:
+
+```
+$ AIPA_TEST_POSTGRES_DSN=... uv run pytest tests/test_postgres_search_path_pin.py --tb=line
+AssertionError: assert [('PROBE_SECR...OBE_SECRET',)] == [('Alice1',), ('Bob1',)]   # || operator
+Failed: DID NOT RAISE UndefinedFunction                                             # = operator
+AssertionError: wrongly accepted: 'SELECT name OPERATOR(public.||) 1 FROM customers ...'
+Failed: DID NOT RAISE UndefinedFunction                                             # bare lower(integer)
+AssertionError: wrongly accepted: 'SELECT name::public.lower FROM customers ...'
+AssertionError: assert 'customers' in frozenset({'aipa_ro.only_here', 'only_here'}) # Finding 2
+AssertionError: assert {'aipa_ro.cus...ic.customers'} <= frozenset({'a... 'only_here'})  # precedence
+7 failed
+```
+
+**Fidelity proof** (`test_pinned_qualified_execution_matches_the_server_
+unpinned`): 35 analytics + 12 qualified-column queries = 47, original on the
+stock path vs rewritten under the pin. 46 identical columns and rows; 1
+identical error - `SELECT g.generate_series FROM generate_series(1,5) g`, in
+`_LEGITIMATE_QUALIFIED_COLUMN_QUERIES` but refused by PostgreSQL 16 itself
+(`UndefinedColumn`: an aliased scalar function scan names its column after the
+alias). That shape was only ever validated, never executed; the comment in
+`safety._query_bound_names` calling it "legal PostgreSQL" is wrong - left for a
+follow-up, since it is a false acceptance that fails at execution, not a leak.
+43 of 47 were rewritten, 51 qualifiers inserted.
+
+**Owner decision needed - the pin's measured cost.** The design was chosen over
+blocking operator symbols because `citext`'s `=` and `pg_trgm`'s `%` live in
+`public`. Measured live: the pin does not preserve them either. A `citext`
+`=` comparison returns its row on the stock path and **no rows, no error**
+under the pin (`pg_catalog`'s case-sensitive `text = text` is reached through
+citext's implicit cast); `pg_trgm`'s `%` fails with `UndefinedFunction`.
+Recorded by `test_the_pin_changes_what_extension_operators_in_public_mean`
+and in `docs/3_decisions.md`. No demo database uses either extension. Whether
+to accept the silent `citext` change, or refuse queries that compare columns
+of non-`pg_catalog` types, is the owner's call; nothing here decides it.
+
+**Other changes worth a reviewer's eye.** The catalogue reads are pinned too,
+not only `execute()` - their unqualified `unnest`/`array_agg`/`=` were
+exposed to the same shadowing, and the new resolution query must not be
+answerable by an overload. `test_function_scan_spellings_are_refused_with_
+unnest_allowlisted` now arms its execution half with `'{public.customers}'`:
+under the pin the bare-name payload returns `NULL` (asserted), so a qualified
+name is what still proves the validator is the refusal that matters.
+
+**Verified:**
+
+```
+$ AIPA_TEST_POSTGRES_DSN=postgresql://aipa_ro:aipa_ro_pw@127.0.0.1:55432/aipa uv run pytest
+887 passed, 6 skipped in 19.43s
+$ AIPA_TEST_POSTGRES_DSN=... uv run pytest -m conformance -rs
+36 passed, 857 deselected in 0.91s        (0 skipped)
+$ env -u AIPA_TEST_POSTGRES_DSN uv run pytest
+579 passed, 314 skipped in 8.23s          (0 failed)
+$ uv run ruff check .
+All checks passed!
+$ uv run ruff format --check .
+80 files already formatted
+$ uv run mypy
+Success: no issues found in 32 source files
+$ uv run python scripts/evaluate_text_to_sql.py --mode gold
+Evaluated 12 cases. Exact result match: 12/12      (then git checkout evaluation/results/)
+```
+
+887 up from 790: +40 `test_safety.py`, +48 `test_engine_postgres.py` (47
+fidelity cases and a coverage check), +8 `test_postgres_search_path_pin.py`,
++1 `test_pipeline.py`; none removed or relaxed. DuckDB's 61-query corpus: 62
+passed (61 plus its size check). The previously closed bypasses - `(expr).name`,
+`::regclass`, `alias.name`, `lo_get` in a readable schema, the `ROWS FROM`/
+`unnest` seam, `3cf40dc`'s function identity - plus the analytics corpus and
+the internals probes: 147 passed, 1 skipped (SQLite's no-second-schema case)
+under `-k`. Post-run superuser check: only `public` holding
+`brand_new_table`/`customers`/`sales`, no user functions, operators, casts or
+extensions beyond `plpgsql`. `.devcontainer/devcontainer.json` was never staged.
