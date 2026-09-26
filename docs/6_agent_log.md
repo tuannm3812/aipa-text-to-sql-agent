@@ -1442,3 +1442,138 @@ check confirms the only non-internal schema is `public` holding
 `brand_new_table`/`customers`/`sales` — the pre-existing fixture drift, left
 alone, and nothing created by this session. `.devcontainer/devcontainer.json`
 has uncommitted owner edits and was never staged.
+
+## 2026-09-26 — Codex review of Claude's Phase 3b closeout (`6c33993..b14b7d3`)
+
+**Verdict: fix before merge.** The ordinary regression, quality, conformance,
+and gold-evaluation gates pass, but two live PostgreSQL probes found one
+security boundary failure and one search-path correctness failure. No product
+code was changed in this review. The pre-existing
+`.devcontainer/devcontainer.json` owner edit was left untouched.
+
+### Finding 1 — Critical: the allowlist does not pin function identity
+
+`safety._references_disallowed_function` accepts a call when
+`_resolve_function_name(function)` is present in
+`PostgresEngine.allowed_functions`. It does not constrain the function's schema,
+argument signature, or resolved `pg_proc` identity. PostgreSQL overload
+resolution can therefore dispatch an allowlisted spelling to a user-defined
+function rather than the audited `pg_catalog` built-in. This affects both an
+explicitly qualified call and an ordinary unqualified call; rejecting only
+`public.lower(...)` would not close the hole.
+
+Live reproduction against the local PostgreSQL 16 fixture:
+
+1. As the bootstrap superuser, created a schema on which `aipa_ro` had no
+   `USAGE`, a table containing `PROBE_SECRET`, and a
+   `SECURITY DEFINER public.lower(integer)` overload that returned that value.
+   PostgreSQL grants function execution to `PUBLIC` by default.
+2. Through the application code and the real `aipa_ro` DSN:
+
+   ```text
+   SELECT public.lower(customer_id) FROM customers LIMIT 1
+   is_safe_query -> True
+   execute_query -> [('PROBE_SECRET',)]
+
+   SELECT lower(customer_id) FROM customers LIMIT 1
+   is_safe_query -> True
+   engine.execute -> [('PROBE_SECRET',)]
+   ```
+
+3. The hidden table itself was not in the advertised schema and a direct query
+   was rejected by the validator; the role also lacked schema `USAGE`. The
+   allowlisted overload was the only path used to obtain the value.
+
+This defeats the stated reason for default-deny — safety across extensions and
+future functions — and permits a validated query to read data outside the
+role's direct table privileges. The fix needs to pin callable provenance, not
+just spelling. At minimum, PostgreSQL validation/execution must ensure ordinary
+allowlisted calls cannot resolve to user-defined overloads (including through
+`search_path` or an explicit qualifier), with a live regression test using a
+same-name overload. A transaction marked read-only does not prevent reads made
+by a `SECURITY DEFINER` function.
+
+The probe function, table, and schema were dropped immediately. A post-cleanup
+catalogue query found only the pre-existing `public.brand_new_table`,
+`public.customers`, and `public.sales` objects.
+
+### Finding 2 — Moderate: `current_schema()` does not model the full search path
+
+`PostgresEngine.default_schema` treats `current_schema()` as PostgreSQL's
+answer to "what does a bare name resolve to," and `_user_schema_names` reads
+only that one schema plus explicit `AIPA_EXTRA_SCHEMAS`. PostgreSQL actually
+resolves each bare relation by walking the complete ordered `search_path`; if
+the first schema exists but does not contain a particular relation, a later
+schema can supply it.
+
+Live reproduction:
+
+1. Created an `aipa_ro` schema containing only `only_here` and granted the role
+   access. The stock `"$user", public` search path then made
+   `current_schema()` return `aipa_ro`.
+2. With `AIPA_EXTRA_SCHEMAS` unset, the engine reported:
+
+   ```text
+   default_schema = aipa_ro
+   advertised = ['aipa_ro.only_here', 'only_here']
+   is_safe_query('SELECT * FROM customers') = False
+   engine.execute('SELECT name FROM customers ...') = [('Alice',), ('Bob',)]
+   ```
+
+PostgreSQL correctly fell through to `public.customers`, while the schema/RAG
+and validator layers omitted and rejected the same valid bare reference. This
+is fail-closed, not an exposure, but it makes normal databases with a
+multi-entry search path silently lose queryable tables and contradicts the
+one-identity contract documented in the Phase 3b decision. Model the effective
+ordered search path per table (including shadowing), or explicitly reject a
+multi-schema search path rather than approximating it with `current_schema()`.
+Add a regression where the first search-path schema exists but the requested
+table exists only in a later schema.
+
+The temporary `aipa_ro` schema was dropped after the probe; the same post-run
+catalogue check confirmed no review objects remain.
+
+### Finding 3 — Low: completed Phase 3b code still describes PostgreSQL as future work
+
+`text_to_sql_agent/dsn.py` says "No PostgreSQL engine exists yet," and the
+module header in `engines/postgres.py` says its prompt fragments are
+placeholders that Task 7 will write, although the engine and the final prompt
+fragments now ship. These comments should describe current behavior so the
+security-sensitive code does not send future reviewers to an obsolete phase
+state.
+
+### Verification run during this review
+
+The live PostgreSQL fixture was healthy throughout. Fresh results:
+
+```text
+$ AIPA_TEST_POSTGRES_DSN=postgresql://aipa_ro:aipa_ro_pw@127.0.0.1:55432/aipa uv run pytest
+786 passed, 6 skipped in 17.82s
+
+$ AIPA_TEST_POSTGRES_DSN=... uv run pytest -m conformance -rs
+36 passed, 756 deselected in 1.17s
+
+$ env -u AIPA_TEST_POSTGRES_DSN UV_CACHE_DIR=/private/tmp/aipa-review-uv uv run pytest
+538 passed, 254 skipped in 9.30s
+
+$ UV_CACHE_DIR=/private/tmp/aipa-review-uv uv run ruff check .
+All checks passed!
+
+$ UV_CACHE_DIR=/private/tmp/aipa-review-uv uv run ruff format --check .
+79 files already formatted
+
+$ UV_CACHE_DIR=/private/tmp/aipa-review-uv uv run mypy --strict text_to_sql_agent
+Success: no issues found in 20 source files
+
+$ UV_CACHE_DIR=/private/tmp/aipa-review-uv uv run python -c "import app"
+(no output, exit 0)
+
+$ UV_CACHE_DIR=/private/tmp/aipa-review-uv uv run python scripts/evaluate_text_to_sql.py \
+    --mode gold --out-dir /private/tmp/aipa-review-gold
+Evaluated 12 cases. Exact result match: 12/12
+```
+
+`git diff --check 6c33993..b14b7d3` was clean before the log append. The first
+parallel quality invocation could not initialise uv's default cache under the
+sandbox (`Operation not permitted`); rerunning the same gates with
+`UV_CACHE_DIR=/private/tmp/aipa-review-uv` produced the passing results above.
