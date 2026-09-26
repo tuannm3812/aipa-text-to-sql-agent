@@ -1314,3 +1314,131 @@ the full gate plus conformance plus the end-to-end matrix plus gold plus
 both DSN states, not a re-run of every probe that produced those numbers.
 CI (`gh run list`/`gh run watch`) was checked after pushing this task's
 commits; see the push record for the run URL and conclusion.
+
+## 2026-09-26 — Claude's fix-before-merge pass on the Phase 3b whole-phase review
+
+BASE `50742db`. Four findings from the final whole-phase review, four commits:
+`f963eec`, `e35f657`, `e0b472c`, `3633933`. Full working notes in
+`.superpowers/sdd/final-review-fixes-report.md` (untracked, per `.gitignore`).
+
+**1. `safety._relation_binding` failed open for relation kinds it did not
+recognise (latent Critical).** It recognised exactly two function-scan
+spellings — `exp.Table(this=Func)` and `exp.Lateral(this=Func)` — treated those
+strictly, and let every other relation kind fall through to a permissive
+catch-all. Two further PostgreSQL function-scan spellings landed there:
+`FROM ROWS FROM (...) g` (`exp.Table` carrying `rows_from`, `.this` is `None`)
+and `FROM unnest(...) g` (`exp.Unnest`, which subclasses `exp.Func` directly
+rather than wrapping one). Reproduced live at BASE with `"unnest"` added to
+`PostgresEngine.allowed_functions` — one legitimate entry any deployment with an
+array column needs:
+
+```
+q = "SELECT g.to_regclass, 1 AS to_regclass FROM unnest('{customers}'::text[]) g"
+shipped allowlist:       is_safe_query(q) -> False
+allowlist | {"unnest"}:  is_safe_query(q) -> True
+                         engine.execute(q) -> [('customers', 1)]
+```
+
+i.e. a completed `pg_class` lookup — the `::regclass` catalogue enumeration this
+phase already closed, reached again through a different node class. `aipa_ro`
+does not refuse it; the validator is the only gate. The `ROWS FROM` spelling was
+refused at BASE only because sqlglot leaves that `exp.Table`'s `.name` empty and
+`_references_unknown_table` rejects the empty candidate — an accident of node
+spelling, not a decision about this seam.
+
+Fixed by inverting the default. `safety._relation_kind` sorts every
+`FROM`/`JOIN` target into `table` / `opaque` / `function-scan` /
+`unrecognised`; only `opaque` (derived table, parenthesised join tree, `VALUES`
+list, `LATERAL` over a subquery, CTE reference) resolves permissively. A
+function scan resolves against `_function_scan_output_names` plus its explicit
+alias list and nothing else. An unrecognised kind binds nothing but its alias
+list, and `_has_unrecognised_relation` refuses the statement outright rather
+than let an unaliased one reach the permissive fallback — the "assume there is a
+fifth" guard, since the previous four bypasses were each found one node class at
+a time.
+
+Swept every relation node sqlglot 27.29.0's `postgres` dialect can put in a
+table-source position and recorded which branch each takes; the table is in the
+report and the 15-case sweep is pinned server-free by
+`tests/test_safety.py::test_every_postgres_relation_kind_takes_a_known_branch`.
+False rejections measured before committing, not assumed: 0 across PostgreSQL's
+35-query corpus, DuckDB's 61-query corpus, and all 12
+`_LEGITIMATE_QUALIFIED_COLUMN_QUERIES` shapes. The fix also *removes* a false
+rejection: `SELECT g.unnest FROM unnest(...) g` was refused at BASE even with
+`unnest` allowlisted, because `_query_bound_names` collected a function scan's
+output name only from `exp.Table(this=Func)`.
+
+Tests add the sweep, direct `_relation_binding` assertions for all three
+`ROWS FROM` forms (so that refusal stops being accidental), eight payloads
+against a fake engine that allowlists `unnest` (so the pin does not depend on a
+taste call in `engines/postgres.py`), and a live test that `monkeypatch`es
+`unnest` on and then runs the payload through `engine.execute` to prove the role
+does not refuse it.
+
+**2. Documentation that contradicted shipped behaviour.** Schema scope was
+widened mid-phase and then narrowed to opt-in via `AIPA_EXTRA_SCHEMAS` by owner
+decision the same day. `docs/3_decisions.md`'s "schema-qualified table identity"
+entry was **not** rewritten — a note under the heading marks it partly
+superseded by the opt-in entry above it, and the two stale claims are struck
+through with an inline correction, matching how the file already supersedes.
+`engines/base.py`'s `Engine.schema_chunks()` docstring (the Protocol contract a
+future engine author implements against) and four places in `engines/duckdb.py`
+now describe what the code does. Swept `grep -rn "every schema"` afterwards;
+remaining hits are factual or dated narrative that narrows itself in the next
+sentence, and `docs/6_agent_log.md` was left alone as append-only.
+
+**3. `AIPA_EXTRA_SCHEMAS` was undocumented for users.** It lived only in the
+decision log, source comments and tests, while the consequence of not knowing
+it is severe and silent: tables in `analytics`, empty schema, every question
+answering `UNANSWERABLE_WITH_GIVEN_SCHEMA`, nothing naming the knob. Documented
+in `README.md` beside the other environment configuration with the example
+value and the symptom to recognise, and in `docs/2_architecture.md` step 2 where
+schema extraction is described.
+
+**4. `collate` was allowlisted for PostgreSQL but not DuckDB.** Both use
+default-deny, both support `COLLATE`, and `exp.Collate` is an `exp.Func`
+subclass either way, so DuckDB refused a query DuckDB itself runs. Swept the
+whole set difference rather than the one name: it was
+`{collate, current_timestamp, initcap}`. `current_timestamp` is the same defect
+(`exp.CurrentTimestamp`, also pure grammar; `"now"` does not cover it because
+`now()` parses to `exp.Anonymous`) and was added. `initcap` is not — DuckDB
+genuinely does not register it (`Catalog Error: Scalar Function with name
+initcap does not exist`) — so it stays off, and is now the whole expected
+difference, pinned by a test.
+
+**Verified:**
+
+```
+$ AIPA_TEST_POSTGRES_DSN=postgresql://aipa_ro:aipa_ro_pw@127.0.0.1:55432/aipa uv run pytest
+786 passed, 6 skipped in 17.31s
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+79 files already formatted
+
+$ uv run mypy
+Success: no issues found in 32 source files
+
+$ AIPA_TEST_POSTGRES_DSN=... uv run pytest -m conformance -rs
+36 passed, 756 deselected in 0.82s      (0 skipped)
+
+$ uv run python scripts/evaluate_text_to_sql.py --mode gold
+Evaluated 12 cases. Exact result match: 12/12
+$ git checkout evaluation/results/
+
+$ unset AIPA_TEST_POSTGRES_DSN && uv run pytest
+538 passed, 254 skipped in 8.18s        (0 failed)
+```
+
+786 passed, up from BASE's 750 — 36 new tests, none removed and none relaxed.
+The four closed PostgreSQL bypasses were re-probed directly against the live
+instance and all stay closed: `(expr).name` field notation (two spellings),
+`::regclass`/`::regrole` OID casts (three spellings), `alias.name` column sugar
+(two spellings), and the `lo_get`-in-a-readable-schema regression via its own
+test, which creates an opted-in schema and drops it again. Post-run superuser
+check confirms the only non-internal schema is `public` holding
+`brand_new_table`/`customers`/`sales` — the pre-existing fixture drift, left
+alone, and nothing created by this session. `.devcontainer/devcontainer.json`
+has uncommitted owner edits and was never staged.
