@@ -581,6 +581,9 @@ def _query_bound_names(parsed: sqlglot_exp.Expression) -> frozenset[str]:
     - The resolved name of any table-valued function - a function scan's
       single output column is named after the function itself, so `SELECT
       g.generate_series FROM generate_series(1,5) g` is legal PostgreSQL.
+      Collected through `_relation_kind`/`_function_scan_output_names` rather
+      than by matching `exp.Table(this=Func)` directly, so the `ROWS FROM`
+      and `unnest` spellings contribute their output names here too.
       Admitting these names is safe rather than circular: this function is
       only ever consulted *after* `_references_disallowed_function` has
       already rejected the statement if any function name in it is not in
@@ -611,11 +614,10 @@ def _query_bound_names(parsed: sqlglot_exp.Expression) -> frozenset[str]:
             name = (column.name or "").lower()
             if name:
                 names.add(name)
-    for table in parsed.find_all(exp.Table):
-        if isinstance(table.this, exp.Func):
-            name = _resolve_function_name(table.this)
-            if name:
-                names.add(name)
+    for scope in parsed.find_all(exp.Select):
+        for relation in _scope_relations(scope):
+            if _relation_kind(relation) == _RELATION_FUNCTION_SCAN:
+                names |= _function_scan_output_names(relation)
     return frozenset(names)
 
 
@@ -692,6 +694,127 @@ def _scope_relations(scope: sqlglot_exp.Expression) -> list[sqlglot_exp.Expressi
     return relations
 
 
+# The four kinds `_relation_kind` sorts a `FROM`/`JOIN` target into.
+#
+# Added 2026-09-26 (final whole-phase review), which found the previous shape
+# failing **open**. That version recognised exactly two function-scan
+# spellings - `exp.Table(this=Func)` and `exp.Lateral(this=Func)` - treated
+# those strictly, and let *every other* relation kind fall through to the
+# permissive catch-all. Two further PostgreSQL function-scan spellings land
+# in that catch-all: `FROM ROWS FROM (generate_series(1,2)) g` (an
+# `exp.Table` carrying `rows_from`, whose own `.this` is `None`) and
+# `FROM unnest('{...}'::text[]) g` (an `exp.Unnest`, which is not an
+# `exp.Table` at all). Reproduced live on the review's PostgreSQL instance:
+# with `"unnest"` added to `PostgresEngine.allowed_functions` - one
+# legitimate entry any deployment with an array column needs -
+# `SELECT g.to_regclass, 1 AS to_regclass FROM unnest('{customers}'::text[]) g`
+# validated and executed, returning `('customers', 1)`, i.e. the `::regclass`
+# catalogue lookup this phase already closed once, reached again through a
+# different node class.
+#
+# The default is therefore inverted here: the permissive branch is reached
+# only for the kinds this module *recognises* as opaque, and anything else
+# is treated as a function scan or, failing that, refused. The cost of the
+# inversion was measured before it shipped rather than assumed - see
+# `_references_unresolvable_qualified_column`'s docstring.
+_RELATION_TABLE = "table"
+_RELATION_OPAQUE = "opaque"
+_RELATION_FUNCTION_SCAN = "function-scan"
+_RELATION_UNRECOGNISED = "unrecognised"
+
+
+def _relation_kind(relation: sqlglot_exp.Expression) -> str:
+    """Sort one `FROM`/`JOIN` target into the four kinds above.
+
+    Swept against sqlglot's `postgres` dialect (2026-09-26): every relation
+    node the parser can put in a table-source position is one of
+    `exp.Table` (a plain name, a function scan, or a `ROWS FROM` list),
+    `exp.Subquery`, `exp.Values`, `exp.Lateral` or `exp.Unnest`. A `JOIN`
+    contributes its own target through `_scope_relations` rather than a
+    distinct kind. Anything outside that set - a node class a future sqlglot
+    release introduces - is `_RELATION_UNRECOGNISED`, which is a refusal
+    rather than a permission.
+
+    Args:
+        relation: A node in a table-source position.
+
+    Returns:
+        One of `_RELATION_TABLE`, `_RELATION_OPAQUE`,
+        `_RELATION_FUNCTION_SCAN` or `_RELATION_UNRECOGNISED`.
+    """
+    if exp is None:
+        return _RELATION_UNRECOGNISED
+    inner = relation.this
+    if isinstance(relation, exp.Table):
+        if relation.args.get("rows_from"):
+            # `FROM ROWS FROM (f(), g()) t` - a function scan per entry.
+            return _RELATION_FUNCTION_SCAN
+        if isinstance(inner, exp.Func):
+            # `FROM generate_series(1, 5) g`, `FROM xmltable(...) x`.
+            return _RELATION_FUNCTION_SCAN
+        if isinstance(inner, exp.Identifier):
+            return _RELATION_TABLE
+        return _RELATION_UNRECOGNISED
+    if isinstance(relation, exp.Unnest):
+        # `FROM unnest(...) g`. `exp.Unnest` *is* the function node (it
+        # subclasses `exp.Func`), rather than wrapping one in `.this`, which
+        # is exactly why the old `isinstance(inner, exp.Func)` test missed it.
+        return _RELATION_FUNCTION_SCAN
+    if isinstance(relation, exp.Lateral):
+        # `LATERAL (SELECT ...) s` is opaque; `LATERAL unnest(x) u` and
+        # `LATERAL generate_series(...) g` are function scans.
+        if isinstance(inner, exp.Func):
+            return _RELATION_FUNCTION_SCAN
+        if isinstance(inner, (exp.Subquery, exp.Query)):
+            return _RELATION_OPAQUE
+        return _RELATION_UNRECOGNISED
+    if isinstance(relation, (exp.Subquery, exp.Values)):
+        # A derived table, a parenthesised join tree, or a `VALUES` list.
+        return _RELATION_OPAQUE
+    return _RELATION_UNRECOGNISED
+
+
+def _function_scan_output_names(relation: sqlglot_exp.Expression) -> frozenset[str]:
+    """The output column names a function scan contributes, before its alias list.
+
+    PostgreSQL names a table function's single output column after the
+    function itself (`SELECT g.generate_series FROM generate_series(1,5) g`),
+    and a `ROWS FROM (f(), g())` list contributes one such name per entry.
+    Nothing else: a function scan supplies no table columns at all, which is
+    what makes `g.lo_get` resolve to nothing however many real columns
+    elsewhere in the database happen to be called `lo_get`.
+
+    Every name this returns has already been through
+    `_references_disallowed_function`, which runs first and rejects the whole
+    statement if any function name in it is not in `engine.allowed_functions`
+    - so this can never contribute a name the engine does not already admit.
+
+    Args:
+        relation: A relation `_relation_kind` classified as a function scan.
+
+    Returns:
+        The lowercased output column names.
+    """
+    if exp is None:
+        return frozenset()
+    names: set[str] = set()
+    rows_from = relation.args.get("rows_from") or []
+    if rows_from:
+        for entry in rows_from:
+            inner = entry.this if isinstance(entry, exp.Table) else entry
+            if isinstance(inner, exp.Func):
+                name = _resolve_function_name(inner)
+                if name:
+                    names.add(name)
+        return frozenset(names)
+    node = relation if isinstance(relation, exp.Func) else relation.this
+    if isinstance(node, exp.Func):
+        name = _resolve_function_name(node)
+        if name:
+            names.add(name)
+    return frozenset(names)
+
+
 def _relation_binding(
     relation: sqlglot_exp.Expression, *, real_table_columns: Mapping[str, frozenset[str]]
 ) -> tuple[frozenset[str], frozenset[str] | None]:
@@ -702,6 +825,11 @@ def _relation_binding(
     output columns this module deliberately does not compute - see
     `_references_unresolvable_qualified_column` for which kinds those are and
     why resolving them exactly is not attempted.
+
+    Dispatched on `_relation_kind`, and `None` is returned only for
+    `_RELATION_OPAQUE` and for a real table this engine does not advertise.
+    The default is strict: see `_relation_kind`'s comment for the review that
+    inverted it and the live bypass that made it necessary.
 
     Args:
         relation: A node in a table-source position.
@@ -717,25 +845,18 @@ def _relation_binding(
         return frozenset(), None
     alias = _alias_name(relation)
     alias_columns = _alias_columns(relation)
+    kind = _relation_kind(relation)
 
-    # A function scan: `FROM generate_series(1, 5) g`, or the same thing
-    # spelled `JOIN LATERAL generate_series(...) g`. This is the relation kind
-    # the whole bypass runs through, and the one that must stay strict: its
-    # only output column is named after the function itself (plus whatever an
-    # explicit alias list renames it to), so a catalogue function reached as
-    # `g.lo_get` resolves to nothing here however many real columns elsewhere
-    # in the database happen to share that name.
-    inner = relation.this
-    if isinstance(relation, (exp.Table, exp.Lateral)) and isinstance(inner, exp.Func):
-        function_name = _resolve_function_name(inner)
-        names = alias_columns | ({function_name} if function_name else set())
+    if kind == _RELATION_FUNCTION_SCAN:
+        output_names = _function_scan_output_names(relation)
+        names = alias_columns | output_names
         if alias:
             return frozenset({alias}), frozenset(names)
         # Unaliased, so PostgreSQL qualifies it by the function's own name:
         # `SELECT generate_series.generate_series FROM generate_series(1, 5)`.
-        return frozenset({function_name} if function_name else set()), frozenset(names)
+        return frozenset(output_names), frozenset(names)
 
-    if isinstance(relation, exp.Table):
+    if kind == _RELATION_TABLE and isinstance(relation, exp.Table):
         name = (relation.name or "").lower()
         schema = (relation.db or "").lower()
         # An unaliased table answers to its bare name and, on PostgreSQL, to
@@ -755,10 +876,44 @@ def _relation_binding(
             return frozenset(qualifiers), None
         return frozenset(qualifiers), frozenset(columns | alias_columns)
 
-    # A derived table, a `VALUES` list, a `LATERAL` over a subquery, or
-    # anything else that binds an alias - permissive, for the reasons in
-    # `_references_unresolvable_qualified_column`'s docstring.
-    return frozenset({alias} if alias else set()), None
+    if kind == _RELATION_OPAQUE:
+        # A derived table, a parenthesised join tree, a `VALUES` list or a
+        # `LATERAL` over a subquery - permissive, for the reasons in
+        # `_references_unresolvable_qualified_column`'s docstring.
+        return frozenset({alias} if alias else set()), None
+
+    # `_RELATION_UNRECOGNISED`. Strict, and with no output names at all: a
+    # qualified reference through a relation kind this module cannot classify
+    # resolves to nothing but an explicit column alias list. An *unaliased*
+    # one binds no qualifier here at all, which `_references_unresolvable_
+    # qualified_column` handles separately rather than letting it reach the
+    # permissive fallback.
+    return frozenset({alias} if alias else set()), frozenset(alias_columns)
+
+
+def _has_unrecognised_relation(parsed: sqlglot_exp.Expression) -> bool:
+    """True if any scope's `FROM`/`JOIN` binds a relation kind we cannot classify.
+
+    The "assume there is a fifth" guard. `_relation_binding` already refuses a
+    qualified reference *through* an unrecognised relation, but an unaliased
+    one binds no qualifier for it to match, so the reference would instead
+    fall through to the permissive fallback - the same fail-open shape the
+    2026-09-26 inversion closed. This lets the caller refuse in that case
+    instead.
+
+    Args:
+        parsed: The parsed statement.
+
+    Returns:
+        True if some relation in the statement is `_RELATION_UNRECOGNISED`.
+    """
+    if exp is None:
+        return True
+    for scope in parsed.find_all(exp.Select):
+        for relation in _scope_relations(scope):
+            if _relation_kind(relation) == _RELATION_UNRECOGNISED:
+                return True
+    return False
 
 
 def _qualifier_keys(column: sqlglot_exp.Column) -> tuple[str, ...]:
@@ -898,7 +1053,8 @@ def _references_unresolvable_qualified_column(
       or `NATURAL` join and a correlated reference all resolve here without
       special cases, because each alias still names a real table.
     - A qualifier bound to a **function scan** (`generate_series(...) g`,
-      including the `LATERAL` spelling) resolves against the function's own
+      including the `LATERAL`, `ROWS FROM (...)` and `unnest(...)`
+      spellings - see `_relation_kind`) resolves against the function's own
       output column name and its alias list - nothing else. A function scan
       contributes no table columns at all, which is exactly why the payload
       above now fails to resolve: `lo_get` is not `generate_series`.
@@ -909,6 +1065,13 @@ def _references_unresolvable_qualified_column(
     **The fallback, and why it is the permissive direction.** Three qualifier
     kinds are deliberately *not* resolved exactly: a CTE name, a derived table
     or `VALUES` alias, and a qualifier the statement does not bind at all.
+    That list is now a closed one rather than a catch-all: `_relation_kind`
+    classifies each relation in the `FROM`, and only the kinds it *recognises*
+    as opaque reach the fallback. A relation kind it cannot classify is
+    strict, and `_has_unrecognised_relation` refuses the statement outright if
+    an unresolved qualifier would otherwise reach the fallback past one. See
+    `_relation_kind`'s own comment for the two function-scan spellings the
+    previous catch-all admitted and the live bypass that followed.
     Computing a CTE's or derived table's output columns means re-implementing
     name resolution through `SELECT *`, nested `USING`/`NATURAL` joins and
     `LATERAL` - the previous implementer avoided exactly that, and rightly:
@@ -932,7 +1095,10 @@ def _references_unresolvable_qualified_column(
     PostgreSQL's 35-query analytics corpus, DuckDB's 61-query corpus and all
     twelve shapes in `tests/test_engine_postgres.py::
     _LEGITIMATE_QUALIFIED_COLUMN_QUERIES` - see
-    `.superpowers/sdd/task-6-report.md`.
+    `.superpowers/sdd/task-6-report.md`. Re-measured over the same three
+    corpora after the 2026-09-26 relation-kind inversion, with the same
+    result: 0 rejections - see
+    `.superpowers/sdd/final-review-fixes-report.md`.
 
     `get_real_table_columns` is a zero-argument callable for the same reason
     `_references_unknown_table`'s `get_real_table_names` is: a statement with
@@ -969,6 +1135,14 @@ def _references_unresolvable_qualified_column(
     for column in candidates:
         resolvable = _qualifier_binding(column, real_table_columns=real_table_columns)
         if resolvable is None:
+            if _has_unrecognised_relation(parsed):
+                # The permissive fallback is exactly what the 2026-09-26
+                # inversion stopped trusting for unclassified relation kinds,
+                # so an unresolved qualifier in a statement that contains one
+                # is refused rather than handed to it. Never fires for any
+                # relation kind sqlglot's `postgres` dialect produces today -
+                # measured at 0 rejections across both analytics corpora.
+                return True
             if fallback is None:
                 fallback = _referenced_table_columns(parsed, real_table_columns) | (
                     _query_bound_names(parsed)

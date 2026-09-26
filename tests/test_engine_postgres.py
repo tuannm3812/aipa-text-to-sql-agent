@@ -1051,6 +1051,75 @@ def test_collate_is_allowed(postgres_dsn: str) -> None:
     assert result.ok, f"{sql!r} failed to execute: {result.error}"
 
 
+# Final whole-phase review, 2026-09-26. `safety._relation_binding` recognised
+# only two function-scan spellings and resolved every other relation kind
+# permissively, so `FROM unnest(...) g` and `FROM ROWS FROM (...) g` re-armed
+# the `alias.name` -> `name(alias)` bypass. Reproduced live at BASE (commit
+# 50742db) with `"unnest"` added to `PostgresEngine.allowed_functions`:
+#
+#   is_safe_query("SELECT g.to_regclass, 1 AS to_regclass
+#                  FROM unnest('{customers}'::text[]) g")   -> True
+#   engine.execute(same)                                    -> [('customers', 1)]
+#
+# i.e. a completed `pg_class` lookup - the `::regclass` catalogue enumeration
+# this phase already closed, reached through a different node class. The
+# server-free sweep over every relation kind lives in `tests/test_safety.py`;
+# this is the live half, and it is the half that proves the role does not
+# refuse the payload on its own.
+_FUNCTION_SCAN_SPELLING_PAYLOAD = (
+    "SELECT g.to_regclass, 1 AS to_regclass FROM unnest('{customers}'::text[]) g"
+)
+
+
+def test_function_scan_spellings_are_refused_with_unnest_allowlisted(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`unnest` is off `PostgresEngine.allowed_functions` only because nothing
+    in the demo schema has an array column - a taste call, and one any
+    deployment that does have one has to reverse. The pin must not depend on
+    it, so this puts `unnest` back for the duration and proves the validator
+    still refuses every function-scan spelling.
+
+    Also proves the payload is real rather than theoretical: run through
+    `engine.execute` directly, bypassing the validator, PostgreSQL happily
+    resolves `customers` against `pg_class` for the `aipa_ro` role. Nothing
+    below the validator refuses it.
+    """
+    assert PostgresEngine.allowed_functions is not None
+    monkeypatch.setattr(
+        PostgresEngine,
+        "allowed_functions",
+        PostgresEngine.allowed_functions | {"unnest", "list_value"},
+    )
+    engine = open_engine(postgres_dsn)
+
+    # Armed: `unnest` really is allowlisted now, so the refusals below are the
+    # relation-kind rule's doing and not the function-name rule's.
+    assert is_safe_query("SELECT g.unnest FROM unnest('{a}'::text[]) g", engine=engine)
+
+    for label, sql in [
+        ("unnest_aliased", _FUNCTION_SCAN_SPELLING_PAYLOAD),
+        (
+            "unnest_unaliased",
+            "SELECT unnest.to_regclass, 1 AS to_regclass FROM unnest('{customers}'::text[])",
+        ),
+        (
+            "lateral_unnest",
+            "SELECT g.to_regclass, 1 AS to_regclass FROM customers c "
+            "JOIN LATERAL unnest('{customers}'::text[]) g ON TRUE",
+        ),
+        (
+            "rows_from",
+            "SELECT g.to_regclass, 1 AS to_regclass FROM ROWS FROM (generate_series(1,2)) g",
+        ),
+    ]:
+        assert not is_safe_query(sql, engine=engine), f"wrongly accepted ({label}): {sql!r}"
+
+    # The payload is genuinely dangerous: the validator is the only refusal.
+    leaked = engine.execute(_FUNCTION_SCAN_SPELLING_PAYLOAD, max_rows=10, work_limit=0)
+    assert leaked.rows == [("customers", 1)], leaked.error
+
+
 # The task brief's Step 5: PostgreSQL's internals surface (`pg_*`,
 # `information_schema`) must be refused whether it is named as a bare table
 # source or as a schema qualifier in front of an otherwise-innocent-looking

@@ -576,3 +576,217 @@ def test_qualified_column_resolution_is_scoped_to_the_referenced_tables(
     """
     engine = _FakePostgresEngine()
     assert agent.is_safe_query(sql, engine=engine) is accepted, f"{label}: {sql!r}"
+
+
+# --- The relation-kind sweep (final whole-phase review, 2026-09-26) ---------
+#
+# `safety._relation_binding` used to recognise two function-scan spellings and
+# treat *every other* relation kind permissively. Two further PostgreSQL
+# function-scan spellings landed in that permissive branch - `FROM ROWS FROM
+# (...) g` and `FROM unnest(...) g` - and either one re-armed the `alias.name`
+# bypass in full as soon as `unnest` was allowlisted, which any deployment
+# with an array column needs. The default is now inverted: only the kinds
+# `safety._relation_kind` recognises as opaque resolve permissively.
+#
+# This sweeps every relation node sqlglot's `postgres` dialect can put in a
+# table-source position and pins which branch each one takes, so a future
+# sqlglot release that introduces a fifth cannot quietly inherit the
+# permissive one - it lands in `unrecognised`, which is a refusal.
+_RELATION_KIND_SWEEP: list[tuple[str, str, str]] = [
+    ("plain_table", "SELECT * FROM customers", "table"),
+    ("schema_qualified_table", "SELECT * FROM public.customers", "table"),
+    ("cte_reference", "WITH t AS (SELECT 1 AS x) SELECT * FROM t", "table"),
+    ("derived_table", "SELECT * FROM (SELECT 1 AS x) t", "opaque"),
+    ("parenthesised_join_tree", "SELECT * FROM (customers JOIN sales ON TRUE)", "opaque"),
+    ("values_list", "SELECT * FROM (VALUES (1)) AS v(x)", "opaque"),
+    ("lateral_subquery", "SELECT * FROM LATERAL (SELECT 1 AS x) s", "opaque"),
+    ("function_scan", "SELECT * FROM generate_series(1,5) g", "function-scan"),
+    ("function_scan_anonymous", "SELECT * FROM some_srf(1) g", "function-scan"),
+    ("xmltable", "SELECT * FROM xmltable('/r' PASSING d COLUMNS a text) x", "function-scan"),
+    ("lateral_function_scan", "SELECT * FROM LATERAL generate_series(1,5) g", "function-scan"),
+    ("unnest", "SELECT * FROM unnest('{a}'::text[]) g", "function-scan"),
+    ("unnest_with_ordinality", "SELECT * FROM unnest(ARRAY[1]) WITH ORDINALITY g", "function-scan"),
+    ("rows_from", "SELECT * FROM ROWS FROM (generate_series(1,2)) g", "function-scan"),
+    (
+        "rows_from_multi",
+        "SELECT * FROM ROWS FROM (generate_series(1,2), some_srf(3)) g(a, b)",
+        "function-scan",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "sql", "expected"),
+    _RELATION_KIND_SWEEP,
+    ids=[label for label, _, _ in _RELATION_KIND_SWEEP],
+)
+def test_every_postgres_relation_kind_takes_a_known_branch(
+    label: str, sql: str, expected: str
+) -> None:
+    """Sweep of sqlglot's `postgres` dialect: each relation node in a `FROM`
+    must land in the branch this pins, and only `opaque` resolves permissively.
+    """
+    sqlglot = pytest.importorskip("sqlglot")
+    from text_to_sql_agent import safety
+
+    parsed = sqlglot.parse_one(sql, read="postgres")
+    relations = [
+        relation
+        for scope in parsed.find_all(safety.exp.Select)
+        for relation in safety._scope_relations(scope)
+    ]
+    kinds = [safety._relation_kind(relation) for relation in relations]
+    assert expected in kinds, f"{label}: {kinds}"
+    assert safety._RELATION_UNRECOGNISED not in kinds, f"{label}: {kinds}"
+
+
+class _FakePostgresEngineWithUnnest(_FakePostgresEngine):
+    """`_FakePostgresEngine` with `unnest` allowlisted - the one legitimate
+    entry that re-armed the bypass.
+
+    The pin must not depend on a taste call in a different file:
+    `PostgresEngine.allowed_functions` leaves `unnest` off only because
+    nothing in the demo schema has an array column, and any deployment that
+    does needs it back. `cast` is here for the `'{...}'::text[]` literal the
+    payload uses to build an array without `ARRAY[...]` (which parses to
+    `exp.Array` and resolves to the `list_value` token instead).
+    """
+
+    name = "fake-postgres-with-unnest"
+    allowed_functions: frozenset[str] | None = frozenset(
+        {"count", "sum", "generate_series", "unnest", "cast", "list_value"}
+    )
+
+
+# Each of these validated at BASE (commit 50742db) with `unnest` allowlisted,
+# and the first one executed against live PostgreSQL returning
+# `('customers', 1)` - `to_regclass` resolving a relation name through
+# `pg_class`, i.e. the `::regclass` catalogue enumeration this phase already
+# closed once, reached again through a different node class.
+_FUNCTION_SCAN_SPELLING_PAYLOADS: list[tuple[str, str]] = [
+    (
+        "unnest_aliased",
+        "SELECT g.to_regclass, 1 AS to_regclass FROM unnest('{customers}'::text[]) g",
+    ),
+    (
+        "unnest_unaliased",
+        "SELECT unnest.to_regclass, 1 AS to_regclass FROM unnest('{customers}'::text[])",
+    ),
+    (
+        "unnest_lo_get",
+        "SELECT g.lo_get, 1 AS lo_get FROM unnest('{customers}'::text[]) g",
+    ),
+    (
+        "unnest_borrowing_a_real_column",
+        "SELECT g.lo_get FROM other.audit a, unnest('{customers}'::text[]) g",
+    ),
+    (
+        "lateral_unnest",
+        "SELECT g.to_regclass, 1 AS to_regclass FROM customers c "
+        "JOIN LATERAL unnest('{customers}'::text[]) g ON TRUE",
+    ),
+    (
+        "rows_from",
+        "SELECT g.to_regclass, 1 AS to_regclass FROM ROWS FROM (generate_series(1,2)) g",
+    ),
+    (
+        "rows_from_unnest",
+        "SELECT g.to_regclass, 1 AS to_regclass FROM ROWS FROM (unnest('{customers}'::text[])) g",
+    ),
+    (
+        "rows_from_with_alias_list",
+        "SELECT g.to_regclass, 1 AS to_regclass FROM ROWS FROM (generate_series(1,2)) g(n)",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "sql"),
+    _FUNCTION_SCAN_SPELLING_PAYLOADS,
+    ids=[label for label, _ in _FUNCTION_SCAN_SPELLING_PAYLOADS],
+)
+def test_no_function_scan_spelling_can_re_arm_the_column_call_bypass(label: str, sql: str) -> None:
+    """Every function-scan spelling must resolve strictly, with `unnest`
+    allowlisted rather than absent - so this pins the seam itself, not the
+    accident of a name being off a list in another module.
+    """
+    engine = _FakePostgresEngineWithUnnest()
+    assert not agent.is_safe_query(sql, engine=engine), f"wrongly accepted ({label}): {sql!r}"
+
+
+def test_the_function_scan_fixture_is_actually_armed() -> None:
+    """The negative assertions above would pass for the wrong reason if
+    `unnest` were still refused on its name. A function scan's own output
+    column must still validate through every spelling.
+    """
+    engine = _FakePostgresEngineWithUnnest()
+    assert agent.is_safe_query("SELECT g.unnest FROM unnest('{a}'::text[]) g", engine=engine)
+    assert agent.is_safe_query("SELECT g.n FROM unnest('{a}'::text[]) AS g(n)", engine=engine)
+    assert agent.is_safe_query(
+        "SELECT g.generate_series FROM generate_series(1,5) g", engine=engine
+    )
+
+
+_STRICT_RELATION_BINDINGS: list[tuple[str, str, frozenset[str], frozenset[str]]] = [
+    (
+        "rows_from",
+        "SELECT * FROM ROWS FROM (generate_series(1,2)) g",
+        frozenset({"g"}),
+        frozenset({"generate_series"}),
+    ),
+    (
+        "rows_from_multi_with_alias_list",
+        "SELECT * FROM ROWS FROM (generate_series(1,2), some_srf(3)) g(a, b)",
+        frozenset({"g"}),
+        frozenset({"a", "b", "generate_series", "some_srf"}),
+    ),
+    (
+        "rows_from_unaliased",
+        "SELECT * FROM ROWS FROM (generate_series(1,2))",
+        frozenset({"generate_series"}),
+        frozenset({"generate_series"}),
+    ),
+    (
+        "unnest",
+        "SELECT * FROM unnest('{a}'::text[]) g",
+        frozenset({"g"}),
+        frozenset({"unnest"}),
+    ),
+    (
+        "unnest_unaliased",
+        "SELECT * FROM unnest('{a}'::text[])",
+        frozenset({"unnest"}),
+        frozenset({"unnest"}),
+    ),
+    (
+        "lateral_unnest",
+        "SELECT * FROM LATERAL unnest('{a}'::text[]) u",
+        frozenset({"u"}),
+        frozenset({"unnest"}),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "sql", "qualifiers", "names"),
+    _STRICT_RELATION_BINDINGS,
+    ids=[label for label, _, _, _ in _STRICT_RELATION_BINDINGS],
+)
+def test_function_scan_spellings_bind_strictly(
+    label: str, sql: str, qualifiers: frozenset[str], names: frozenset[str]
+) -> None:
+    """`ROWS FROM (...)` is refused end-to-end by `_references_unknown_table`
+    too - its outer `exp.Table` carries no name for that rule to match - but
+    that is an accident of how sqlglot spells the node, not a decision about
+    this seam. This asserts the seam directly: each spelling binds exactly its
+    own output names, so the refusal survives any change to the other rule.
+    """
+    sqlglot = pytest.importorskip("sqlglot")
+    from text_to_sql_agent import safety
+
+    parsed = sqlglot.parse_one(sql, read="postgres")
+    relation = safety._scope_relations(parsed)[0]
+    assert safety._relation_kind(relation) == safety._RELATION_FUNCTION_SCAN, label
+    bound_qualifiers, bound_names = safety._relation_binding(relation, real_table_columns={})
+    assert bound_qualifiers == qualifiers, label
+    assert bound_names == names, label
