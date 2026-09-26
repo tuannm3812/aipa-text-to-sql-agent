@@ -1116,8 +1116,18 @@ def test_function_scan_spellings_are_refused_with_unnest_allowlisted(
         assert not is_safe_query(sql, engine=engine), f"wrongly accepted ({label}): {sql!r}"
 
     # The payload is genuinely dangerous: the validator is the only refusal.
-    leaked = engine.execute(_FUNCTION_SCAN_SPELLING_PAYLOAD, max_rows=10, work_limit=0)
-    assert leaked.rows == [("customers", 1)], leaked.error
+    # Since the 2026-09-27 search-path pin, `engine.execute` resolves
+    # `to_regclass('customers')` against `pg_catalog` alone, so the payload's
+    # bare-name form now comes back NULL - the pin blunts it incidentally.
+    # A schema-qualified name inside the string is not affected by the pin,
+    # so that form is what proves the catalogue lookup still completes and
+    # the validator is still the refusal that matters.
+    assert engine.execute(_FUNCTION_SCAN_SPELLING_PAYLOAD, max_rows=10, work_limit=0).rows == [
+        (None, 1)
+    ]
+    armed = _FUNCTION_SCAN_SPELLING_PAYLOAD.replace("{customers}", "{public.customers}")
+    leaked = engine.execute(armed, max_rows=10, work_limit=0)
+    assert leaked.rows == [("public.customers", 1)], leaked.error
 
 
 # The task brief's Step 5: PostgreSQL's internals surface (`pg_*`,
@@ -1282,6 +1292,72 @@ def test_analytics_corpus_passes_validation_and_executes(postgres_dsn: str, sql:
     assert is_safe_query(sql, engine=engine), f"wrongly rejected: {sql!r}"
     result = engine.execute(sql, max_rows=1000, work_limit=0)
     assert result.ok, f"{sql!r} failed to execute: {result.error}"
+
+
+# --- 2026-09-27: fidelity of the pinned, engine-qualified execution ----------
+#
+# `PostgresEngine.execute` now runs every statement under `SET LOCAL
+# search_path = pg_catalog` and schema-qualifies each bare table reference
+# first (`safety.qualify_bare_table_references`). A rewrite that subtly
+# changed a query's meaning would be a correctness bug in every PostgreSQL
+# answer, so every legitimate query this file already carries is run both
+# ways and must return byte-identical results: the original text through a
+# plain `aipa_ro` connection on its stock search path (the server resolving
+# every name itself), and the engine's rewritten text under the pin.
+_FIDELITY_CORPUS: list[tuple[str, str]] = [
+    *((f"analytics_{i:02d}", sql) for i, sql in enumerate(ANALYTICS_CORPUS)),
+    *((f"qualified_column_{label}", sql) for label, sql in _LEGITIMATE_QUALIFIED_COLUMN_QUERIES),
+]
+
+
+def test_fidelity_corpus_covers_both_existing_corpora() -> None:
+    """The proof is only as strong as its coverage - pin the count it reports."""
+    assert len(_FIDELITY_CORPUS) == len(ANALYTICS_CORPUS) + len(
+        _LEGITIMATE_QUALIFIED_COLUMN_QUERIES
+    )
+
+
+@pytest.mark.parametrize(
+    "label,sql", _FIDELITY_CORPUS, ids=[label for label, _ in _FIDELITY_CORPUS]
+)
+def test_pinned_qualified_execution_matches_the_server_unpinned(
+    postgres_dsn: str, label: str, sql: str
+) -> None:
+    """Original SQL on the stock path and rewritten SQL under the pin: identical results.
+
+    Also pins what the rewrite is allowed to change: removing every inserted
+    `"public".` must give back the original text exactly, so the only edit
+    is a schema qualifier in front of a table - never a function, operator,
+    cast, alias or comment the validator inspected.
+
+    "Identical" includes failing identically. One entry,
+    `qualified_column_function_scan_default_column` (`SELECT g.generate_series
+    FROM generate_series(1,5) g`), was only ever checked against the
+    validator, and PostgreSQL 16 itself refuses it on the stock path - an
+    aliased scalar function scan names its column after the alias, not the
+    function (observed 2026-09-27: `UndefinedColumn`). The rewrite must then
+    refuse it with the same SQLSTATE, not answer it.
+    """
+    engine = open_engine(postgres_dsn)
+    with psycopg.connect(postgres_dsn, connect_timeout=5) as conn:
+        conn.read_only = True
+        try:
+            cur = conn.execute(sql)
+        except psycopg.Error as server_error:
+            with pytest.raises(psycopg.Error) as pinned_error:
+                engine.execute(sql, max_rows=10_000, work_limit=0)
+            assert pinned_error.value.sqlstate == server_error.sqlstate
+            return
+        expected_columns = [d.name for d in cur.description or []]
+        expected_rows = [tuple(row) for row in cur.fetchall()]
+
+    result = engine.execute(sql, max_rows=10_000, work_limit=0)
+
+    assert result.error is None, result.error
+    assert result.columns == expected_columns
+    assert result.rows == expected_rows
+    assert result.sql is not None
+    assert result.sql.replace('"public".', "") == sql
 
 
 # --- Task 5: harden the schema layer ----------------------------------------

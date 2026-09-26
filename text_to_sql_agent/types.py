@@ -44,14 +44,23 @@ class SchemaChunk:
             foreign-key edge and a chunk's own identity are the same kind of
             key (`rag.py`'s neighbour graph joins on exactly that).
         search_text: Concatenated text used for lexical/semantic scoring.
-        schema_name: The schema this table lives in, **only when that is not
-            the engine's default schema**; `""` otherwise. Empty is therefore
-            both "the default schema" and "no schema recorded", which is what
-            lets it default and keeps every pre-Phase-3b construction (and
-            `rag.py`, Phase 4's file) correct unchanged. The engine that built
-            the chunk is the one that knows its own `default_schema`, so it
-            resolves the pair before setting this rather than storing the
-            default alongside every chunk.
+        schema_name: The schema this table lives in, **only when the table
+            cannot be spelled bare** - outside the engine's default schema on
+            SQLite/DuckDB, or (PostgreSQL, 2026-09-27) whenever the bare name
+            does not resolve to this table on the role's search path; `""`
+            otherwise. Empty is therefore both "spelled bare" and "no schema
+            recorded", which is what lets it default and keeps every
+            pre-Phase-3b construction (and `rag.py`, Phase 4's file) correct
+            unchanged. The engine that built the chunk is the one that knows
+            how its own bare names resolve, so it decides before setting this.
+        home_schema: For a chunk spelled bare (`schema_name == ""`), the schema
+            it actually lives in, when that is not simply the engine's
+            `default_schema`; `""` otherwise. Only PostgreSQL sets it: its bare
+            names resolve across the whole search path (2026-09-27), so a bare
+            table may live in any path schema, and `engines/base.py::
+            table_name_spellings` needs the real one to build the table's
+            qualified spelling. SQLite and DuckDB leave it empty, meaning
+            `default_schema`, exactly as before.
         value_hints: Sample distinct values per low-cardinality text column.
         score: Relevance score assigned during retrieval; `0.0` until scored.
         matched_terms: Query terms that matched this chunk, once scored.
@@ -64,6 +73,7 @@ class SchemaChunk:
     foreign_tables: list[str]
     search_text: str
     schema_name: str = ""
+    home_schema: str = ""
     value_hints: dict[str, list[str]] | None = None
     score: float = 0.0
     matched_terms: list[str] | None = None

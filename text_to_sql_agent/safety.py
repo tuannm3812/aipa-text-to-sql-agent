@@ -404,6 +404,14 @@ def _references_disallowed_function(
 # (`pg_catalog.lower(integer)` does not exist - the built-in only accepts
 # `text`, so a blanket rewrite would break real queries rather than merely
 # re-route them).
+#
+# Since 2026-09-27 rule 2 is defence in depth, not the only refusal: pinning
+# `search_path` to `pg_catalog` *alone* (not merely putting it first - the
+# overload's schema is then not searched at all) makes a bare `lower(x)`
+# resolve to the built-in or fail, whatever overloads exist elsewhere. It is
+# kept anyway: it refuses the query before it reaches the server, and it does
+# not depend on the pin being set on every execution path. Rule 1 is still
+# the only refusal for the qualified spelling, which the pin cannot reach.
 _PG_CATALOG_SCHEMA = "pg_catalog"
 
 
@@ -542,6 +550,116 @@ def _references_shadowed_function(
             if not shadowed:
                 return False
         if resolved in shadowed:
+            return True
+    return False
+
+
+# Decision (2026-09-27, owner-approved): PostgreSQL executes every query with
+# `SET LOCAL search_path = pg_catalog` (see `PostgresEngine.execute`), which is
+# what makes an unqualified operator, function or type resolve to the built-in
+# rather than to a same-named user object on the role's search path - the
+# operator half of that bypass carries no name the function allowlist could
+# pin. Anything that *names its own schema* is outside the pin's reach, so each
+# such spelling needs a validator rule instead. Function calls already had one
+# (`_references_non_catalog_qualified_function`, above); the two rules below
+# add operators and types. Gated on this constant, not `_DOT_CALL_DIALECTS`:
+# these exist because of the pin, not because of PostgreSQL's dotted-call
+# sugar, and must be enabled wherever the pin is. DuckDB and SQLite have no
+# such pin and no schema-scoped operator resolution, so neither is affected.
+# `tests/test_safety.py::test_pinned_search_path_dialects_contains_the_postgres
+# _engines_own_dialect` pins the value against `PostgresEngine.sqlglot_dialect`.
+_PINNED_SEARCH_PATH_DIALECTS: frozenset[str] = frozenset({"postgres"})
+
+# PostgreSQL folds an unquoted identifier with ASCII-only lowercasing under a
+# UTF-8 server encoding (`downcase_identifier`), so `str.lower()` - which also
+# folds non-ASCII letters - would compute a different name for `Ärger`.
+_ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _server_folded_name(identifier: sqlglot_exp.Identifier) -> str:
+    """The name PostgreSQL itself sees for `identifier`: exact if quoted, folded if not."""
+    name = str(identifier.this or "")
+    return name if identifier.args.get("quoted") else name.translate(_ASCII_FOLD)
+
+
+def _references_non_catalog_operator(parsed: sqlglot_exp.Expression, *, dialect: str) -> bool:
+    """True if an `OPERATOR(schema.op)` construct names any schema but `pg_catalog`.
+
+    `a OPERATOR(public.||) b` resolves the operator in the schema it names,
+    so the pinned `search_path` cannot reach it - proven live in `tests/
+    test_postgres_search_path_pin.py`, where exactly this spelling leaked a
+    `SECURITY DEFINER` operator's result through a pinned execution. sqlglot
+    parses the construct into `exp.Operator` with the qualified operator as a
+    plain string (`"public.||"`), dropping any identifier quotes, so the
+    qualifier is compared literally: only the exact text `pg_catalog` passes.
+    That refuses the harmless `PG_CATALOG.||` too, which nothing this agent
+    generates would ever write. An unqualified `OPERATOR(||)` resolves under
+    the pin and passes. PostgreSQL operator symbols cannot contain `.`, so the
+    last `.` always separates the qualifier from the symbol. Anything sqlglot
+    represents other than as a string is refused outright.
+
+    Args:
+        parsed: The parsed statement.
+        dialect: The dialect the statement was parsed under.
+
+    Returns:
+        True if the statement must be rejected.
+    """
+    if exp is None:
+        return True
+    if dialect not in _PINNED_SEARCH_PATH_DIALECTS:
+        return False
+    for node in parsed.find_all(exp.Operator):
+        operator = node.args.get("operator")
+        if not isinstance(operator, str):
+            return True
+        qualifier, dot, _symbol = operator.replace(" ", "").rpartition(".")
+        if dot and qualifier != _PG_CATALOG_SCHEMA:
+            return True
+    return False
+
+
+def _references_non_catalog_qualified_type(parsed: sqlglot_exp.Expression, *, dialect: str) -> bool:
+    """True if a type name is schema-qualified to anything but `pg_catalog`.
+
+    `x::public.t` and `CAST(x AS public.t)` resolve `t` in the schema they
+    name, so the pinned `search_path` cannot reach them, and a cast to a user
+    type can run a user-defined cast function - `SECURITY DEFINER` if its
+    owner chose. Before this rule the spelling was refused only by accident:
+    sqlglot parses the qualified type name as an `exp.Dot`, which the dot-call
+    rule read as `(public).t` sugar and refused because `t` was not an
+    allowlisted function. A user type *named after* an allowlisted function
+    (`public.lower`) passed straight through; `tests/
+    test_postgres_search_path_pin.py` reproduces that leak live.
+
+    Every `exp.DataType` in the statement is checked, which covers `::`,
+    `CAST`, and a type nested inside an array type (`::public.t[]`). A
+    qualified type is `kind=Dot(this=Identifier(schema), expression=
+    Identifier(type))`; anything other than exactly that shape with the
+    qualifier folding to `pg_catalog` is refused. An unqualified user type
+    resolves in `pg_catalog` or nowhere under the pin, so it is left alone.
+
+    Args:
+        parsed: The parsed statement.
+        dialect: The dialect the statement was parsed under.
+
+    Returns:
+        True if the statement must be rejected.
+    """
+    if exp is None:
+        return True
+    if dialect not in _PINNED_SEARCH_PATH_DIALECTS:
+        return False
+    for data_type in parsed.find_all(exp.DataType):
+        kind = data_type.args.get("kind")
+        if not isinstance(kind, exp.Dot):
+            continue
+        qualifier = kind.this
+        if not (
+            isinstance(qualifier, exp.Identifier)
+            and isinstance(kind.expression, exp.Identifier)
+            and _server_folded_name(qualifier) == _PG_CATALOG_SCHEMA
+        ):
             return True
     return False
 
@@ -1775,6 +1893,12 @@ def _is_safe_ast(
             parsed, get_shadowed_function_names=get_shadowed_function_names
         ):
             return False
+        # The pinned-search-path rules (2026-09-27): no I/O, so they sit with
+        # the other structural checks ahead of the catalogue reads below.
+        if _references_non_catalog_operator(parsed, dialect=dialect):
+            return False
+        if _references_non_catalog_qualified_type(parsed, dialect=dialect):
+            return False
         if _references_disallowed_dot_call(
             parsed,
             dialect=dialect,
@@ -1938,3 +2062,136 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         get_real_table_columns=get_real_table_columns,
         get_shadowed_function_names=get_shadowed_function_names,
     )
+
+
+class TableQualificationError(RuntimeError):
+    """The spliced, schema-qualified SQL did not re-parse to the intended statement.
+
+    Raised by `qualify_bare_table_references` instead of executing text whose
+    meaning it cannot vouch for. It indicates a defect in the splice, never
+    a property of the user's query, and fails closed: nothing runs.
+    """
+
+
+def _quote_schema(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def qualify_bare_table_references(
+    sql: str,
+    *,
+    dialect: str,
+    resolve: Callable[[frozenset[str]], Mapping[str, str]],
+) -> str:
+    """Schema-qualify every bare base-table reference in `sql`, changing nothing else.
+
+    Decision (2026-09-27, owner-approved): PostgreSQL executes with `SET LOCAL
+    search_path = pg_catalog`, under which the server no longer resolves a
+    bare table name at all. The engine resolves each one itself (`resolve`,
+    which for PostgreSQL is `engines/postgres.py::resolve_bare_relation_
+    names` - the same function that decides which chunks `table_names()`
+    advertises bare) and this writes the answer into the SQL.
+
+    **Splice, not regenerate.** The only edit is inserting `"schema".`
+    immediately before each qualifying table identifier, at the source offset
+    sqlglot's tokenizer recorded for it. Regenerating the statement from the
+    AST was ruled out: sqlglot's generator canonicalises function names,
+    rewrites `::` casts, re-parenthesises, and drops or moves comments, so the
+    executed text would differ from the validated text in exactly the
+    positions `is_safe_query` inspected - functions, operators, casts. A
+    splice leaves every one of those byte-identical, preserves the table
+    identifier's own case and quoting (`"Sales"` stays `"Sales"`, `Customers`
+    stays `Customers` for the server to fold), and cannot introduce a
+    construct the validator never saw.
+
+    **What is qualified.** Only a node `_relation_kind` - the validator's own
+    relation classifier - calls `_RELATION_TABLE`, carrying no schema or
+    catalog yet, not inside a `FOR UPDATE OF` list (PostgreSQL requires those
+    unqualified), and not spelled like any CTE defined anywhere in the
+    statement. The CTE test is deliberately coarser than `_visible_cte_
+    names`: PostgreSQL's `WITH RECURSIVE` lets a CTE reference a *later*
+    sibling, which that DuckDB-derived scoping model does not admit, and
+    qualifying a name the server would bind to a CTE would silently swap in a
+    real table. Leaving a bare name unqualified instead fails closed - under
+    the pin it resolves in `pg_catalog` (every relation there is `pg_*`,
+    which the internals rule already refuses) or nowhere. Function scans,
+    `unnest`, `ROWS FROM`, `VALUES` and derived tables are never qualified,
+    by the same classification. A name `resolve` has no answer for is left
+    bare, for the same fail-closed reason.
+
+    **Proof of the splice.** The rewritten text is re-parsed and must equal
+    the original AST with exactly those `db` qualifiers added - otherwise
+    `TableQualificationError`. Text sqlglot cannot parse as one statement is
+    returned unchanged: it executes under the pin, where a bare name cannot
+    reach any user schema.
+
+    Args:
+        sql: SQL about to be executed - normally already cleared by
+            `is_safe_query`.
+        dialect: The sqlglot dialect to parse under.
+        resolve: Maps the set of server-folded bare names (quoted: exact;
+            unquoted: ASCII-lowercased, as PostgreSQL folds them) to the
+            schema each resolves to. Only called when there is at least one
+            candidate.
+
+    Returns:
+        `sql` with each resolvable bare base-table reference prefixed by its
+        quoted schema.
+
+    Raises:
+        TableQualificationError: If the rewritten text does not re-parse to
+            the intended statement.
+    """
+    if sqlglot is None or exp is None:
+        return sql
+    try:
+        statements = [s for s in sqlglot.parse(sql, read=dialect) if s is not None]
+    except Exception:
+        return sql
+    if len(statements) != 1:
+        return sql
+    parsed = statements[0]
+
+    cte_names = {(cte.alias or "").lower() for cte in parsed.find_all(exp.CTE)}
+    candidates: list[tuple[sqlglot_exp.Table, sqlglot_exp.Identifier, str]] = []
+    for table in parsed.find_all(exp.Table):
+        if _relation_kind(table) != _RELATION_TABLE:
+            continue
+        if table.args.get("db") or table.args.get("catalog"):
+            continue
+        if table.find_ancestor(exp.Lock) is not None:
+            continue
+        identifier = table.this
+        if not isinstance(identifier, exp.Identifier):
+            continue
+        if (identifier.name or "").lower() in cte_names:
+            continue
+        candidates.append((table, identifier, _server_folded_name(identifier)))
+    if not candidates:
+        return sql
+
+    resolved = resolve(frozenset(name for _, _, name in candidates))
+    insertions: list[tuple[int, str]] = []
+    for table, identifier, name in candidates:
+        schema = resolved.get(name)
+        if schema is None:
+            continue
+        start = (identifier.meta or {}).get("start")
+        if not isinstance(start, int) or not 0 <= start < len(sql):
+            raise TableQualificationError(f"no source position for table {name!r}")
+        insertions.append((start, schema))
+        table.set("db", exp.to_identifier(schema, quoted=True))
+    if not insertions:
+        return sql
+
+    rewritten = sql
+    for start, schema in sorted(insertions, reverse=True):
+        rewritten = f"{rewritten[:start]}{_quote_schema(schema)}.{rewritten[start:]}"
+
+    try:
+        reparsed = [s for s in sqlglot.parse(rewritten, read=dialect) if s is not None]
+    except Exception as exc:
+        raise TableQualificationError("qualified SQL no longer parses") from exc
+    if len(reparsed) != 1 or reparsed[0] != parsed:
+        raise TableQualificationError("qualified SQL does not match the validated statement")
+    return rewritten

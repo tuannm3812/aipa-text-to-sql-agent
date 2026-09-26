@@ -800,3 +800,212 @@ def test_function_scan_spellings_bind_strictly(
     bound_qualifiers, bound_names = safety._relation_binding(relation, real_table_columns={})
     assert bound_qualifiers == qualifiers, label
     assert bound_names == names, label
+
+
+# --- 2026-09-27: the pinned search path -------------------------------------
+#
+# PostgreSQL now executes under `SET LOCAL search_path = pg_catalog`, so an
+# unqualified operator, function or type resolves to the built-in. A spelling
+# that names its own schema is out of the pin's reach and needs a validator
+# rule instead; these are the server-free halves of those rules and of the
+# table-qualification rewrite. The live proofs are in
+# `tests/test_postgres_search_path_pin.py` and `tests/test_engine_postgres.py`.
+
+
+def test_pinned_search_path_dialects_contains_the_postgres_engines_own_dialect() -> None:
+    """The operator and type rules are gated on this constant; nothing else ties
+    it to the engine, so renaming `PostgresEngine.sqlglot_dialect` would turn
+    both into silent no-ops. This is the test that would fail instead.
+    """
+    from text_to_sql_agent import safety
+    from text_to_sql_agent.engines.postgres import PostgresEngine
+
+    assert PostgresEngine.sqlglot_dialect in safety._PINNED_SEARCH_PATH_DIALECTS
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT name OPERATOR(public.||) 1 FROM customers",
+        'SELECT name OPERATOR("public".||) 1 FROM customers',
+        "SELECT name FROM customers WHERE name OPERATOR(public.=) 'x'",
+        "SELECT name FROM customers WHERE name OPERATOR(other.pg_catalog.=) 'x'",
+        "SELECT name OPERATOR(PG_CATALOG.||) 1 FROM customers",
+    ],
+)
+def test_an_operator_qualified_outside_pg_catalog_is_refused(sql: str) -> None:
+    assert not agent.is_safe_query(sql, engine=_FakePostgresEngine())
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT name OPERATOR(pg_catalog.||) 1 FROM customers",
+        "SELECT name OPERATOR(||) 1 FROM customers",
+        "SELECT name || 'x' FROM customers",
+    ],
+)
+def test_an_operator_resolving_under_the_pin_still_validates(sql: str) -> None:
+    assert agent.is_safe_query(sql, engine=_FakePostgresEngine())
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT name::public.lower FROM customers",
+        "SELECT CAST(name AS public.lower) FROM customers",
+        'SELECT name::"public"."lower" FROM customers',
+        "SELECT ARRAY[name]::public.lower[] FROM customers",
+        "SELECT name::other.sum FROM customers",
+    ],
+)
+def test_a_type_qualified_outside_pg_catalog_is_refused(sql: str) -> None:
+    """`lower`/`sum` are allowlisted names on purpose: before this rule the
+    dot-call rule refused a qualified type only when its name was *not* an
+    allowlisted function, so these exact shapes validated at BASE.
+    """
+    assert not agent.is_safe_query(sql, engine=_FakePostgresEngine())
+
+
+def test_the_type_rule_is_what_refuses_a_pg_catalog_lookalike() -> None:
+    """The rule itself, directly: `pg_catalog`-qualified passes it, anything else fails it."""
+    import sqlglot
+
+    from text_to_sql_agent import safety
+
+    def refused(sql: str) -> bool:
+        parsed = sqlglot.parse_one(sql, read="postgres")
+        return safety._references_non_catalog_qualified_type(parsed, dialect="postgres")
+
+    assert not refused("SELECT name::pg_catalog.text FROM customers")
+    assert not refused("SELECT name::text FROM customers")
+    assert refused("SELECT name::public.text FROM customers")
+    assert refused('SELECT name::"PG_CATALOG".text FROM customers')
+    assert not refused('SELECT name::"pg_catalog".text FROM customers')
+
+
+def test_the_pin_rules_leave_duckdb_and_sqlite_untouched() -> None:
+    """Both rules are gated on the dialect: DuckDB and SQLite behave exactly as before."""
+    import sqlglot
+
+    from text_to_sql_agent import safety
+
+    for dialect in ("duckdb", "sqlite"):
+        parsed = sqlglot.parse_one("SELECT CAST(x AS main.t) FROM customers", read=dialect)
+        assert not safety._references_non_catalog_qualified_type(parsed, dialect=dialect)
+        assert not safety._references_non_catalog_operator(parsed, dialect=dialect)
+
+
+def _qualify(sql: str, homes: dict[str, str] | None = None) -> tuple[str, list[frozenset[str]]]:
+    from text_to_sql_agent.safety import qualify_bare_table_references
+
+    homes = {"customers": "public", "sales": "public", "Sales": "Mixed"} if homes is None else homes
+    calls: list[frozenset[str]] = []
+
+    def resolve(names: frozenset[str]) -> dict[str, str]:
+        calls.append(names)
+        return {name: homes[name] for name in names if name in homes}
+
+    return qualify_bare_table_references(sql, dialect="postgres", resolve=resolve), calls
+
+
+@pytest.mark.parametrize(
+    "sql,expected",
+    [
+        ("SELECT name FROM customers", 'SELECT name FROM "public".customers'),
+        (
+            "SELECT c.name FROM customers c JOIN sales s ON s.customer_id = c.customer_id",
+            'SELECT c.name FROM "public".customers c JOIN "public".sales s '
+            "ON s.customer_id = c.customer_id",
+        ),
+        # Case and quoting of the table identifier are left exactly as written.
+        ("SELECT * FROM Customers", 'SELECT * FROM "public".Customers'),
+        ('SELECT * FROM "Sales"', 'SELECT * FROM "Mixed"."Sales"'),
+        # Comments, casts, operators and spacing survive byte-for-byte.
+        (
+            "SELECT name::text || 'x' /* keep */ FROM\n  customers -- tail\n",
+            "SELECT name::text || 'x' /* keep */ FROM\n  \"public\".customers -- tail\n",
+        ),
+        # Nested scopes, subqueries and a LATERAL body are all base-table refs.
+        (
+            "SELECT * FROM (SELECT * FROM sales) d WHERE EXISTS (SELECT 1 FROM customers)",
+            'SELECT * FROM (SELECT * FROM "public".sales) d '
+            'WHERE EXISTS (SELECT 1 FROM "public".customers)',
+        ),
+        # A write target is qualified too, so the read-only transaction and the
+        # role's grants - not a missing table - are what refuse it.
+        (
+            "INSERT INTO customers VALUES (1, 'x')",
+            "INSERT INTO \"public\".customers VALUES (1, 'x')",
+        ),
+    ],
+)
+def test_qualification_inserts_only_a_schema_before_each_base_table(
+    sql: str, expected: str
+) -> None:
+    rewritten, _ = _qualify(sql)
+    assert rewritten == expected
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # Already qualified, by the query itself.
+        "SELECT * FROM public.customers",
+        "SELECT * FROM other.customers",
+        # CTE references, including one sharing a real table's name.
+        "WITH totals AS (SELECT 1 AS x) SELECT * FROM totals",
+        "WITH customers AS (SELECT 1 AS x) SELECT * FROM customers",
+        # PostgreSQL's `WITH RECURSIVE` lets a CTE see a *later* sibling; a name
+        # spelled like any CTE in the statement is left for the server to bind.
+        "WITH RECURSIVE a AS (SELECT * FROM sales), sales AS (SELECT 1 AS x) SELECT * FROM a",
+        # Function scans, unnest, ROWS FROM and VALUES are never tables.
+        "SELECT * FROM generate_series(1, 5) g",
+        "SELECT * FROM unnest(ARRAY[1, 2]) u",
+        "SELECT * FROM ROWS FROM (generate_series(1, 2)) g",
+        "SELECT * FROM (VALUES (1), (2)) v(x)",
+        # A name nothing resolves: left bare, so under the pin it fails closed.
+        "SELECT * FROM nowhere",
+        # No FROM at all.
+        "SELECT 1",
+        # Not parseable as one statement: returned untouched, runs pinned.
+        "SELECT 1; SELECT 2",
+        "THIS IS NOT SQL (",
+    ],
+)
+def test_qualification_leaves_everything_else_untouched(sql: str) -> None:
+    rewritten, _ = _qualify(sql)
+    assert rewritten == sql
+
+
+def test_for_update_of_names_stay_unqualified() -> None:
+    """PostgreSQL requires `FOR UPDATE OF` names unqualified; only the FROM target moves."""
+    rewritten, _ = _qualify("SELECT * FROM customers FOR UPDATE OF customers")
+    assert rewritten == 'SELECT * FROM "public".customers FOR UPDATE OF customers'
+
+
+def test_qualification_resolves_the_names_the_server_would_see() -> None:
+    """Unquoted identifiers fold to lowercase (ASCII only); quoted ones are exact."""
+    _, calls = _qualify('SELECT * FROM Customers, "Sales", "sales", ÄrgeR')
+    assert calls == [frozenset({"customers", "Sales", "sales", "Ärger"})]
+
+
+def test_a_schema_name_needing_escapes_is_quoted_safely() -> None:
+    rewritten, _ = _qualify("SELECT * FROM customers", {"customers": 'we"ird'})
+    assert rewritten == 'SELECT * FROM "we""ird".customers'
+
+
+def test_qualification_fails_closed_when_the_splice_does_not_reparse(monkeypatch) -> None:
+    """A wrong splice must refuse to run, not execute text nobody validated."""
+    from sqlglot import exp
+
+    from text_to_sql_agent import safety
+
+    original_to_identifier = exp.to_identifier
+
+    def wrong_identifier(name, quoted=None, copy=True):  # type: ignore[no-untyped-def]
+        return original_to_identifier(f"{name}_not", quoted=quoted, copy=copy)
+
+    monkeypatch.setattr(safety.exp, "to_identifier", wrong_identifier)
+    with pytest.raises(safety.TableQualificationError):
+        _qualify("SELECT * FROM customers")

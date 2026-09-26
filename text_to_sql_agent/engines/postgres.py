@@ -89,12 +89,31 @@ honest precondition this fix rests on: `aipa_ro` itself cannot `CREATE` in
 any schema it does not own (verified live), so the overload that arms this
 bypass can only come from a different, more privileged principal sharing the
 database - a DBA, or another application's role.
+
+2026-09-27 (owner-approved): that fix could not cover **operators** - a
+`public.||(text, integer)` operator captures `name || 1` with no function
+name for the allowlist to pin - nor Codex's Finding 2, where
+`current_schema()` modelled only the first entry of the search path. Both
+are closed by one design. Every connection this engine opens is pinned with
+`SET LOCAL search_path = pg_catalog` (`_pin_search_path`), so unqualified
+functions, operators and types resolve to built-ins or not at all. Under the
+pin the server no longer resolves bare table names either, so the engine
+does: `resolve_bare_relation_names` walks the role's effective path
+(`current_schemas(false)`, read before pinning) exactly as the server would,
+and is the single answer used both to decide which chunks are spelled bare
+(so what `table_names()` advertises and the validator accepts) and to
+schema-qualify each bare table in the SQL `execute()` runs
+(`safety.qualify_bare_table_references`). Scope widened with it: every
+schema on the path is read (`_scope_schema_names`, which replaced
+`_user_schema_names`), and `AIPA_EXTRA_SCHEMAS` now means schemas outside
+the path. `shadowed_function_names()` is kept as defence in depth. See
+`docs/3_decisions.md`'s 2026-09-27 entries.
 """
 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -106,6 +125,7 @@ from ..config import (
     DEFAULT_VALUE_HINT_MAX_CARDINALITY,
     DEFAULT_WORK_LIMIT_MS,
 )
+from ..safety import qualify_bare_table_references
 from ..types import QueryResult, SchemaChunk
 from .base import (
     EngineForbiddenError,
@@ -118,11 +138,10 @@ from .base import (
 
 _CONNECT_TIMEOUT_SECONDS = 5
 
-# See `PostgresEngine.default_schema`. This is what a bare, unqualified table
-# name resolves against for a role whose `search_path` is PostgreSQL's
-# default, and the only schema whose tables `table_names()` also advertises
-# under their bare names. It is no longer the only schema the catalogue reads
-# - see `_user_schema_names`.
+# See `PostgresEngine.default_schema`: its fallback when the role's effective
+# search path is empty. It no longer decides which tables are advertised bare
+# - `resolve_bare_relation_names` does - nor which schemas are read - see
+# `_scope_schema_names`.
 _PUBLIC_SCHEMA = "public"
 
 
@@ -223,67 +242,164 @@ def _quote_qualified(schema_name: str, table_name: str) -> str:
     return _quote_identifier(schema_name) + "." + _quote_identifier(table_name)
 
 
-def _user_schema_names(
+def _pin_search_path(conn: psycopg.Connection[tuple[Any, ...]]) -> list[str]:
+    """Read the role's effective search path, then pin this transaction's to `pg_catalog`.
+
+    Decision (2026-09-27, owner-approved). PostgreSQL resolves functions,
+    operators and types through `search_path`, and an exact argument-type
+    match in *any* schema on it beats a built-in needing a cast, whatever the
+    order - so anyone able to create objects in a schema on the path can
+    shadow a built-in. `SET LOCAL search_path = pg_catalog` removes every
+    other schema from that lookup for the rest of the transaction (verified
+    live: a `public.||(text, integer)` operator and a `public.lower(integer)`
+    overload both become unreachable to an unqualified spelling). Every
+    connection this engine opens calls this first, not only `execute()`: the
+    catalogue reads below use unqualified `unnest`, `array_agg`,
+    `array_position`, `has_schema_privilege` and `=`, and would otherwise be
+    exposed to the same shadowing on the role's own path.
+
+    The path is read *before* the pin, through an explicitly
+    `pg_catalog`-qualified call with an exact-type argument (`false` is a
+    `boolean`), so no user overload can answer it. `current_schemas(false)`
+    is PostgreSQL's own model of the path (verified live 2026-09-27 on
+    PostgreSQL 16): ordered, `"$user"` expanded, schemas that do not exist or
+    that the role holds no `USAGE` on omitted, and the *implicitly* searched
+    `pg_catalog` omitted (an explicitly listed one is kept, in its position).
+    Omitting the implicit `pg_catalog` cannot change a resolution this agent
+    accepts: every relation in `pg_catalog` is named `pg_*` (verified live -
+    none is not), and `safety._references_internals` refuses those names.
+
+    `SET LOCAL` needs an open transaction; `_connect_read_only`'s connections
+    are not autocommit, so the `SELECT` above has already opened one, and the
+    setting ends with it - it cannot leak into a pooled or reused connection.
+
+    Returns:
+        The role's effective search path, in resolution order.
+    """
+    row = conn.execute("SELECT pg_catalog.current_schemas(false)").fetchone()
+    path = [str(name) for name in row[0]] if row and row[0] else []
+    conn.execute("SET LOCAL search_path = pg_catalog")
+    return path
+
+
+def resolve_bare_relation_names(
+    conn: psycopg.Connection[tuple[Any, ...]],
+    names: Iterable[str],
+    *,
+    search_path: list[str],
+) -> dict[str, str]:
+    """The schema each bare relation name resolves to, exactly as the server would.
+
+    **The single source of truth for "what does this bare name mean"**
+    (2026-09-27). It decides which chunks `schema_chunks()` spells bare (and
+    therefore what `table_names()` advertises and `safety.is_safe_query`
+    accepts bare), and it is the `resolve` callback `execute()` hands to
+    `safety.qualify_bare_table_references`, which writes the answer into the
+    SQL before it runs under the pinned path. One function, so the validator
+    and the executor cannot disagree - two implementations of this question
+    are how Phase 3b kept producing advertised-then-rejected inversions, and
+    Codex's Finding 2 was one: `current_schema()` modelled only the first
+    path entry, while the server walks all of them.
+
+    Walks `search_path` in order and returns, per name, the first schema
+    holding *any* `pg_class` entry of that name - table, view, sequence,
+    index or composite type alike, readable or not - because that is what
+    the server's own `RangeVarGetRelid` does: an unreadable relation earlier
+    on the path still shadows a readable one later (the query then fails on
+    privileges), so it must shadow here too. Internal schemas on the path
+    keep their position for the same reason; `_scope_schema_names` is what
+    keeps them from being advertised.
+
+    Must run on a pinned connection (`_pin_search_path`): the query's own
+    `unnest` and `=` then resolve in `pg_catalog`, so a user overload cannot
+    answer the question that decides what every bare name means.
+
+    Args:
+        conn: A connection already pinned by `_pin_search_path`.
+        names: Server-folded relation names (quoted identifiers exact,
+            unquoted ones lowercased, as PostgreSQL folds them).
+        search_path: `_pin_search_path`'s return value for this connection.
+
+    Returns:
+        `{name: schema}` for each name that resolves; a name found in no
+        path schema is absent, exactly as the server would fail to find it.
+    """
+    wanted = sorted(set(names))
+    if not wanted or not search_path:
+        return {}
+    rows = conn.execute(
+        "SELECT DISTINCT ON (c.relname) c.relname, n.nspname "
+        "FROM unnest(%s::text[]) WITH ORDINALITY AS p(nspname, ord) "
+        "JOIN pg_namespace n ON n.nspname = p.nspname "
+        "JOIN pg_class c ON c.relnamespace = n.oid "
+        "WHERE c.relname = ANY(%s::text[]) "
+        "ORDER BY c.relname, p.ord",
+        (search_path, wanted),
+    ).fetchall()
+    return {str(relname): str(nspname) for relname, nspname in rows}
+
+
+def _scope_schema_names(
     conn: psycopg.Connection[tuple[Any, ...]],
     *,
-    default_schema: str,
+    search_path: list[str],
     extra_schemas: frozenset[str],
     internal_prefixes: tuple[str, ...],
     internal_names: frozenset[str],
 ) -> list[str]:
-    """This role's `default_schema` plus its opted-in, privileged extras.
+    """The schemas whose tables are read and advertised: the search path, plus opted-in extras.
 
-    Decision (2026-09-26): schema scope is opt-in, not "every schema this
-    role can read". Task 6 read every schema `has_schema_privilege` allowed,
-    which means a deployment that granted `aipa_ro` `USAGE` on a staging or
-    PII schema for some unrelated tool would have that schema's tables,
-    columns and DDL silently sent to the LLM provider. Reading is now
-    restricted to `default_schema` and whatever `engines/base.py`'s
-    `extra_schemas_from_env()` (`AIPA_EXTRA_SCHEMAS`) names - candidates the
-    caller supplies, not a value this function reads itself, so a single
-    engine instance's opt-in set is fixed for its lifetime rather than
-    re-read per catalogue query.
+    Decision (2026-09-27), refining the 2026-09-26 opt-in decision. That
+    decision read only `default_schema` (`current_schema()`, the *first*
+    path entry) plus `AIPA_EXTRA_SCHEMAS`. But the search path *is*
+    PostgreSQL's meaning of "default": every schema on it can supply a bare
+    table name, and Codex's Finding 2 showed the server answering a bare
+    `customers` from `public` while this engine, reading only `aipa_ro`,
+    refused it. So every schema on the role's effective path is now in
+    scope, and `AIPA_EXTRA_SCHEMAS` keeps its meaning for schemas **outside**
+    the path. What stays true of the 2026-09-26 decision: a schema the role
+    can merely *read* is still never advertised unless it is on the path or
+    opted in - a deployment's staging or PII schema granted for some other
+    tool is still invisible. See `docs/3_decisions.md`.
 
-    `pg_catalog`, `pg_toast`, any `pg_temp_*`/`pg_toast_temp_*` and
-    `information_schema` are PostgreSQL's internals, not the user's data.
-    Review finding 1 (2026-09-26): the candidate list used to be filtered by
-    nothing beyond membership in `[default_schema, *extra_schemas]` - the
-    assumption recorded here until this fix was that neither could ever
-    *spell* an internal schema, so there was "no separate exclusion left to
-    state". That assumption was wrong the moment an operator's
-    `AIPA_EXTRA_SCHEMAS` (or the database itself) named a schema like
-    `PG_evil` or `Information_Schema`: nothing here rejected it, so it was
-    read into `raw_schema()`/`table_names()` and then permanently refused by
-    `safety._references_internals`, which lowercases before comparing -
-    advertised, then rejected, the layer-disagreement `docs/3_decisions.md`'s
-    2026-09-25 entry closed in the opposite direction. `is_internal_schema_
-    name` now applies the identical case-insensitive comparison here, before
-    a candidate ever reaches the privilege check below, so a schema
-    `safety.py` would refuse to let a query reference is never read at all.
+    Path schemas need no privilege check: `current_schemas(false)` already
+    omits any schema the role holds no `USAGE` on. Opted-in extras still
+    require `has_schema_privilege` - naming a schema does not grant it.
+    Internal schemas (`pg_catalog`, `information_schema`, anything `pg_*`,
+    case-insensitively - `engines/base.py::is_internal_schema_name`, review
+    finding 1 of 2026-09-26) are never in scope, whether they reached here
+    through the path or the opt-in.
 
-    `has_schema_privilege` is still what keeps the rest honest: `aipa_ro` is
-    a least-privilege role, and a schema it holds no `USAGE` on is one whose
-    tables it could not read even if opted in - naming a schema in
-    `AIPA_EXTRA_SCHEMAS` does not by itself grant access to it. A schema that
-    is opted in but not granted, or granted but not opted in, is absent
-    either way; only the intersection is read.
+    Args:
+        conn: A connection already pinned by `_pin_search_path`.
+        search_path: That connection's effective path, in order.
+        extra_schemas: The engine's `AIPA_EXTRA_SCHEMAS` opt-in set.
+        internal_prefixes: `Engine.internal_prefixes`.
+        internal_names: `Engine.internal_names`.
+
+    Returns:
+        The in-scope path schemas in path order, then the privileged extras
+        in name order.
     """
-    candidates = [
-        name
-        for name in [default_schema, *sorted(extra_schemas)]
-        if not is_internal_schema_name(
+
+    def _internal(name: str) -> bool:
+        return is_internal_schema_name(
             name, internal_prefixes=internal_prefixes, internal_names=internal_names
         )
-    ]
+
+    in_path = [name for name in search_path if not _internal(name)]
+    candidates = sorted(
+        name for name in extra_schemas if name not in search_path and not _internal(name)
+    )
     if not candidates:
-        return []
+        return in_path
     rows = conn.execute(
         "SELECT nspname FROM pg_namespace "
         "WHERE nspname = ANY(%s) AND has_schema_privilege(nspname, 'USAGE') "
         "ORDER BY nspname",
         (candidates,),
     ).fetchall()
-    return [name for (name,) in rows]
+    return [*in_path, *(str(name) for (name,) in rows)]
 
 
 def _fetch_shadowed_function_names(
@@ -352,8 +468,8 @@ def _fetch_columns(
     (see `duckdb.py`'s module docstring) is what a bare-name key does the
     moment a query result spans two schemas holding a same-named table:
     their columns land in the same list, silently merged. Every caller in
-    this module now passes `default_schema` plus every opted-in
-    `AIPA_EXTRA_SCHEMAS` entry (`_user_schema_names`), so `schema_names` is
+    this module now passes every search-path schema plus every opted-in
+    `AIPA_EXTRA_SCHEMAS` entry (`_scope_schema_names`), so `schema_names` is
     routinely more than one element - the keying holds regardless of how
     many schemas are asked for, proven directly, with more than one, by
     `tests/test_engine_postgres.py::
@@ -471,8 +587,19 @@ def _fetch_foreign_keys(
     return fk_by_table
 
 
-def _plain_table(schema_name: str, table_name: str, default_schema: str) -> str:
-    """`schema.table` outside `default_schema`, the bare name inside it, unquoted.
+def _is_bare(schema_name: str, table_name: str, bare_home: Mapping[str, str]) -> bool:
+    """Whether `schema_name.table_name` is what its bare name resolves to.
+
+    `bare_home` is `resolve_bare_relation_names`'s answer, so this is the
+    server's own rule: a table is spelled bare exactly when the bare name
+    reaches it, which also means a table shadowed by an earlier search-path
+    schema - or one outside the path entirely - is spelled qualified.
+    """
+    return bare_home.get(table_name) == schema_name
+
+
+def _plain_table(schema_name: str, table_name: str, bare_home: Mapping[str, str]) -> str:
+    """The bare name when it resolves to this table, `schema.table` otherwise, unquoted.
 
     The same rule `SchemaChunk.qualified_name` applies, for the two places a
     chunk cannot apply it for itself: the names it lists in `foreign_tables`
@@ -481,19 +608,19 @@ def _plain_table(schema_name: str, table_name: str, default_schema: str) -> str:
     its `search_text`. `_display_table` below is the quoted form of the same
     rule, for DDL text.
     """
-    if schema_name == default_schema:
+    if _is_bare(schema_name, table_name, bare_home):
         return table_name
     return f"{schema_name}.{table_name}"
 
 
-def _display_table(schema_name: str, table_name: str, default_schema: str) -> str:
-    """Bare-quoted for `default_schema`, schema-qualified otherwise.
+def _display_table(schema_name: str, table_name: str, bare_home: Mapping[str, str]) -> str:
+    """Bare-quoted when the bare name resolves to this table, schema-qualified otherwise.
 
     Keeps `raw_schema()`/`schema_chunks()`'s output byte-for-byte the same as
-    before this task for the common single-schema (`public`-only) case,
-    while still disambiguating a table that lives somewhere else.
+    before for the common single-schema (`public`-only) case, while still
+    disambiguating a table the bare name would not reach.
     """
-    if schema_name == default_schema:
+    if _is_bare(schema_name, table_name, bare_home):
         return _quote_identifier(table_name)
     return _quote_qualified(schema_name, table_name)
 
@@ -505,7 +632,7 @@ def _table_ddl(
     pk_columns: list[str],
     foreign_keys: list[_ForeignKey],
     *,
-    default_schema: str,
+    bare_home: Mapping[str, str],
 ) -> str:
     """Synthesise a `CREATE TABLE` statement from catalogue columns, PK and FKs.
 
@@ -524,10 +651,10 @@ def _table_ddl(
     for fk in foreign_keys:
         local_list = ", ".join(_quote_identifier(c) for c in fk.local_columns)
         ref_list = ", ".join(_quote_identifier(c) for c in fk.ref_columns)
-        ref_table = _display_table(fk.ref_schema, fk.ref_table, default_schema)
+        ref_table = _display_table(fk.ref_schema, fk.ref_table, bare_home)
         lines.append(f"FOREIGN KEY ({local_list}) REFERENCES {ref_table} ({ref_list})")
     body = ",\n  ".join(lines)
-    table_ref = _display_table(schema_name, table_name, default_schema)
+    table_ref = _display_table(schema_name, table_name, bare_home)
     return f"CREATE TABLE {table_ref} (\n  {body}\n);"
 
 
@@ -565,6 +692,16 @@ def _value_hints_for_table(
         if values:
             hints[column_name] = values
     return hints
+
+
+@dataclass(frozen=True)
+class _Catalogue:
+    """One pinned catalogue read: columns, keys, and each bare name's home schema."""
+
+    columns_by_table: dict[tuple[str, str], list[tuple[str, str, str]]]
+    pk_by_table: dict[tuple[str, str], list[str]]
+    fk_by_table: dict[tuple[str, str], list[_ForeignKey]]
+    bare_home: dict[str, str]
 
 
 class PostgresEngine:
@@ -827,100 +964,63 @@ POSTGRESQL DIALECT (must follow):
             dsn: A `postgresql://` or `postgres://` URL, scheme included.
         """
         self.dsn = dsn
-        # See `engines/base.py::extra_schemas_from_env` and `_user_schema_
+        # See `engines/base.py::extra_schemas_from_env` and `_scope_schema_
         # names` above - read once here so this instance's scope is fixed
         # for its whole lifetime.
         self.extra_schemas: frozenset[str] = extra_schemas_from_env()
         # See the `default_schema` property below - `None` means "not yet
         # asked the server."
-        self._default_schema: str | None = None
+        self._search_path: tuple[str, ...] | None = None
         # See `shadowed_function_names` below - `None` means "not yet asked
-        # the server," the same sentinel `_default_schema` uses and for the
+        # the server," the same sentinel `_search_path` uses and for the
         # same reason (no real answer is ever `None`).
         self._shadowed_function_names: frozenset[str] | None = None
 
     @property
     def default_schema(self) -> str:
-        """This role's actual default schema, per PostgreSQL's own `current_schema()`.
+        """The first schema of this role's effective search path.
 
-        Decision (2026-09-26, review finding 3). This used to be the class
-        constant `"public"` (`_PUBLIC_SCHEMA`). PostgreSQL does not resolve a
-        bare table name against a fixed schema - it resolves it against
-        `search_path`, whose stock value is `"$user", public`: the schema
-        named after the connecting role, if one exists, before `public`.
-        `aipa_ro` is a role name, and nothing stops a deployment from also
-        having a schema named `aipa_ro` - at which point the constant and the
-        server's own answer diverge, and this class was *asserting* a false
-        identity: `table_names()` advertised bare `customers` as
-        `public.customers`, `is_safe_query` validated it against that
-        identity, and PostgreSQL itself executed it against `aipa_ro.
-        customers` instead - a different real table, approved under the
-        wrong name. Querying `current_schema()` is the fix: it is PostgreSQL's
-        own answer to "what does a bare name resolve to on this connection",
-        not this engine's guess at one.
+        History. This was the constant `"public"` until review finding 3
+        (2026-09-26) showed a schema named after the role shadowing it under
+        the stock `"$user", public` path; it then became `current_schema()`,
+        which is exactly the first entry of the path. Codex's Finding 2 then
+        showed that one entry is not a model of the path at all: PostgreSQL
+        resolves a bare name by walking *every* entry, so a table missing
+        from the first falls through to a later one. Since 2026-09-27 this
+        property no longer decides anything about bare names - each table's
+        own resolution does (`resolve_bare_relation_names`, recorded on its
+        chunk as `SchemaChunk.home_schema`) - and it remains only because the
+        `Engine` protocol declares it and `table_name_spellings` falls back to
+        it for a chunk that records no home schema, which no chunk this
+        engine builds does.
 
-        Cached in `self._default_schema` after the first successful query -
-        `current_schema()` cannot change mid-connection for this engine's
-        purposes (`execute()` opens its own short-lived connection per call
-        and never runs `SET search_path`, and no validated query can run one
-        either: `search_path` reads as a settings function, refused by
-        `safety.py` the same way `current_setting(...)` is). This also keeps
-        every read-only call site (`raw_schema`, `schema_chunks`,
-        `schema_fingerprint`, `table_names`, `table_columns`) consistent
-        within one `PostgresEngine` instance's lifetime - `schema.py`'s
-        `get_schema_chunks` builds a fresh instance from `open_engine` on
-        every call (see that module), so "per instance" here already means
-        "once per top-level call," not a process-lifetime cache that could go
-        stale. It is also why this stays consistent with `schema_fingerprint`
-        and `schema.py`'s own `lru_cache`: `schema_fingerprint()` includes
-        `self.default_schema` directly in the tuple it returns, so a
-        `search_path` change on the server (a schema created or dropped that
-        changes what `"$user", public` resolves to) still changes the
-        fingerprint and invalidates that cache the same way any other schema
-        change does.
-
-        A plain instance-level cache, not `functools.cached_property`: this
-        class already declares `default_schema` at the `Engine` Protocol's
-        expected name and type (`str`), and `cached_property` would still
-        need `self._default_schema` distinguished from "unset" - `None` is
-        never a valid schema name, so it is an unambiguous sentinel.
+        Cached per instance, like `shadowed_function_names`: `schema.py` and
+        `pipeline.py` build a fresh engine per call, so "per instance" means
+        "per question", not per process.
 
         Returns:
-            `current_schema()`'s answer, or `_PUBLIC_SCHEMA` if the server
-            reports no default schema at all (an empty `search_path`) -
-            matching PostgreSQL's own behaviour for a bare table reference
-            in that case.
+            The first effective search-path schema, or `_PUBLIC_SCHEMA` when
+            the path is empty.
         """
-        if self._default_schema is None:
+        if self._search_path is None:
             with _connect_read_only(self.dsn) as conn:
-                self._resolve_default_schema(conn)
-        assert self._default_schema is not None
-        return self._default_schema
+                self._pinned(conn)
+        assert self._search_path is not None
+        return self._search_path[0] if self._search_path else _PUBLIC_SCHEMA
 
-    def _resolve_default_schema(self, conn: psycopg.Connection[tuple[Any, ...]]) -> None:
-        """Cache `current_schema()`'s answer using an already-open connection.
+    def _pinned(self, conn: psycopg.Connection[tuple[Any, ...]]) -> list[str]:
+        """`_pin_search_path(conn)`, remembering the first answer for `default_schema`.
 
-        `raw_schema`/`schema_chunks`/`schema_fingerprint` each call this
-        first thing, inside the `with _connect_read_only(...)` block they
-        already open for their own catalogue reads, so their first access to
-        `self.default_schema` later in the same method hits the cache
-        instead of opening a second connection just to resolve it.
-        `tests/test_engine_postgres.py::
-        test_schema_extraction_uses_the_read_only_connection` pins each of
-        those three methods to exactly one `_connect_read_only` call - this
-        is what keeps that true now that resolving `default_schema` needs a
-        query of its own; only the `default_schema` property's *other*
-        callers (`table_names`/`table_columns`, and a caller reading it
-        directly before calling anything else) pay for a dedicated
-        connection, and only once per instance.
-
-        A no-op once cached - safe to call from every one of those three
-        methods unconditionally.
+        Every method below that opens a connection calls this first, so each
+        one runs pinned and pays for no second connection just to answer
+        `default_schema` - `tests/test_engine_postgres.py::test_schema_
+        extraction_uses_the_read_only_connection` pins those methods to
+        exactly one `_connect_read_only` call each.
         """
-        if self._default_schema is not None:
-            return
-        row = conn.execute("SELECT current_schema()").fetchone()
-        self._default_schema = row[0] if row and row[0] else _PUBLIC_SCHEMA
+        search_path = _pin_search_path(conn)
+        if self._search_path is None:
+            self._search_path = tuple(search_path)
+        return search_path
 
     def check_reachable(self) -> None:
         """Raise if the server cannot be reached, or the role is too privileged.
@@ -939,10 +1039,15 @@ POSTGRESQL DIALECT (must follow):
           before the broad `except Exception` below can wrap it into an
           `EngineUnreachableError`, which would misdescribe "reachable but
           refused" as "unreachable."
+
+        Pinned (`_pin_search_path`) before the privilege check, so the
+        `pg_has_role` calls that decide it resolve to the built-in and not to
+        a same-named overload on the role's path.
         """
         try:
             with psycopg.connect(self.dsn, connect_timeout=_CONNECT_TIMEOUT_SECONDS) as conn:
                 conn.execute("SELECT 1")
+                _pin_search_path(conn)
                 _refuse_if_role_is_overprivileged(conn)
         except EngineForbiddenError:
             raise
@@ -952,7 +1057,23 @@ POSTGRESQL DIALECT (must follow):
             ) from exc
 
     def execute(self, sql: str, *, max_rows: int, work_limit: int) -> QueryResult:
-        """Execute already-validated SQL under a read-only transaction.
+        """Execute already-validated SQL under a read-only, search-path-pinned transaction.
+
+        Decision (2026-09-27, owner-approved). The statement runs with
+        `SET LOCAL search_path = pg_catalog` (`_pin_search_path`), so every
+        unqualified function, operator and type resolves to the built-in or
+        not at all - a user-defined `public.||(text, integer)` operator or
+        `public.lower(integer)` overload is unreachable however exact its
+        argument match. Under the pin the server no longer resolves a bare
+        *table* name either, so before running it the engine qualifies each
+        one itself (`safety.qualify_bare_table_references`), using
+        `resolve_bare_relation_names` - the same function that decided which
+        tables `table_names()` advertises bare, so the validator and the
+        executor cannot disagree about what a bare name means. The rewrite
+        only inserts `"schema".` before a table identifier; see that
+        function's docstring for why it splices rather than regenerates.
+
+        `QueryResult.sql` is the SQL that actually ran - the qualified text.
 
         Args:
             sql: A query already cleared by `is_safe_query`.
@@ -967,6 +1088,8 @@ POSTGRESQL DIALECT (must follow):
 
         Raises:
             ValueError: If `max_rows` is less than 1.
+            safety.TableQualificationError: If the qualified text did not
+                re-parse to the validated statement - nothing is executed.
             Exception: For genuine SQL errors, such as a missing table or a
                 write refused by the read-only transaction/role. Only the
                 statement-timeout cancellation is converted to a returned
@@ -979,6 +1102,14 @@ POSTGRESQL DIALECT (must follow):
         conn = _connect_read_only(self.dsn)
         try:
             with conn.cursor() as cur:
+                search_path = _pin_search_path(conn)
+                executed_sql = qualify_bare_table_references(
+                    sql,
+                    dialect=self.sqlglot_dialect,
+                    resolve=lambda names: resolve_bare_relation_names(
+                        conn, names, search_path=search_path
+                    ),
+                )
                 if work_limit > 0:
                     # `SET LOCAL` scopes the budget to this one transaction,
                     # so it cannot leak into another statement on a pooled or
@@ -988,12 +1119,12 @@ POSTGRESQL DIALECT (must follow):
                     # LLM output, so formatting it directly is safe.
                     cur.execute(f"SET LOCAL statement_timeout = {int(work_limit)}")
                 try:
-                    cur.execute(sql)
+                    cur.execute(executed_sql)
                 except psycopg_errors.QueryCanceled:
                     return QueryResult(
                         columns=[],
                         rows=[],
-                        sql=sql,
+                        sql=executed_sql,
                         error=f"QUERY_ABORTED_AFTER_{work_limit}_MS",
                     )
                 rows = cur.fetchmany(max_rows + 1)
@@ -1003,23 +1134,53 @@ POSTGRESQL DIALECT (must follow):
                 return QueryResult(
                     columns=columns,
                     rows=[tuple(r) for r in capped_rows],
-                    sql=sql,
+                    sql=executed_sql,
                     error=f"RESULT_TRUNCATED_TO_{max_rows}_ROWS",
                 )
-            return QueryResult(columns=columns, rows=[tuple(r) for r in capped_rows], sql=sql)
+            return QueryResult(
+                columns=columns, rows=[tuple(r) for r in capped_rows], sql=executed_sql
+            )
         finally:
             conn.close()
+
+    def _read_catalogue(self, conn: psycopg.Connection[tuple[Any, ...]]) -> _Catalogue:
+        """Everything `raw_schema()`/`schema_chunks()` need, from one pinned connection.
+
+        Scope is `_scope_schema_names` (the search path plus opted-in
+        extras); `bare_home` is `resolve_bare_relation_names` over every table
+        read and every table a foreign key references, which is what decides
+        each one's spelling.
+        """
+        search_path = self._pinned(conn)
+        schema_names = _scope_schema_names(
+            conn,
+            search_path=search_path,
+            extra_schemas=self.extra_schemas,
+            internal_prefixes=self.internal_prefixes,
+            internal_names=self.internal_names,
+        )
+        columns_by_table = _fetch_columns(conn, schema_names)
+        pk_by_table = _fetch_primary_keys(conn, schema_names)
+        fk_by_table = _fetch_foreign_keys(conn, schema_names)
+        referenced = {fk.ref_table for fks in fk_by_table.values() for fk in fks}
+        bare_home = resolve_bare_relation_names(
+            conn,
+            {table for _, table in columns_by_table} | referenced,
+            search_path=search_path,
+        )
+        return _Catalogue(columns_by_table, pk_by_table, fk_by_table, bare_home)
 
     def raw_schema(self) -> str:
         """Extract synthesised `CREATE TABLE` statements for every readable table.
 
-        `default_schema` plus whatever is opted into via `AIPA_EXTRA_SCHEMAS`
-        - see `_user_schema_names`. A table outside `public` is written
-        schema-qualified (`_display_table`), which is both how a query must
-        spell it and how `table_names()` advertises it, so nothing is shown
-        here that the validator would refuse.
+        Every schema on the role's search path plus whatever is opted into
+        via `AIPA_EXTRA_SCHEMAS` - see `_scope_schema_names`. A table is
+        written bare when its bare name resolves to it and schema-qualified
+        otherwise (`_display_table`), which is both how a query must spell it
+        and how `table_names()` advertises it, so nothing is shown here that
+        the validator would refuse.
 
-        Reads through the same read-only, least-privilege connection
+        Reads through the same read-only, least-privilege, pinned connection
         `execute()` uses (`_connect_read_only`) rather than a plain
         `psycopg.connect` - only fixed catalogue SQL runs here, never
         LLM-authored text, so the practical risk was always low, but there is
@@ -1031,78 +1192,58 @@ POSTGRESQL DIALECT (must follow):
             and separated by blank lines, ordered by schema then table name.
         """
         with _connect_read_only(self.dsn) as conn:
-            self._resolve_default_schema(conn)
-            schema_names = _user_schema_names(
-                conn,
-                default_schema=self.default_schema,
-                extra_schemas=self.extra_schemas,
-                internal_prefixes=self.internal_prefixes,
-                internal_names=self.internal_names,
-            )
-            columns_by_table = _fetch_columns(conn, schema_names)
-            pk_by_table = _fetch_primary_keys(conn, schema_names)
-            fk_by_table = _fetch_foreign_keys(conn, schema_names)
+            catalogue = self._read_catalogue(conn)
         return "\n\n".join(
             _table_ddl(
                 schema_name,
                 table_name,
-                columns_by_table[(schema_name, table_name)],
-                pk_by_table.get((schema_name, table_name), []),
-                fk_by_table.get((schema_name, table_name), []),
-                default_schema=self.default_schema,
+                catalogue.columns_by_table[(schema_name, table_name)],
+                catalogue.pk_by_table.get((schema_name, table_name), []),
+                catalogue.fk_by_table.get((schema_name, table_name), []),
+                bare_home=catalogue.bare_home,
             )
-            for schema_name, table_name in sorted(columns_by_table)
+            for schema_name, table_name in sorted(catalogue.columns_by_table)
         )
 
     def schema_chunks(self) -> list[SchemaChunk]:
         """Build table-level schema chunks for retrieval without reading row data.
 
-        Covers `default_schema` plus whatever is opted into via
-        `AIPA_EXTRA_SCHEMAS` - see `_user_schema_names`.
+        Covers every schema on the role's search path plus whatever is opted
+        into via `AIPA_EXTRA_SCHEMAS` - see `_scope_schema_names`.
         `_fetch_columns`/`_fetch_primary_keys`/`_fetch_foreign_keys` key
         everything by `(schema, table)` rather than bare `table_name`, which
-        is what makes that widening safe: two schemas sharing a table name
-        stay two entries with their own columns, keys and value hints, where
-        a bare-name key would silently merge them (`duckdb.py`'s module
+        is what makes more than one schema safe: two schemas sharing a table
+        name stay two entries with their own columns, keys and value hints,
+        where a bare-name key would silently merge them (`duckdb.py`'s module
         docstring records what that merge did in practice).
 
-        A chunk records `schema_name` only when the table is outside
-        `default_schema`, so `chunk.qualified_name` is exactly the spelling
-        `table_names()` advertises and `safety.py` accepts.
+        A chunk is spelled bare (`schema_name` empty, `home_schema` set) only
+        when its bare name resolves to it (`resolve_bare_relation_names`), and
+        records `schema_name` otherwise, so `chunk.qualified_name` is exactly
+        the spelling `table_names()` advertises and `safety.py` accepts - and
+        the bare spelling means what the server would make it mean.
 
         Reads through `_connect_read_only`, the same connection `execute()`
         uses - see `raw_schema()`'s docstring for why.
         """
         with _connect_read_only(self.dsn) as conn:
-            self._resolve_default_schema(conn)
-            schema_names = _user_schema_names(
-                conn,
-                default_schema=self.default_schema,
-                extra_schemas=self.extra_schemas,
-                internal_prefixes=self.internal_prefixes,
-                internal_names=self.internal_names,
-            )
-            columns_by_table = _fetch_columns(conn, schema_names)
-            pk_by_table = _fetch_primary_keys(conn, schema_names)
-            fk_by_table = _fetch_foreign_keys(conn, schema_names)
+            catalogue = self._read_catalogue(conn)
+            bare_home = catalogue.bare_home
 
             chunks: list[SchemaChunk] = []
-            for schema_name, table_name in sorted(columns_by_table):
-                typed_columns = columns_by_table[(schema_name, table_name)]
+            for schema_name, table_name in sorted(catalogue.columns_by_table):
+                typed_columns = catalogue.columns_by_table[(schema_name, table_name)]
                 columns = [c for c, _, _ in typed_columns]
-                pk_columns = pk_by_table.get((schema_name, table_name), [])
-                foreign_keys = fk_by_table.get((schema_name, table_name), [])
+                pk_columns = catalogue.pk_by_table.get((schema_name, table_name), [])
+                foreign_keys = catalogue.fk_by_table.get((schema_name, table_name), [])
                 # Spelled the way the referenced table's own chunk spells
-                # itself (bare inside `default_schema`, qualified outside),
-                # so a foreign-key edge and a chunk identity are the same
-                # kind of key - PostgreSQL, unlike DuckDB, does allow a
-                # foreign key to cross schemas, so `fk.ref_schema` is read
+                # itself (bare when the bare name reaches it, qualified
+                # otherwise), so a foreign-key edge and a chunk identity are
+                # the same kind of key - PostgreSQL, unlike DuckDB, does allow
+                # a foreign key to cross schemas, so `fk.ref_schema` is read
                 # rather than assumed.
                 foreign_tables = sorted(
-                    {
-                        _plain_table(fk.ref_schema, fk.ref_table, self.default_schema)
-                        for fk in foreign_keys
-                    }
+                    {_plain_table(fk.ref_schema, fk.ref_table, bare_home) for fk in foreign_keys}
                 )
                 ddl = _table_ddl(
                     schema_name,
@@ -1110,16 +1251,17 @@ POSTGRESQL DIALECT (must follow):
                     typed_columns,
                     pk_columns,
                     foreign_keys,
-                    default_schema=self.default_schema,
+                    bare_home=bare_home,
                 )
                 untyped_columns = [(c, t) for c, t, _ in typed_columns]
                 value_hints = _value_hints_for_table(conn, schema_name, table_name, untyped_columns)
                 value_text = " ".join(value for values in value_hints.values() for value in values)
-                # The chunk's own qualified spelling leads `search_text`: for
-                # a table in `default_schema` it is the same string as the
-                # bare name, so single-schema retrieval scoring is unchanged.
-                display_name = _plain_table(schema_name, table_name, self.default_schema)
+                # The chunk's own spelling leads `search_text`: for a table
+                # spelled bare it is the same string as the bare name, so
+                # single-schema retrieval scoring is unchanged.
+                display_name = _plain_table(schema_name, table_name, bare_home)
                 search_text = " ".join([display_name, ddl, *columns, *foreign_tables, value_text])
+                bare = _is_bare(schema_name, table_name, bare_home)
                 chunks.append(
                     SchemaChunk(
                         table_name=table_name,
@@ -1127,7 +1269,8 @@ POSTGRESQL DIALECT (must follow):
                         columns=columns,
                         foreign_tables=foreign_tables,
                         search_text=search_text,
-                        schema_name="" if schema_name == self.default_schema else schema_name,
+                        schema_name="" if bare else schema_name,
+                        home_schema=schema_name if bare else "",
                         value_hints=value_hints,
                     )
                 )
@@ -1137,7 +1280,7 @@ POSTGRESQL DIALECT (must follow):
         """Hash table names, column names/types and foreign keys into a cache key.
 
         Covers the same schemas `raw_schema()`/`schema_chunks()` do
-        (`_user_schema_names`), so a table appearing in or vanishing from any
+        (`_scope_schema_names`), so a table appearing in or vanishing from any
         of them invalidates `schema.py`'s cache. Nothing row-derived
         goes into the hash - no row count, no value-hint query - which is
         what `tests/test_engine_postgres.py::
@@ -1148,9 +1291,16 @@ POSTGRESQL DIALECT (must follow):
         doc's literal "table names, column names and types, and foreign
         keys" - a nullability change or a column reorder is still
         schema-derived, not row-derived, and either should still invalidate
-        the cache. Foreign keys are new in this hash; Task 2's version
-        hashed columns alone, so adding or dropping a foreign key with no
-        column-level change went unnoticed by the cache.
+        the cache. Foreign keys are included too, so adding or dropping one
+        with no column-level change still invalidates.
+
+        The bare-name resolution (`resolve_bare_relation_names` over every
+        table read) is hashed as well (2026-09-27): a relation created
+        earlier on the search path - even one the role cannot read, which
+        `information_schema.columns` would never show - changes what a bare
+        name means, and with it which chunks are spelled bare. The returned
+        tuple leads with the effective search path itself for the same
+        reason.
 
         The returned tuple's second element (2026-09-26) is `self.extra_
         schemas` itself, sorted - not merely implied by `schema_names`
@@ -1168,10 +1318,10 @@ POSTGRESQL DIALECT (must follow):
         uses - see `raw_schema()`'s docstring for why.
         """
         with _connect_read_only(self.dsn) as conn:
-            self._resolve_default_schema(conn)
-            schema_names = _user_schema_names(
+            search_path = self._pinned(conn)
+            schema_names = _scope_schema_names(
                 conn,
-                default_schema=self.default_schema,
+                search_path=search_path,
                 extra_schemas=self.extra_schemas,
                 internal_prefixes=self.internal_prefixes,
                 internal_names=self.internal_names,
@@ -1206,9 +1356,14 @@ POSTGRESQL DIALECT (must follow):
                 "ORDER BY nsp.nspname, cls.relname, con.conname",
                 (schema_names,),
             ).fetchall()
-        digest_input = repr((schema_names, column_rows, fk_rows))
+            bare_home = resolve_bare_relation_names(
+                conn,
+                {str(row[1]) for row in column_rows} | {str(row[5]) for row in fk_rows},
+                search_path=search_path,
+            )
+        digest_input = repr((schema_names, column_rows, fk_rows, sorted(bare_home.items())))
         digest = hashlib.sha256(digest_input.encode()).hexdigest()
-        return (self.default_schema, tuple(sorted(self.extra_schemas)), digest)
+        return (tuple(search_path), tuple(sorted(self.extra_schemas)), digest)
 
     def table_names(self) -> frozenset[str]:
         """Every valid spelling of every user table, lowercased, via the cache.
@@ -1239,8 +1394,9 @@ POSTGRESQL DIALECT (must follow):
         `name(alias)` function-call sugar. PostgreSQL is the only engine
         that actually reaches it.
 
-        Per table, not unioned across tables: this engine reads `default_
-        schema` plus every opted-in extra (`_user_schema_names`), so a union
+        Per table, not unioned across tables: this engine reads every
+        search-path schema plus every opted-in extra (`_scope_schema_names`),
+        so a union
         is still a union over more than one table's columns, which is
         precisely what re-armed that sugar as a bypass on 2026-09-26 (a
         column named `lo_get` in any readable schema was enough). See
@@ -1302,6 +1458,7 @@ POSTGRESQL DIALECT (must follow):
         """
         if self._shadowed_function_names is None:
             with _connect_read_only(self.dsn) as conn:
+                self._pinned(conn)
                 self._shadowed_function_names = _fetch_shadowed_function_names(
                     conn, allowed_functions=self.allowed_functions or frozenset()
                 )

@@ -585,7 +585,7 @@ DUCKDB DIALECT (must follow):
         `table_names()`. `extra_schemas` is filtered through the identical
         case-insensitive comparison here, before it ever reaches a query, so
         a schema `safety.py` would refuse to let a reference resolve into is
-        never read at all - matching `PostgresEngine._user_schema_names`.
+        never read at all - matching `PostgresEngine._scope_schema_names`.
         """
         extras = sorted(
             name

@@ -305,6 +305,7 @@ def retrieve_schema_context(
                 # a table outside the engine's default schema the identity of
                 # a same-named table inside it.
                 schema_name=chunk.schema_name,
+                home_schema=chunk.home_schema,
                 value_hints=chunk.value_hints,
                 score=score,
                 matched_terms=sorted(matched_terms),
@@ -341,6 +342,7 @@ def retrieve_schema_context(
                                 foreign_tables=neighbor_chunk.foreign_tables,
                                 search_text=neighbor_chunk.search_text,
                                 schema_name=neighbor_chunk.schema_name,
+                                home_schema=neighbor_chunk.home_schema,
                                 value_hints=neighbor_chunk.value_hints,
                                 score=max(neighbor_chunk.score, chunk.score * (0.35 / (depth + 1))),
                                 matched_terms=neighbor_chunk.matched_terms or [],

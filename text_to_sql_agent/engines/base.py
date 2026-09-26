@@ -17,6 +17,9 @@ from ..types import QueryResult, SchemaChunk
 # become LLM-visible just because this agent happened to widen its own
 # catalogue read. `AIPA_EXTRA_SCHEMAS` is the opt-in: a comma-separated list
 # of schema names to read *in addition to* the engine's own default schema.
+# (For PostgreSQL, since 2026-09-27, "its own default" means every schema on
+# the role's effective search path - see `postgres.py::_scope_schema_names` -
+# and this list keeps its meaning for schemas outside that path.)
 # Unset or empty opts into nothing, which is the safe default - both engines'
 # `__init__` read it once via `extra_schemas_from_env()` below, mirroring how
 # `ui/secrets.py`'s `active_gemini_key` reads `GEMINI_API_KEY` straight from
@@ -44,7 +47,7 @@ def extra_schemas_from_env() -> frozenset[str]:
     fixed for its whole lifetime even if the variable changes mid-process.
     Blank entries and surrounding whitespace are dropped. Still gated by
     each engine's own privilege check where one exists - `PostgresEngine`'s
-    `_user_schema_names` only ever reads a schema this names *and* the
+    `_scope_schema_names` only ever reads a schema this names *and* the
     connecting role holds `USAGE` on; naming a schema here does not by
     itself grant access to it.
 
@@ -180,7 +183,7 @@ def _spellings_with_identity(
     Raises:
         AmbiguousTableIdentityError: If a spelling this loop is about to
             record already belongs to a *different* chunk (different
-            `(schema_name, table_name)`, exact case). Two spellings coming
+            `(schema_name, home_schema, table_name)`, exact case). Two spellings coming
             from the *same* chunk - a default-schema table's bare and
             qualified forms - are never a collision; they are the documented
             dual-spelling contract `table_name_spellings` implements.
@@ -189,13 +192,15 @@ def _spellings_with_identity(
     for chunk in chunks:
         bare = chunk.table_name.lower()
         schema = chunk.schema_name.lower()
-        spellings = [f"{schema}.{bare}"] if schema else [bare, f"{default_schema.lower()}.{bare}"]
+        home = (chunk.home_schema or default_schema).lower()
+        spellings = [f"{schema}.{bare}"] if schema else [bare, f"{home}.{bare}"]
         for spelling in spellings:
             existing = owners.get(spelling)
             if existing is not None and (
                 existing.schema_name,
+                existing.home_schema,
                 existing.table_name,
-            ) != (chunk.schema_name, chunk.table_name):
+            ) != (chunk.schema_name, chunk.home_schema, chunk.table_name):
                 raise AmbiguousTableIdentityError(spelling, existing, chunk)
             owners[spelling] = chunk
     return owners
@@ -277,6 +282,7 @@ def is_internal_schema_name(
     `"PG_evil".t` is refused exactly as `pg_evil.t` would be. Before this
     function existed, nothing on the *engine* side made the same comparison
     when deciding which schemas to read: `PostgresEngine._user_schema_names`
+    (now `_scope_schema_names`)
     and `DuckDBEngine._allowed_schemas` matched only the exact literal
     strings `"information_schema"`/`"pg_catalog"` (or, for PostgreSQL,
     nothing at all beyond the operator-supplied candidate list). A schema
@@ -288,7 +294,7 @@ def is_internal_schema_name(
     `docs/3_decisions.md`'s 2026-09-25 entry closed in the opposite
     direction. Both sides must apply the identical comparison - this
     function *is* that comparison, called from each engine's own schema-scope
-    filtering (`PostgresEngine._user_schema_names`,
+    filtering (`PostgresEngine._scope_schema_names`,
     `DuckDBEngine._allowed_schemas`) so a schema `safety.py` would refuse to
     let a query reference is never read in the first place.
 
@@ -350,7 +356,10 @@ class Engine(Protocol):
     # to decide which tables may also be spelled bare, what `SchemaChunk.
     # schema_name` is resolved against before a chunk records it, and - via
     # `table_names()` rather than a hardcoded string - what `safety.py`'s
-    # schema-qualifier check now accepts.
+    # schema-qualifier check now accepts. PostgreSQL (2026-09-27) resolves
+    # bare names across its whole search path, not one schema, so it records
+    # each bare table's real schema on `SchemaChunk.home_schema` instead and
+    # this is only its first path entry.
     default_schema: str
     # The `work_limit` `execute()` receives when a caller does not pass one
     # explicitly - see `execution.execute_query`. Each engine's `work_limit`
