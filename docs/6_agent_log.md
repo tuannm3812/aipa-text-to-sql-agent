@@ -2111,3 +2111,10 @@ returns no rows; the DuckDB unscoped-CTE stand-in accepts the new `dialect`
 keyword. Every live fixture uses a uniquely named schema (or table, for
 `citext` in `public`) and drops it in `finally`; `citext` is only dropped if
 the fixture created it. `.devcontainer/devcontainer.json` was never staged.
+
+**Correction to the breakdown above** (per-file `pytest --collect-only`,
+BASE `8fb01d5` vs HEAD): `test_engine_postgres.py` 276 -> 288 (+12: 6
+fidelity, 6 exact-text; the count check was renamed, not added) and
+`test_ui_results.py` 13 -> 15 (+2: the new code in the known-codes
+parametrisation and the not-read-only message test). `test_safety.py`
+151 -> 182 (+31). With +24 in the new module the total is still +69, 887 -> 956.
