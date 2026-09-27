@@ -2024,3 +2024,90 @@ was not repeated in this follow-up. No live provider or browser run was made.
 Benchmark outputs stayed outside the repository. Only this log entry was
 edited by this review; Claude's ongoing changes and the owner's existing
 `.devcontainer/devcontainer.json` edit were preserved. No commit was made.
+
+## 2026-09-27 — Claude: risky column types refused (Codex P1); CTE-scoped qualification (Codex P2)
+
+BASE `8fb01d5`. Commits: `856cb7e` (P2, CTE scope), `dbbae14` (P1, risky
+column types), `c7c71f3` (decision entries, standards, README), `d631036`
+(Codex's follow-up entry above, committed verbatim), and this entry.
+
+**P1 - implicit casts.** Implemented the owner's "refuse risky types only"
+decision. A type is risky when it is not a `pg_catalog` type and has a cast
+whose function lives outside `pg_catalog` or operators of its own outside
+`pg_catalog`; arrays, domains, composites (row types included), ranges and
+multiranges over a risky type are risky too (`engines/postgres.py::
+_fetch_risky_tables`, pinned, `SET LOCAL jit = off`). `Engine.
+risky_type_columns()` reports it per advertised spelling; SQLite and DuckDB
+return `{}`. `safety._touches_risky_column_type` is the last validator rule
+and over-approximates touched columns (names ignoring qualifiers, alias
+column lists, whole-row references, `*` except `count(*)`, `USING`,
+`NATURAL`). `safety.query_refusal` returns `BLOCKED_UNSUPPORTED_COLUMN_TYPE`;
+both pipeline entry points surface it (repair checks use it too) and
+`ui/results.py` explains it without claiming the SQL was not read-only.
+
+Codex's completion checklist, answered: the payload is proven armed through
+`engine.execute` with the validator bypassed, then refused through
+`ask_database` and `ask_database_with_sql` with repair left on - one
+generation, `PostgresEngine.execute` never called, the dedicated code and
+UI message asserted. `citext` now refuses explicitly; plain enum, domain over
+`text` and unaffected-column queries are asserted to validate and execute
+with the server's rows. Aliases, CTEs, derived tables, whole-row and wildcard
+forms are in the 18-case refusal matrix. The exclusions (casts/operators
+between built-in types; custom type I/O; both need a superuser) are recorded
+in `docs/3_decisions.md` as a stated boundary, not a claim that the pin
+blocks every route to user code.
+
+**Failing at BASE** (`tests/test_postgres_risky_types.py`, 24 tests, all
+failed at BASE; the three primary assertions, each after its armed check
+passed):
+
+```
+E   AssertionError: the implicit cast bypass validated            # Codex's enum probe
+E   AssertionError: the silently-wrong citext query validated     # citext `=`
+E   AssertionError: the whole-row cast bypass validated           # row-type cast
+E   AttributeError: module 'text_to_sql_agent.safety' has no attribute 'query_refusal'  (x19)
+E   AttributeError: 'PostgresEngine' object has no attribute 'risky_type_columns'       (x2)
+```
+
+The plain-enum/domain test failed at BASE only on the new
+`risky_type_columns()` call; its validate-and-execute half is a guard against
+over-refusal and passes at BASE by design.
+
+**P2 - CTE scope.** `qualify_bare_table_references` now asks
+`_names_visible_cte`, the validator's own scoped answer (reused, not a third
+implementation), with PostgreSQL folding and all-siblings `WITH RECURSIVE`
+visibility behind the dialect. Six fidelity cases added; at BASE three failed
+(`UndefinedTable` for both of Codex's probes and for a non-recursive CTE whose
+body reads the same-named table), in both the fidelity and exact-text tests;
+the recursive and quoted-mixed-case cases passed at BASE and guard the
+behaviour the coarse rule protected.
+
+**Verified** (DSN `postgresql://aipa_ro:...@127.0.0.1:55432/aipa`):
+
+```
+$ uv run pytest                                  956 passed, 6 skipped in 22.11s
+$ uv run pytest -m conformance -rs               36 passed, 926 deselected   (0 skipped)
+$ env -u AIPA_TEST_POSTGRES_DSN uv run pytest    612 passed, 350 skipped     (0 failed)
+$ -k test_pinned_qualified_execution_matches...  53 passed                   (fidelity corpus 47 -> 53)
+$ tests/test_engine_duckdb.py -k analytics_corpus  62 passed                 (61 + size check)
+$ closed-bypass selection (dot_call, oid_cast, column_call, hostile_column_name,
+  function_scan, overload, shadow, non_catalog, operator, search_path, lo_get,
+  internal) over test_engine_postgres/test_safety/test_postgres_search_path_pin
+                                                 109 passed
+$ uv run ruff check .                            All checks passed!
+$ uv run ruff format --check .                   81 files already formatted
+$ uv run mypy                                    Success: no issues found in 32 source files
+$ uv run python scripts/evaluate_text_to_sql.py --mode gold
+                                                 12/12   (then git checkout evaluation/results/)
+```
+
+956 up from 887: +24 `test_postgres_risky_types.py`, +13
+`test_engine_postgres.py` (6 fidelity, 6 exact-text, 1 renamed count check
+now covering three corpora), +31 `test_safety.py`, +1 `test_ui_results.py`.
+Adapted, not relaxed: `test_repaired_sql_is_rechecked_for_safety` spies on
+`query_refusal` (still two checks); the extension-cost test now asserts the
+`citext` query is refused while execution with the validator bypassed still
+returns no rows; the DuckDB unscoped-CTE stand-in accepts the new `dialect`
+keyword. Every live fixture uses a uniquely named schema (or table, for
+`citext` in `public`) and drops it in `finally`; `citext` is only dropped if
+the fixture created it. `.devcontainer/devcontainer.json` was never staged.
