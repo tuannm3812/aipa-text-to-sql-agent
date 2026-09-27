@@ -1304,17 +1304,95 @@ def test_analytics_corpus_passes_validation_and_executes(postgres_dsn: str, sql:
 # ways and must return byte-identical results: the original text through a
 # plain `aipa_ro` connection on its stock search path (the server resolving
 # every name itself), and the engine's rewritten text under the pin.
+#
+# Codex's 2026-09-27 Finding 2 added `_CTE_SCOPE_QUERIES`: a CTE anywhere in
+# the statement used to suppress qualification of every same-spelled table,
+# ignoring lexical scope and quoted identity, so the real table was left bare
+# and vanished under the pin (`UndefinedTable`). Each entry carries the exact
+# text the engine must execute, so the test pins not only equal rows but that
+# only the real base-table reference gained `"public".` - never a CTE
+# reference.
+_CTE_SCOPE_QUERIES: list[tuple[str, str, str]] = [
+    (
+        # Codex's first probe: the inner CTE cannot shadow the outer table.
+        "inner_cte_does_not_shadow_outer_table",
+        "SELECT name FROM customers WHERE EXISTS "
+        "(WITH customers AS (SELECT 1 AS x) SELECT x FROM customers)",
+        'SELECT name FROM "public".customers WHERE EXISTS '
+        "(WITH customers AS (SELECT 1 AS x) SELECT x FROM customers)",
+    ),
+    (
+        # Codex's second probe: quoted `"CUSTOMERS"` is not bare `customers`.
+        "quoted_uppercase_cte_is_not_the_bare_table",
+        'WITH "CUSTOMERS" AS (SELECT 1) SELECT name FROM customers',
+        'WITH "CUSTOMERS" AS (SELECT 1) SELECT name FROM "public".customers',
+    ),
+    (
+        # A quoted mixed-case CTE referenced by its own quoted name stays a CTE.
+        "quoted_mixed_case_cte_reference",
+        'WITH "Top" AS (SELECT customer_id FROM customers WHERE customer_id = 1) '
+        'SELECT count(*) FROM "Top"',
+        'WITH "Top" AS (SELECT customer_id FROM "public".customers WHERE customer_id = 1) '
+        'SELECT count(*) FROM "Top"',
+    ),
+    (
+        # `WITH RECURSIVE`: the first CTE's `customers` is its *later* sibling,
+        # so it stays bare; only `sales` is a base table.
+        "recursive_forward_reference_to_a_later_sibling",
+        "WITH RECURSIVE firsts AS (SELECT name FROM customers), "
+        "customers AS (SELECT 'x'::text AS name) "
+        "SELECT (SELECT count(*) FROM sales) AS n, name FROM firsts",
+        "WITH RECURSIVE firsts AS (SELECT name FROM customers), "
+        "customers AS (SELECT 'x'::text AS name) "
+        'SELECT (SELECT count(*) FROM "public".sales) AS n, name FROM firsts',
+    ),
+    (
+        # `WITH RECURSIVE` self-reference stays bare too.
+        "recursive_self_reference",
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) "
+        "SELECT n, (SELECT count(*) FROM customers) AS c FROM t ORDER BY n",
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) "
+        'SELECT n, (SELECT count(*) FROM "public".customers) AS c FROM t ORDER BY n',
+    ),
+    (
+        # Without RECURSIVE a CTE cannot see itself: its body's `customers`
+        # is the real table, while the main query's is the CTE.
+        "non_recursive_cte_body_sees_the_real_table",
+        "WITH customers AS (SELECT * FROM customers WHERE customer_id = 1) "
+        "SELECT name FROM customers",
+        'WITH customers AS (SELECT * FROM "public".customers WHERE customer_id = 1) '
+        "SELECT name FROM customers",
+    ),
+]
+
 _FIDELITY_CORPUS: list[tuple[str, str]] = [
     *((f"analytics_{i:02d}", sql) for i, sql in enumerate(ANALYTICS_CORPUS)),
     *((f"qualified_column_{label}", sql) for label, sql in _LEGITIMATE_QUALIFIED_COLUMN_QUERIES),
+    *((f"cte_scope_{label}", sql) for label, sql, _ in _CTE_SCOPE_QUERIES),
 ]
 
 
-def test_fidelity_corpus_covers_both_existing_corpora() -> None:
+def test_fidelity_corpus_covers_every_source_corpus() -> None:
     """The proof is only as strong as its coverage - pin the count it reports."""
     assert len(_FIDELITY_CORPUS) == len(ANALYTICS_CORPUS) + len(
         _LEGITIMATE_QUALIFIED_COLUMN_QUERIES
-    )
+    ) + len(_CTE_SCOPE_QUERIES)
+
+
+@pytest.mark.parametrize(
+    "label,sql,expected",
+    _CTE_SCOPE_QUERIES,
+    ids=[label for label, _, _ in _CTE_SCOPE_QUERIES],
+)
+def test_cte_scope_queries_validate_and_qualify_only_the_base_table(
+    postgres_dsn: str, label: str, sql: str, expected: str
+) -> None:
+    """Exactly the real base-table references gain `"public".`; CTE references do not."""
+    engine = open_engine(postgres_dsn)
+    assert is_safe_query(sql, engine=engine), f"wrongly rejected: {sql!r}"
+    result = engine.execute(sql, max_rows=10_000, work_limit=0)
+    assert result.error is None, result.error
+    assert result.sql == expected
 
 
 @pytest.mark.parametrize(

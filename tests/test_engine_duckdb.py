@@ -1330,7 +1330,7 @@ def test_cte_scoping_fix_is_load_bearing(monkeypatch, engine_with_table_t):
     teardown, restoring the real, scoped implementation.
     """
 
-    def _unscoped_cte_names(table: exp.Table) -> frozenset[str]:
+    def _unscoped_cte_names(table: exp.Table, **_kwargs: object) -> frozenset[str]:
         parsed = table
         while parsed.parent is not None:
             parsed = parsed.parent

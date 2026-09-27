@@ -797,7 +797,9 @@ def test_function_scan_spellings_bind_strictly(
     parsed = sqlglot.parse_one(sql, read="postgres")
     relation = safety._scope_relations(parsed)[0]
     assert safety._relation_kind(relation) == safety._RELATION_FUNCTION_SCAN, label
-    bound_qualifiers, bound_names = safety._relation_binding(relation, real_table_columns={})
+    bound_qualifiers, bound_names = safety._relation_binding(
+        relation, dialect="postgres", real_table_columns={}
+    )
     assert bound_qualifiers == qualifiers, label
     assert bound_names == names, label
 
@@ -938,6 +940,24 @@ def _qualify(sql: str, homes: dict[str, str] | None = None) -> tuple[str, list[f
             "INSERT INTO customers VALUES (1, 'x')",
             "INSERT INTO \"public\".customers VALUES (1, 'x')",
         ),
+        # Codex 2026-09-27 Finding 2: CTE visibility is lexical, not statement-wide.
+        # An inner CTE does not shadow the outer table...
+        (
+            "SELECT name FROM customers WHERE EXISTS "
+            "(WITH customers AS (SELECT 1 AS x) SELECT x FROM customers)",
+            'SELECT name FROM "public".customers WHERE EXISTS '
+            "(WITH customers AS (SELECT 1 AS x) SELECT x FROM customers)",
+        ),
+        # ...a quoted "CUSTOMERS" is not bare customers...
+        (
+            'WITH "CUSTOMERS" AS (SELECT 1) SELECT name FROM customers',
+            'WITH "CUSTOMERS" AS (SELECT 1) SELECT name FROM "public".customers',
+        ),
+        # ...and a non-recursive CTE's own body reads the real table.
+        (
+            "WITH customers AS (SELECT * FROM customers) SELECT * FROM customers",
+            'WITH customers AS (SELECT * FROM "public".customers) SELECT * FROM customers',
+        ),
     ],
 )
 def test_qualification_inserts_only_a_schema_before_each_base_table(
@@ -959,6 +979,9 @@ def test_qualification_inserts_only_a_schema_before_each_base_table(
         # PostgreSQL's `WITH RECURSIVE` lets a CTE see a *later* sibling; a name
         # spelled like any CTE in the statement is left for the server to bind.
         "WITH RECURSIVE a AS (SELECT * FROM sales), sales AS (SELECT 1 AS x) SELECT * FROM a",
+        # Unquoted `Totals` folds to the CTE `totals`, as on the server.
+        "WITH totals AS (SELECT 1 AS x) SELECT * FROM Totals",
+        'WITH "Top" AS (SELECT 1 AS x) SELECT * FROM "Top"',
         # Function scans, unnest, ROWS FROM and VALUES are never tables.
         "SELECT * FROM generate_series(1, 5) g",
         "SELECT * FROM unnest(ARRAY[1, 2]) u",
@@ -976,6 +999,24 @@ def test_qualification_inserts_only_a_schema_before_each_base_table(
 def test_qualification_leaves_everything_else_untouched(sql: str) -> None:
     rewritten, _ = _qualify(sql)
     assert rewritten == sql
+
+
+def test_cte_name_folding_is_dialect_specific() -> None:
+    """PostgreSQL compares CTE names server-folded; DuckDB keeps its case-insensitive match.
+
+    A quoted `"Totals"` CTE is not the bare `totals` on PostgreSQL, so the
+    validator must treat `totals` as a real (here: unknown) table there, while
+    DuckDB - case-insensitive even for quoted identifiers - still binds it.
+    """
+    import sqlglot
+
+    from text_to_sql_agent import safety
+
+    sql = 'WITH "Totals" AS (SELECT 1 AS x) SELECT * FROM totals'
+    for dialect, binds in (("postgres", False), ("duckdb", True)):
+        parsed = sqlglot.parse_one(sql, read=dialect)
+        table = [t for t in parsed.find_all(sqlglot.exp.Table) if t.name == "totals"][0]
+        assert safety._names_visible_cte(table, dialect=dialect) is binds, dialect
 
 
 def test_for_update_of_names_stay_unqualified() -> None:

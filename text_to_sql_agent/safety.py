@@ -1123,7 +1123,10 @@ def _function_scan_output_names(relation: sqlglot_exp.Expression) -> frozenset[s
 
 
 def _relation_binding(
-    relation: sqlglot_exp.Expression, *, real_table_columns: Mapping[str, frozenset[str]]
+    relation: sqlglot_exp.Expression,
+    *,
+    dialect: str,
+    real_table_columns: Mapping[str, frozenset[str]],
 ) -> tuple[frozenset[str], frozenset[str] | None]:
     """What one `FROM`/`JOIN` relation binds: its qualifiers, and its columns.
 
@@ -1140,6 +1143,7 @@ def _relation_binding(
 
     Args:
         relation: A node in a table-source position.
+        dialect: The dialect it was parsed under - see `_names_visible_cte`.
         real_table_columns: The engine's per-table column map, keyed by every
             spelling `Engine.table_names()` advertises.
 
@@ -1170,7 +1174,7 @@ def _relation_binding(
         # its schema-qualified one too; an aliased one answers only to the
         # alias, which is what PostgreSQL itself enforces.
         qualifiers = {alias} if alias else ({name} | ({f"{schema}.{name}"} if schema else set()))
-        if not schema and name in _visible_cte_names(relation):
+        if _names_visible_cte(relation, dialect=dialect):
             # A CTE reference. Its output columns are the inner query's, which
             # this module does not compute - permissive.
             return frozenset(qualifiers), None
@@ -1248,7 +1252,10 @@ def _qualifier_keys(column: sqlglot_exp.Column) -> tuple[str, ...]:
 
 
 def _qualifier_binding(
-    column: sqlglot_exp.Column, *, real_table_columns: Mapping[str, frozenset[str]]
+    column: sqlglot_exp.Column,
+    *,
+    dialect: str,
+    real_table_columns: Mapping[str, frozenset[str]],
 ) -> frozenset[str] | None:
     """The names `column`'s qualifier binds, or `None` to resolve permissively.
 
@@ -1259,6 +1266,7 @@ def _qualifier_binding(
 
     Args:
         column: A qualified `exp.Column`.
+        dialect: The dialect it was parsed under.
         real_table_columns: The engine's per-table column map.
 
     Returns:
@@ -1276,7 +1284,7 @@ def _qualifier_binding(
         if isinstance(node, exp.Select):
             for relation in _scope_relations(node):
                 qualifiers, names = _relation_binding(
-                    relation, real_table_columns=real_table_columns
+                    relation, dialect=dialect, real_table_columns=real_table_columns
                 )
                 if any(key in qualifiers for key in keys):
                     return names
@@ -1440,7 +1448,9 @@ def _references_unresolvable_qualified_column(
     # falls back to it.
     fallback: frozenset[str] | None = None
     for column in candidates:
-        resolvable = _qualifier_binding(column, real_table_columns=real_table_columns)
+        resolvable = _qualifier_binding(
+            column, dialect=dialect, real_table_columns=real_table_columns
+        )
         if resolvable is None:
             if _has_unrecognised_relation(parsed):
                 # The permissive fallback is exactly what the 2026-09-26
@@ -1530,8 +1540,47 @@ def _casts_to_object_identifier_type(parsed: sqlglot_exp.Expression) -> bool:
     return False
 
 
-def _visible_cte_names(table: sqlglot_exp.Table) -> frozenset[str]:
-    """The CTE aliases actually visible at `table`'s position, per DuckDB's own scoping.
+def _cte_spelling(identifier: sqlglot_exp.Expression | None, *, dialect: str) -> str:
+    """The name a CTE alias or a bare table reference means, for CTE-binding purposes.
+
+    PostgreSQL (the `_PINNED_SEARCH_PATH_DIALECTS`) binds a bare reference to
+    a CTE only when the two *server-folded* names are equal: `"CUSTOMERS"` is
+    not `customers`, but `Customers` is. DuckDB and SQLite treat identifiers
+    case-insensitively even when quoted, so every other dialect keeps the
+    lowercased spelling it always used - unchanged by construction.
+    """
+    if exp is None or identifier is None:
+        return ""
+    if dialect in _PINNED_SEARCH_PATH_DIALECTS and isinstance(identifier, exp.Identifier):
+        return _server_folded_name(identifier)
+    return str(identifier.name or "").lower()
+
+
+def _cte_alias_spelling(cte: sqlglot_exp.Expression, *, dialect: str) -> str:
+    alias = cte.args.get("alias")
+    identifier = alias.this if alias is not None else None
+    if identifier is None:
+        return (cte.alias or "").lower()
+    return _cte_spelling(identifier, dialect=dialect)
+
+
+def _names_visible_cte(table: sqlglot_exp.Table, *, dialect: str) -> bool:
+    """True if bare `table` binds to a CTE at its position - the one answer every caller uses.
+
+    The validator's unknown-table and qualified-column checks and the
+    engine's table qualification (`qualify_bare_table_references`) all ask
+    this, so "is this name a CTE or a real table" has exactly one answer
+    (Codex review 2026-09-27, Finding 2: the qualifier had its own, coarser
+    answer, and a CTE anywhere in the statement left a real table bare).
+    A schema-qualified reference never names a CTE.
+    """
+    if table.args.get("db") or table.args.get("catalog"):
+        return False
+    return _cte_spelling(table.this, dialect=dialect) in _visible_cte_names(table, dialect=dialect)
+
+
+def _visible_cte_names(table: sqlglot_exp.Table, *, dialect: str) -> frozenset[str]:
+    """The CTE aliases actually visible at `table`'s position, per the engine's own scoping.
 
     Fix 2 (2026-09-19 review round): a CTE is a real SQL scope, not a flat
     namespace over the whole statement. The previous implementation collected
@@ -1570,6 +1619,15 @@ def _visible_cte_names(table: sqlglot_exp.Table) -> frozenset[str]:
     - A `WITH RECURSIVE` CTE is visible inside its own body - modelled by
       also admitting its own index when the `with` node's `recursive` flag is
       set.
+    - **PostgreSQL only** (2026-09-27, Codex Finding 2): under `WITH
+      RECURSIVE` *every* sibling is visible to every CTE body, including a
+      later one - PostgreSQL documents that `RECURSIVE` lifts the ordering
+      requirement, and its error for a forward reference without it names
+      `WITH RECURSIVE` as the fix. Without `RECURSIVE` PostgreSQL agrees with
+      DuckDB: earlier siblings only, and never the CTE itself, so `WITH
+      customers AS (SELECT * FROM customers)` reads the real table in its
+      body. Names are compared server-folded for PostgreSQL (`_cte_spelling`)
+      and lowercased elsewhere.
     - Shadowing (an inner CTE reusing an outer CTE's name) needs no special
       case: this function only answers "is this name visible as *some* CTE
       here", never "which one" - both the inner and outer definitions are
@@ -1578,12 +1636,16 @@ def _visible_cte_names(table: sqlglot_exp.Table) -> frozenset[str]:
 
     Args:
         table: A parsed `exp.Table` node to compute CTE visibility for.
+        dialect: The dialect the statement was parsed under - picks the
+            recursive-sibling rule and the name folding above.
 
     Returns:
-        The lowercased CTE aliases visible at `table`'s position.
+        The CTE aliases visible at `table`'s position, spelled by
+        `_cte_spelling`.
     """
     if exp is None:
         return frozenset()
+    all_siblings_when_recursive = dialect in _PINNED_SEARCH_PATH_DIALECTS
     visible: set[str] = set()
     child: sqlglot_exp.Expression = table
     parent = child.parent
@@ -1599,8 +1661,12 @@ def _visible_cte_names(table: sqlglot_exp.Table) -> frozenset[str]:
                 # each other here.
                 own_index = next((i for i, c in enumerate(ctes) if c is parent), -1)
                 for i, cte in enumerate(ctes):
-                    if i < own_index or (is_recursive and i == own_index):
-                        name = (cte.alias or "").lower()
+                    if (
+                        i < own_index
+                        or (is_recursive and i == own_index)
+                        or (is_recursive and all_siblings_when_recursive)
+                    ):
+                        name = _cte_alias_spelling(cte, dialect=dialect)
                         if name:
                             visible.add(name)
                 child = with_node
@@ -1610,7 +1676,7 @@ def _visible_cte_names(table: sqlglot_exp.Table) -> frozenset[str]:
             with_arg = parent.args.get("with")
             if isinstance(with_arg, exp.With) and with_arg is not child:
                 for cte in with_arg.expressions:
-                    name = (cte.alias or "").lower()
+                    name = _cte_alias_spelling(cte, dialect=dialect)
                     if name:
                         visible.add(name)
         child = parent
@@ -1619,7 +1685,10 @@ def _visible_cte_names(table: sqlglot_exp.Table) -> frozenset[str]:
 
 
 def _references_unknown_table(
-    parsed: sqlglot_exp.Expression, *, get_real_table_names: Callable[[], frozenset[str]]
+    parsed: sqlglot_exp.Expression,
+    *,
+    dialect: str,
+    get_real_table_names: Callable[[], frozenset[str]],
 ) -> bool:
     """True if any `FROM`/`JOIN` target is not a real table or a CTE name.
 
@@ -1691,6 +1760,7 @@ def _references_unknown_table(
 
     Args:
         parsed: The parsed statement.
+        dialect: The dialect it was parsed under - see `_names_visible_cte`.
         get_real_table_names: Returns the engine's own table names,
             lowercased - see `Engine.table_names()`.
 
@@ -1707,7 +1777,7 @@ def _references_unknown_table(
             return True
         schema = (table.db or "").lower()
         name = (table.name or "").lower()
-        if not schema and name in _visible_cte_names(table):
+        if _names_visible_cte(table, dialect=dialect):
             continue
         candidates.append(f"{schema}.{name}" if schema else name)
     if not candidates:
@@ -1922,7 +1992,9 @@ def _is_safe_ast(
             return False
         if _casts_to_object_identifier_type(parsed):
             return False
-        if _references_unknown_table(parsed, get_real_table_names=get_real_table_names):
+        if _references_unknown_table(
+            parsed, dialect=dialect, get_real_table_names=get_real_table_names
+        ):
             return False
         if _references_unresolvable_qualified_column(
             parsed, dialect=dialect, get_real_table_columns=get_real_table_columns
@@ -2107,14 +2179,18 @@ def qualify_bare_table_references(
     **What is qualified.** Only a node `_relation_kind` - the validator's own
     relation classifier - calls `_RELATION_TABLE`, carrying no schema or
     catalog yet, not inside a `FOR UPDATE OF` list (PostgreSQL requires those
-    unqualified), and not spelled like any CTE defined anywhere in the
-    statement. The CTE test is deliberately coarser than `_visible_cte_
-    names`: PostgreSQL's `WITH RECURSIVE` lets a CTE reference a *later*
-    sibling, which that DuckDB-derived scoping model does not admit, and
-    qualifying a name the server would bind to a CTE would silently swap in a
-    real table. Leaving a bare name unqualified instead fails closed - under
-    the pin it resolves in `pg_catalog` (every relation there is `pg_*`,
-    which the internals rule already refuses) or nowhere. Function scans,
+    unqualified), and not bound to a CTE visible at its own position
+    (`_names_visible_cte`, the same answer the validator uses). Until Codex's
+    2026-09-27 Finding 2 this test was a flat, lowercased set of every CTE
+    alias anywhere in the statement, which ignored lexical scope and quoted
+    identity: an inner `WITH customers` or a quoted `"CUSTOMERS"` left the
+    outer, real `customers` bare, and the pin then made it vanish
+    (`UndefinedTable`). The scoped answer models PostgreSQL's `WITH
+    RECURSIVE`, where a CTE sees every sibling, including a later one, so a
+    name the server binds to a CTE is still never qualified - which would
+    silently swap in a real table. A bare name left unqualified fails
+    closed - under the pin it resolves in `pg_catalog` (every relation there
+    is `pg_*`, which the internals rule already refuses) or nowhere. Function scans,
     `unnest`, `ROWS FROM`, `VALUES` and derived tables are never qualified,
     by the same classification. A name `resolve` has no answer for is left
     bare, for the same fail-closed reason.
@@ -2152,7 +2228,6 @@ def qualify_bare_table_references(
         return sql
     parsed = statements[0]
 
-    cte_names = {(cte.alias or "").lower() for cte in parsed.find_all(exp.CTE)}
     candidates: list[tuple[sqlglot_exp.Table, sqlglot_exp.Identifier, str]] = []
     for table in parsed.find_all(exp.Table):
         if _relation_kind(table) != _RELATION_TABLE:
@@ -2164,7 +2239,7 @@ def qualify_bare_table_references(
         identifier = table.this
         if not isinstance(identifier, exp.Identifier):
             continue
-        if (identifier.name or "").lower() in cte_names:
+        if _names_visible_cte(table, dialect=dialect):
             continue
         candidates.append((table, identifier, _server_folded_name(identifier)))
     if not candidates:
