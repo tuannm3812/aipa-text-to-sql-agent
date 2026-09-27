@@ -6,6 +6,7 @@ from ui import results
 
 KNOWN_CODES = [
     "BLOCKED_UNSAFE_SQL",
+    "BLOCKED_UNSUPPORTED_COLUMN_TYPE",
     "UNANSWERABLE_WITH_GIVEN_SCHEMA",
     "RESULT_TRUNCATED_TO_1000_ROWS",
     "QUERY_ABORTED_AFTER_100000_VM_STEPS",
@@ -23,6 +24,13 @@ def test_describe_error_returns_a_human_message(code: str) -> None:
 
 def test_describe_error_mentions_read_only_for_blocked_sql() -> None:
     assert "read-only" in results.describe_error("BLOCKED_UNSAFE_SQL")
+
+
+def test_the_column_type_refusal_does_not_claim_the_sql_was_not_read_only() -> None:
+    """A `citext` comparison is read-only; the message must name the real reason."""
+    message = results.describe_error("BLOCKED_UNSUPPORTED_COLUMN_TYPE")
+    assert "read-only" not in message
+    assert "data type" in message
 
 
 def test_describe_error_mentions_schema_for_unanswerable() -> None:

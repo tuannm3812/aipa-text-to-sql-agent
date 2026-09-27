@@ -134,6 +134,7 @@ from .base import (
     is_internal_schema_name,
     table_column_spellings,
     table_name_spellings,
+    table_risk_spellings,
 )
 
 _CONNECT_TIMEOUT_SECONDS = 5
@@ -457,6 +458,134 @@ def _fetch_shadowed_function_names(
         (sorted(allowed_functions),),
     ).fetchall()
     return frozenset(name for (name,) in rows)
+
+
+# `Engine.risky_type_columns`'s rule, step one: every risky type's oid, as
+# one recursive catalogue query - see `_fetch_risky_tables`.
+_RISKY_TYPES_SQL = """
+WITH RECURSIVE
+hooked(oid) AS (
+    SELECT k.castsource
+    FROM pg_cast k
+    JOIN pg_proc p ON p.oid = k.castfunc
+    JOIN pg_namespace pn ON pn.oid = p.pronamespace
+    WHERE pn.nspname <> 'pg_catalog'
+    UNION
+    SELECT k.casttarget
+    FROM pg_cast k
+    JOIN pg_proc p ON p.oid = k.castfunc
+    JOIN pg_namespace pn ON pn.oid = p.pronamespace
+    WHERE pn.nspname <> 'pg_catalog'
+    UNION
+    SELECT o.oprleft
+    FROM pg_operator o
+    JOIN pg_namespace opn ON opn.oid = o.oprnamespace
+    WHERE opn.nspname <> 'pg_catalog'
+    UNION
+    SELECT o.oprright
+    FROM pg_operator o
+    JOIN pg_namespace opn ON opn.oid = o.oprnamespace
+    WHERE opn.nspname <> 'pg_catalog'
+),
+risky(oid) AS (
+    SELECT t.oid
+    FROM pg_type t
+    JOIN hooked h ON h.oid = t.oid
+    JOIN pg_namespace tn ON tn.oid = t.typnamespace
+    WHERE tn.nspname <> 'pg_catalog'
+    UNION
+    SELECT c.container
+    FROM risky r
+    JOIN LATERAL (
+        SELECT t.oid FROM pg_type t WHERE t.typelem = r.oid OR t.typbasetype = r.oid
+        UNION ALL
+        SELECT t.oid
+        FROM pg_attribute a
+        JOIN pg_type t ON t.typrelid = a.attrelid
+        WHERE a.atttypid = r.oid AND a.attnum > 0 AND NOT a.attisdropped
+        UNION ALL
+        SELECT rg.rngtypid FROM pg_range rg WHERE rg.rngsubtype = r.oid
+        UNION ALL
+        SELECT rg.rngmultitypid FROM pg_range rg WHERE rg.rngtypid = r.oid
+    ) c(container) ON true
+)
+SELECT oid FROM risky
+"""
+
+# Step two, only run when step one found anything: which in-scope relations
+# have a risky column or row type.
+_RISKY_TABLES_SQL = """
+SELECT n.nspname, cls.relname,
+       coalesce(array_agg(a.attname ORDER BY a.attnum)
+                FILTER (WHERE a.atttypid = ANY(%(risky)s::oid[])), '{}'::name[])
+FROM pg_class cls
+JOIN pg_namespace n ON n.oid = cls.relnamespace
+JOIN pg_attribute a
+  ON a.attrelid = cls.oid AND a.attnum > 0 AND NOT a.attisdropped
+WHERE n.nspname = ANY(%(schemas)s) AND cls.relkind IN ('r', 'v', 'm', 'f', 'p')
+GROUP BY n.nspname, cls.relname, cls.reltype
+HAVING bool_or(a.atttypid = ANY(%(risky)s::oid[])) OR cls.reltype = ANY(%(risky)s::oid[])
+"""
+
+
+def _fetch_risky_tables(
+    conn: psycopg.Connection[tuple[Any, ...]], schema_names: list[str]
+) -> dict[tuple[str, str], frozenset[str]]:
+    """In-scope tables with a column or row type whose casts or operators run user code.
+
+    Decision (2026-09-27, Codex Finding 1) - see `Engine.risky_type_columns`
+    for the rule and why it exists. `_RISKY_TYPES_SQL` computes the risky
+    types in one recursive query: the base case is every non-`pg_catalog` type that has
+    (a) a `pg_cast` row, as source or target, whose `castfunc` lives outside
+    `pg_catalog`, or (b) an operator outside `pg_catalog` taking it as either
+    operand; the recursive case marks every type that *contains* a risky
+    type - an array (`typelem`), a domain (`typbasetype`), a composite or
+    table row type (`typrelid`'s attributes), a range (`rngsubtype`) and its
+    multirange. A cast with no function (binary-coercible or I/O conversion)
+    runs no user code at cast time and is not a reason on its own. The base
+    case starts from the (normally empty) set of non-`pg_catalog` casts and
+    operators rather than testing every `pg_type` row, and the recursion
+    only looks for containers of types already found risky.
+    `_RISKY_TABLES_SQL` then maps them onto in-scope relations (the `relkind`
+    filter keeps every relation with user-visible columns: table, view,
+    materialised view, foreign table, partitioned table), and is skipped
+    entirely when there is no risky type - the common case.
+
+    **Out of scope, deliberately.** A cast or operator between two
+    `pg_catalog` types can only be created by a superuser, and a superuser
+    can do anything this check could stop, so that boundary is stated, not
+    covered. A type's own I/O functions are likewise not examined: a base
+    type with custom I/O needs C functions, which need a superuser.
+
+    Must run on a pinned connection (`_pin_search_path`): its `=`, `<>`,
+    `array_agg` and `bool_or` then resolve to built-ins only.
+
+    Args:
+        conn: A connection already pinned by `_pin_search_path`.
+        schema_names: `_scope_schema_names`'s answer for this connection.
+
+    Returns:
+        `(schema, table)` of every in-scope relation with at least one risky
+        column or a risky row type, mapped to its risky column names (empty
+        when only the row type is risky - which in practice means a cast or
+        operator defined on the row type itself, since a risky column makes
+        the row type risky too).
+    """
+    if not schema_names:
+        return {}
+    # The recursive CTE's row estimate is wildly high, which on its own
+    # crosses `jit_above_cost` and spent ~160 ms compiling a plan that runs
+    # in about one. Transaction-scoped, like the pin, and this connection
+    # only ever runs fixed catalogue SQL.
+    conn.execute("SET LOCAL jit = off")
+    risky = [int(oid) for (oid,) in conn.execute(_RISKY_TYPES_SQL).fetchall()]
+    if not risky:
+        return {}
+    rows = conn.execute(_RISKY_TABLES_SQL, {"risky": risky, "schemas": schema_names}).fetchall()
+    return {
+        (str(schema), str(table)): frozenset(str(column) for column in columns)
+        for schema, table, columns in rows
+    }
 
 
 def _fetch_columns(
@@ -975,6 +1104,8 @@ POSTGRESQL DIALECT (must follow):
         # the server," the same sentinel `_search_path` uses and for the
         # same reason (no real answer is ever `None`).
         self._shadowed_function_names: frozenset[str] | None = None
+        # See `risky_type_columns` below - same sentinel, same reason.
+        self._risky_type_columns: Mapping[str, frozenset[str]] | None = None
 
     @property
     def default_schema(self) -> str:
@@ -1463,6 +1594,49 @@ POSTGRESQL DIALECT (must follow):
                     conn, allowed_functions=self.allowed_functions or frozenset()
                 )
         return self._shadowed_function_names
+
+    def risky_type_columns(self) -> Mapping[str, frozenset[str]]:
+        """Each table spelling with a risky column or row type, mapped to its risky columns.
+
+        See `Engine.risky_type_columns` for the rule and why it exists, and
+        `_fetch_risky_tables` for the catalogue query, which runs pinned and
+        over the same `_scope_schema_names` every other catalogue read uses.
+        Keyed by the same spellings `table_names()` advertises
+        (`base.table_risk_spellings`), so the validator looks a reference up
+        under the key it already resolved.
+
+        Cached per instance, exactly as `shadowed_function_names` is and with
+        the same staleness window: a cast or operator created after this
+        instance first answered is seen from the next question onward, not
+        mid-question. The same honest precondition holds - `aipa_ro` cannot
+        create a type, cast or operator itself.
+
+        Deferred import for the same circular-import reason as
+        `SQLiteEngine.table_names` - see that method's docstring.
+        """
+        if self._risky_type_columns is None:
+            from ..schema import get_schema_chunks
+
+            with _connect_read_only(self.dsn) as conn:
+                search_path = self._pinned(conn)
+                schema_names = _scope_schema_names(
+                    conn,
+                    search_path=search_path,
+                    extra_schemas=self.extra_schemas,
+                    internal_prefixes=self.internal_prefixes,
+                    internal_names=self.internal_names,
+                )
+                risky_tables = _fetch_risky_tables(conn, schema_names)
+            self._risky_type_columns = (
+                table_risk_spellings(
+                    get_schema_chunks(self.dsn),
+                    default_schema=self.default_schema,
+                    risky_tables=risky_tables,
+                )
+                if risky_tables
+                else {}
+            )
+        return self._risky_type_columns
 
 
 __all__ = ["PostgresEngine"]

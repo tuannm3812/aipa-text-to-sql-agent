@@ -886,5 +886,13 @@ DUCKDB DIALECT (must follow):
         """
         return frozenset()
 
+    def risky_type_columns(self) -> Mapping[str, frozenset[str]]:
+        """Always empty - DuckDB has no user-definable casts or operators on column types.
+
+        See `Engine.risky_type_columns` for the concept this answers and why
+        PostgreSQL is the only engine with anything to report.
+        """
+        return {}
+
 
 __all__ = ["DuckDBEngine"]

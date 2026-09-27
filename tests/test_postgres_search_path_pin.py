@@ -429,6 +429,12 @@ def test_the_pin_changes_what_extension_operators_in_public_mean(postgres_dsn: s
     If this test starts failing, the cost paragraph of `docs/3_decisions.md`'s
     2026-09-27 entry is out of date. Only extensions this test created are
     dropped; a deployment's own are never touched.
+
+    Superseded for `citext` by the later 2026-09-27 "refuse risky column
+    types" decision: the pinned execution still behaves as measured here
+    (asserted below, with the validator bypassed), but the validator now
+    refuses the query before it runs - `citext` has operators of its own
+    outside `pg_catalog`. See `tests/test_postgres_risky_types.py`.
     """
     admin = _as_postgres_superuser(postgres_dsn)
     with psycopg.connect(admin, connect_timeout=5, autocommit=True) as conn:
@@ -446,7 +452,7 @@ def test_the_pin_changes_what_extension_operators_in_public_mean(postgres_dsn: s
 
         citext_eq = "SELECT email FROM pin_extension_cost WHERE email = 'alice@x.com'"
         assert _as_role_unpinned(postgres_dsn, citext_eq) == [("Alice@X.com",)]
-        assert is_safe_query(citext_eq, engine=engine)
+        assert not is_safe_query(citext_eq, engine=engine)
         assert engine.execute(citext_eq, max_rows=10, work_limit=0).rows == []
 
         trigram = "SELECT note FROM pin_extension_cost WHERE note % 'widgit blue'"

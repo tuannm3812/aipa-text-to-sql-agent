@@ -23,6 +23,12 @@ except ModuleNotFoundError:  # pragma: no cover
 
 _ALLOWED_PREFIX = re.compile(r"(?is)^(select|with)\b")
 
+# The two refusal codes `query_refusal` returns. `SCREAMING_SNAKE_CASE`
+# because `app.py`, `ui/results.py` and the evaluation harness branch on them
+# (`docs/0_coding_standards.md` §3).
+BLOCKED_UNSAFE_SQL = "BLOCKED_UNSAFE_SQL"
+BLOCKED_UNSUPPORTED_COLUMN_TYPE = "BLOCKED_UNSUPPORTED_COLUMN_TYPE"
+
 
 def _no_table_names() -> frozenset[str]:
     """The `get_real_table_names` default for SQLite.
@@ -43,6 +49,14 @@ def _no_table_columns() -> Mapping[str, frozenset[str]]:
     scoping fix the column check resolves a qualifier against *one table's*
     columns, so it receives a table-keyed mapping rather than a flat set (see
     `_references_unresolvable_qualified_column`).
+    """
+    return {}
+
+
+def _no_risky_type_columns() -> Mapping[str, frozenset[str]]:
+    """The `get_risky_type_columns` default: SQLite, and any engine without default-deny.
+
+    See `Engine.risky_type_columns` - only PostgreSQL has anything to report.
     """
     return {}
 
@@ -1897,6 +1911,108 @@ def _references_internals(
     return False
 
 
+def _touches_risky_column_type(
+    parsed: sqlglot_exp.Expression,
+    *,
+    dialect: str,
+    get_risky_type_columns: Callable[[], Mapping[str, frozenset[str]]],
+) -> bool:
+    """True if the statement touches a column whose type can run user code.
+
+    Decision (2026-09-27, Codex review Finding 1; owner's call "refuse risky
+    types only"). Under the pinned `search_path` a name can no longer resolve
+    to user code, but PostgreSQL still applies a user-defined *implicit cast*
+    when it coerces a column for a built-in - `upper(v)` on an enum with an
+    `AS IMPLICIT` cast to `text` ran a `SECURITY DEFINER` function and leaked
+    a table the role cannot read - and `citext`'s `=` silently degrades to a
+    case-sensitive `text = text`. Neither shows in the SQL text; both are a
+    property of the column's type, which `Engine.risky_type_columns` reports
+    per table (see it for what makes a type risky). A plain enum or a domain
+    over a built-in type is not risky, so its columns stay queryable.
+
+    **Which columns a statement touches**, resolved as an over-approximation
+    that can refuse too much but cannot miss a binding - every way a column's
+    value leaves its base table is one of these:
+
+    - a column reference (`exp.Column`, in any clause, at any depth, however
+      qualified) or a bare word sqlglot keeps as `exp.Var`, whose own name is
+      a risky column of *any* risky table the statement references. Matching
+      by name rather than binding each reference to its table means an
+      unrelated same-named column elsewhere in the statement is refused too;
+      the qualifier is ignored, so `x.v` and `v` are treated alike;
+    - a name bound by a table-alias column list (`source AS s(x)` renames
+      `v` to `x`): every such name on a risky table counts as risky;
+    - a whole-row reference - the table's alias or name used as a value
+      (`s`, `to_jsonb(s)`, `public.source`) - touches every column **and the
+      table's own row type**, which lives in the table's schema and can carry
+      a cast of its own; `_RISKY_TYPES_SQL` also marks a row type risky when
+      any column is;
+    - any `*` or `t.*` except `count(*)` touches every column of every
+      relation in scope, so it is refused whenever a risky table is
+      referenced at all (a `*` inside a CTE or derived table that later feeds
+      `upper(q.v)` is caught at the star, not at the outer name);
+    - `JOIN ... USING (v)` names its columns as identifiers, checked like a
+      column reference; a `NATURAL` join touches columns without naming
+      them, so it is refused whenever a risky table is referenced.
+
+    Only real base-table references count (`_relation_kind`, minus visible
+    CTEs via `_names_visible_cte`), so a CTE sharing a risky table's name is
+    not mistaken for it - its body's own references are what get checked.
+
+    Args:
+        parsed: The parsed statement, already accepted by every other rule.
+        dialect: The dialect it was parsed under.
+        get_risky_type_columns: The engine's `risky_type_columns`, called
+            only if the statement references at least one real table.
+
+    Returns:
+        True if the statement must be refused.
+    """
+    if exp is None:
+        return True
+    tables = [
+        table
+        for table in parsed.find_all(exp.Table)
+        if _relation_kind(table) == _RELATION_TABLE
+        and not _names_visible_cte(table, dialect=dialect)
+    ]
+    if not tables:
+        return False
+    risky = get_risky_type_columns()
+    if not risky:
+        return False
+    touched: set[str] = set()
+    references_risky_table = False
+    for table in tables:
+        schema = (table.db or "").lower()
+        name = (table.name or "").lower()
+        columns = risky.get(f"{schema}.{name}" if schema else name)
+        if columns is None:
+            continue
+        references_risky_table = True
+        touched |= columns
+        touched |= _alias_columns(table)
+        touched.add(name)
+        alias = _alias_name(table)
+        if alias:
+            touched.add(alias)
+    if not references_risky_table:
+        return False
+    for star in parsed.find_all(exp.Star):
+        if not isinstance(star.parent, exp.Count):
+            return True
+    for join in parsed.find_all(exp.Join):
+        if str(join.args.get("method") or "").upper() == "NATURAL":
+            return True
+        for identifier in join.args.get("using") or []:
+            if (identifier.name or "").lower() in touched:
+                return True
+    for node in parsed.find_all(exp.Column, exp.Var):
+        if (node.name or "").lower() in touched:
+            return True
+    return False
+
+
 def _is_safe_ast(
     sql_string: str,
     *,
@@ -1907,33 +2023,40 @@ def _is_safe_ast(
     get_real_table_names: Callable[[], frozenset[str]],
     get_real_table_columns: Callable[[], Mapping[str, frozenset[str]]],
     get_shadowed_function_names: Callable[[], frozenset[str]],
-) -> bool:
+    get_risky_type_columns: Callable[[], Mapping[str, frozenset[str]]],
+) -> str | None:
     """Reject anything that parses to more than one statement or writes data.
 
-    Returns False when `sqlglot` is unavailable: without a parser there is no
-    validation to perform, and refusing to run is the correct failure mode for
-    a safety check.
+    Refuses with `BLOCKED_UNSAFE_SQL` when `sqlglot` is unavailable: without a
+    parser there is no validation to perform, and refusing to run is the
+    correct failure mode for a safety check.
+
+    Returns:
+        `None` when the statement is accepted, otherwise the refusal's error
+        code - `BLOCKED_UNSUPPORTED_COLUMN_TYPE` only for a statement every
+        other rule accepts that touches a risky column type (see
+        `_touches_risky_column_type`), `BLOCKED_UNSAFE_SQL` for all else.
     """
     if sqlglot is None or exp is None:
-        return False
+        return BLOCKED_UNSAFE_SQL
     try:
         statements = sqlglot.parse(sql_string, read=dialect)
     except Exception:
-        return False
+        return BLOCKED_UNSAFE_SQL
 
     # `parse_one` would silently inspect only the first statement, so a payload
     # like "SELECT 1; DROP TABLE t" would be approved on the strength of its
     # harmless prefix. Count them instead.
     if len(statements) != 1:
-        return False
+        return BLOCKED_UNSAFE_SQL
     parsed = statements[0]
     if parsed is None:
-        return False
+        return BLOCKED_UNSAFE_SQL
 
     if _references_internals(
         parsed, internal_prefixes=internal_prefixes, internal_names=internal_names
     ):
-        return False
+        return BLOCKED_UNSAFE_SQL
 
     # Default-deny, additional to the internals check above rather than a
     # replacement for it: `allowed_functions` is only non-`None` for an
@@ -1950,7 +2073,7 @@ def _is_safe_ast(
     # database backing every `FROM` clause they write.
     if allowed_functions is not None:
         if _references_disallowed_function(parsed, allowed_functions=allowed_functions):
-            return False
+            return BLOCKED_UNSAFE_SQL
         # Finding 1 fix (2026-09-26): two more identity checks, both after the
         # name-based gate above and before the dot-call sugar check below -
         # a call already rejected on name needs neither, and the schema-
@@ -1958,17 +2081,17 @@ def _is_safe_ast(
         # does. See these two functions' own module-level comment for what
         # each closes and why neither alone is enough.
         if _references_non_catalog_qualified_function(parsed, dialect=dialect):
-            return False
+            return BLOCKED_UNSAFE_SQL
         if _references_shadowed_function(
             parsed, get_shadowed_function_names=get_shadowed_function_names
         ):
-            return False
+            return BLOCKED_UNSAFE_SQL
         # The pinned-search-path rules (2026-09-27): no I/O, so they sit with
         # the other structural checks ahead of the catalogue reads below.
         if _references_non_catalog_operator(parsed, dialect=dialect):
-            return False
+            return BLOCKED_UNSAFE_SQL
         if _references_non_catalog_qualified_type(parsed, dialect=dialect):
-            return False
+            return BLOCKED_UNSAFE_SQL
         if _references_disallowed_dot_call(
             parsed,
             dialect=dialect,
@@ -1976,7 +2099,7 @@ def _is_safe_ast(
             internal_prefixes=internal_prefixes,
             internal_names=internal_names,
         ):
-            return False
+            return BLOCKED_UNSAFE_SQL
         # Both column rules sit here, after the function and dot-call checks
         # and before the table check, for the same ordering reason the
         # comment above gives: the internal-name one needs no I/O at all, and
@@ -1989,17 +2112,17 @@ def _is_safe_ast(
             internal_prefixes=internal_prefixes,
             internal_names=internal_names,
         ):
-            return False
+            return BLOCKED_UNSAFE_SQL
         if _casts_to_object_identifier_type(parsed):
-            return False
+            return BLOCKED_UNSAFE_SQL
         if _references_unknown_table(
             parsed, dialect=dialect, get_real_table_names=get_real_table_names
         ):
-            return False
+            return BLOCKED_UNSAFE_SQL
         if _references_unresolvable_qualified_column(
             parsed, dialect=dialect, get_real_table_columns=get_real_table_columns
         ):
-            return False
+            return BLOCKED_UNSAFE_SQL
 
     forbidden = (
         exp.Alter,
@@ -2012,13 +2135,36 @@ def _is_safe_ast(
         exp.Update,
     )
     if isinstance(parsed, forbidden) or any(parsed.find_all(*forbidden)):
-        return False
+        return BLOCKED_UNSAFE_SQL
 
     allowed_roots = (exp.Select, exp.Union, exp.With)
-    return isinstance(parsed, allowed_roots) or parsed.find(exp.Select) is not None
+    if not (isinstance(parsed, allowed_roots) or parsed.find(exp.Select) is not None):
+        return BLOCKED_UNSAFE_SQL
+
+    # Last, deliberately: it is the one refusal with its own error code, so it
+    # must only ever describe a statement every rule above already accepts -
+    # a write that also touches a `citext` column is "not read-only", not
+    # "unsupported type". It also reads the catalogue, which the cheaper
+    # structural rules above should get the chance to make unnecessary.
+    if allowed_functions is not None and _touches_risky_column_type(
+        parsed, dialect=dialect, get_risky_type_columns=get_risky_type_columns
+    ):
+        return BLOCKED_UNSUPPORTED_COLUMN_TYPE
+    return None
 
 
 def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
+    """True when `query_refusal` accepts `sql_string` - see that function for every rule.
+
+    Kept as the boolean spelling every caller that only needs yes-or-no
+    uses (the evaluation harnesses, the repair retry). A caller that shows
+    the user *why* a query was refused - the pipeline - calls
+    `query_refusal` for the code instead.
+    """
+    return query_refusal(sql_string, engine=engine) is None
+
+
+def query_refusal(sql_string: str, *, engine: Engine | None = None) -> str | None:
     """Conservatively allow only single-statement, read-only SELECT/CTE queries.
 
     Rejects anything empty, not starting with `SELECT`/`WITH`, parsing to more
@@ -2057,15 +2203,24 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
             exactly as before this function had one to read.
             Every pre-engine caller and the notebook keep working unchanged.
 
+    Since 2026-09-27 (Codex review Finding 1) it also refuses a statement
+    that touches a column whose type can run user code through a cast or an
+    operator (`Engine.risky_type_columns`, `_touches_risky_column_type`), with
+    its own error code: that refusal is about the column's type, not about the
+    statement writing anything, and `BLOCKED_UNSAFE_SQL`'s "not a read-only
+    query" message would tell the user something false.
+
     Returns:
-        True if the query is judged safe to execute read-only. False when
-        `sqlglot` is unavailable, since no validation is possible.
+        `None` if the query is judged safe to execute read-only; otherwise
+        `BLOCKED_UNSUPPORTED_COLUMN_TYPE` for a risky column type, or
+        `BLOCKED_UNSAFE_SQL` for everything else - including when `sqlglot`
+        is unavailable, since no validation is possible.
     """
     if not sql_string or not sql_string.strip():
-        return False
+        return BLOCKED_UNSAFE_SQL
     s = sql_string.strip().rstrip(";").strip()
     if not _ALLOWED_PREFIX.match(s):
-        return False
+        return BLOCKED_UNSAFE_SQL
     if engine is None:
         # Deferred import, not a module-level one: it keeps `SQLiteEngine`'s
         # own class attributes as the single source for the default, rather
@@ -2082,6 +2237,7 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         get_real_table_names: Callable[[], frozenset[str]] = _no_table_names
         get_real_table_columns: Callable[[], Mapping[str, frozenset[str]]] = _no_table_columns
         get_shadowed_function_names: Callable[[], frozenset[str]] = _no_shadowed_function_names
+        get_risky_type_columns: Callable[[], Mapping[str, frozenset[str]]] = _no_risky_type_columns
     else:
         dialect = engine.sqlglot_dialect
         internal_prefixes = engine.internal_prefixes
@@ -2124,6 +2280,14 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
             if allowed_functions is not None
             else _no_shadowed_function_names
         )
+        # Same closure treatment again, for the risky-column-type check
+        # (2026-09-27): total for every engine (SQLite and DuckDB return an
+        # empty mapping), read only behind default-deny, and only called
+        # once every other rule has accepted a statement that references a
+        # real table.
+        get_risky_type_columns = (
+            engine.risky_type_columns if allowed_functions is not None else _no_risky_type_columns
+        )
     return _is_safe_ast(
         s,
         dialect=dialect,
@@ -2133,6 +2297,7 @@ def is_safe_query(sql_string: str, *, engine: Engine | None = None) -> bool:
         get_real_table_names=get_real_table_names,
         get_real_table_columns=get_real_table_columns,
         get_shadowed_function_names=get_shadowed_function_names,
+        get_risky_type_columns=get_risky_type_columns,
     )
 
 

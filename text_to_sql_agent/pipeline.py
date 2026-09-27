@@ -10,7 +10,7 @@ from .execution import execute_query
 from .ingestion import ingest_csvs_to_db
 from .llm import generate_sql
 from .rag import retrieve_relevant_schema
-from .safety import is_safe_query
+from .safety import query_refusal
 from .schema import get_schema
 from .types import QueryResult
 
@@ -44,9 +44,10 @@ def ask_database(
 
     Returns:
         A `QueryResult`. `error` is set to `UNANSWERABLE_WITH_GIVEN_SCHEMA` if
-        the model could not answer from the schema, `BLOCKED_UNSAFE_SQL` if
-        `is_safe_query` rejected the generated SQL, or the exception text if
-        generation or execution failed.
+        the model could not answer from the schema, the `query_refusal` code
+        (`BLOCKED_UNSAFE_SQL`, or `BLOCKED_UNSUPPORTED_COLUMN_TYPE` for a
+        column whose type can run user code) if the generated SQL was
+        refused, or the exception text if generation or execution failed.
 
     Raises:
         EngineUnreachableError: If `db_path` cannot be reached by its engine.
@@ -67,8 +68,9 @@ def ask_database(
 
         if "UNANSWERABLE_WITH_GIVEN_SCHEMA" in sql:
             return QueryResult(columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA")
-        if not is_safe_query(sql, engine=engine):
-            return QueryResult(columns=[], rows=[], sql=sql, error="BLOCKED_UNSAFE_SQL")
+        refusal = query_refusal(sql, engine=engine)
+        if refusal is not None:
+            return QueryResult(columns=[], rows=[], sql=sql, error=refusal)
         try:
             return execute_query(db_path, sql)
         except Exception as e:
@@ -82,7 +84,7 @@ def ask_database(
                 max_repair_attempts=max_repair_attempts,
                 engine=engine,
             )
-            if repaired_sql and is_safe_query(repaired_sql, engine=engine):
+            if repaired_sql and query_refusal(repaired_sql, engine=engine) is None:
                 return execute_query(db_path, repaired_sql)
             raise
     except Exception as e:
@@ -146,8 +148,9 @@ def ask_database_with_sql(
         return sql, QueryResult(
             columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA"
         )
-    if not is_safe_query(sql, engine=engine):
-        return sql, QueryResult(columns=[], rows=[], sql=sql, error="BLOCKED_UNSAFE_SQL")
+    refusal = query_refusal(sql, engine=engine)
+    if refusal is not None:
+        return sql, QueryResult(columns=[], rows=[], sql=sql, error=refusal)
 
     try:
         result = execute_query(db_path, sql)
@@ -164,7 +167,7 @@ def ask_database_with_sql(
             max_repair_attempts=max_repair_attempts,
             engine=engine,
         )
-        if repaired_sql and is_safe_query(repaired_sql, engine=engine):
+        if repaired_sql and query_refusal(repaired_sql, engine=engine) is None:
             try:
                 repaired_result = execute_query(db_path, repaired_sql)
                 return repaired_result.sql or repaired_sql, repaired_result

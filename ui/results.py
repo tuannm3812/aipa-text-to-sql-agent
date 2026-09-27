@@ -35,6 +35,14 @@ _ERROR_MESSAGES = {
         "The generated SQL was blocked because it was not a read-only query. "
         "The SQL is shown below so you can see what was rejected."
     ),
+    "BLOCKED_UNSUPPORTED_COLUMN_TYPE": (
+        "The generated SQL was not run because it uses a column whose data type "
+        "comes from a database extension or a custom type with its own conversions "
+        "or comparison rules (for example citext). The agent cannot guarantee such "
+        "a query runs only built-in code or returns correct results, so it refuses "
+        "it rather than risk a wrong answer. Try asking about other columns. "
+        "The SQL is shown below."
+    ),
     "UNANSWERABLE_WITH_GIVEN_SCHEMA": (
         "The question could not be answered from this database's schema. "
         "Try rephrasing it, or pick a database that holds the relevant tables."

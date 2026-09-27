@@ -167,23 +167,23 @@ def test_repair_is_attempted_once_when_execution_fails(customers_db: str) -> Non
 
 def test_repaired_sql_is_rechecked_for_safety(customers_db: str) -> None:
     """A repair that returns unsafe SQL must not be executed."""
-    from text_to_sql_agent.safety import is_safe_query as real_is_safe_query
+    from text_to_sql_agent.safety import query_refusal as real_query_refusal
 
     responses = ["SELECT nope FROM customers", "DROP TABLE customers"]
     safety_check_args: list[str] = []
 
-    def spy_is_safe_query(sql: str, **kwargs) -> bool:
-        """Wrap the real is_safe_query to record arguments."""
+    def spy_query_refusal(sql: str, **kwargs) -> str | None:
+        """Wrap the real query_refusal to record arguments."""
         safety_check_args.append(sql)
-        return real_is_safe_query(sql, **kwargs)
+        return real_query_refusal(sql, **kwargs)
 
     with (
         patch("text_to_sql_agent.pipeline.generate_sql", side_effect=responses),
-        patch("text_to_sql_agent.pipeline.is_safe_query", side_effect=spy_is_safe_query),
+        patch("text_to_sql_agent.pipeline.query_refusal", side_effect=spy_query_refusal),
     ):
         result = agent.ask_database("list customers", db_path=customers_db)
 
-    # Verify is_safe_query was called twice: once for generated, once for repaired
+    # Verify the safety check ran twice: once for generated, once for repaired
     assert len(safety_check_args) == 2
     assert safety_check_args[0] == "SELECT nope FROM customers"
     assert safety_check_args[1] == "DROP TABLE customers"

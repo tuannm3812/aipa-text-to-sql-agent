@@ -271,6 +271,43 @@ def table_column_spellings(
     }
 
 
+def table_risk_spellings(
+    chunks: Iterable[SchemaChunk],
+    *,
+    default_schema: str,
+    risky_tables: Mapping[tuple[str, str], frozenset[str]],
+) -> dict[str, frozenset[str]]:
+    """`Engine.risky_type_columns()`'s contract: catalogue facts keyed by query spelling.
+
+    Keyed by exactly the spellings `table_name_spellings` produces (built from
+    the same `_spellings_with_identity` pass), so the validator looks a table
+    reference up under the same key it already used to decide the table is
+    real - a table the query can name is never missed here because it was
+    spelled differently.
+
+    Args:
+        chunks: The engine's schema chunks.
+        default_schema: The engine's `default_schema`.
+        risky_tables: `(real schema, table)` of every in-scope table with at
+            least one risky part, mapped to its risky column names.
+
+    Returns:
+        Every spelling of every such table, mapped to its lowercased risky
+        column names (empty when only the table's row type is risky).
+
+    Raises:
+        AmbiguousTableIdentityError: See `_spellings_with_identity`.
+    """
+    owners = _spellings_with_identity(chunks, default_schema=default_schema)
+    spellings: dict[str, frozenset[str]] = {}
+    for spelling, chunk in owners.items():
+        schema = chunk.schema_name or chunk.home_schema or default_schema
+        columns = risky_tables.get((schema, chunk.table_name))
+        if columns is not None:
+            spellings[spelling] = frozenset(column.lower() for column in columns)
+    return spellings
+
+
 def is_internal_schema_name(
     name: str, *, internal_prefixes: tuple[str, ...], internal_names: frozenset[str]
 ) -> bool:
@@ -524,5 +561,44 @@ class Engine(Protocol):
             The lowercased subset of `allowed_functions` that currently has
             an executable overload outside `pg_catalog` - empty when nothing
             is shadowed, which is the common case.
+        """
+        ...
+
+    def risky_type_columns(self) -> Mapping[str, frozenset[str]]:
+        """Tables whose columns or row type carry a type that can run user code.
+
+        Decision (2026-09-27, Codex review Finding 1; owner's call: "refuse
+        risky types only"). PostgreSQL's pinned `search_path` stops a *name*
+        resolving to user code, but not the server applying a user-defined
+        **implicit cast** while coercing a column for a built-in: an enum
+        with an `AS IMPLICIT` cast to `text` backed by a `SECURITY DEFINER`
+        function made `SELECT upper(v) FROM source` read a table the role
+        cannot, and the query names nothing a structural check can see. The
+        type of a column is a catalogue fact, not a property of the SQL text,
+        so the engine reports it and `safety.is_safe_query` refuses any query
+        that touches such a column - the same split as `table_names()`,
+        `table_columns()` and `shadowed_function_names()`: the validator
+        never opens a connection.
+
+        A type is *risky* when it is not a `pg_catalog` type and either (a)
+        a `pg_cast` row with it as source or target is backed by a function
+        outside `pg_catalog`, or (b) it has operators of its own outside
+        `pg_catalog`. Rule (b) is what refuses `citext`, whose `=` the pin
+        silently replaces with case-sensitive `text = text`. Riskiness
+        propagates to an array of, a domain over, a composite (including a
+        table's own row type) containing, and a range over a risky type. A
+        plain enum or a domain over a built-in type is none of these and
+        stays queryable.
+
+        SQLite and DuckDB have no user-definable casts or operators an
+        unprivileged principal can attach to a column type, so both return
+        the empty mapping and their validation is unchanged. Only called
+        for an engine whose `allowed_functions` is not `None`.
+
+        Returns:
+            Each spelling `table_names()` advertises for a table with at
+            least one risky part, mapped to its lowercased risky column
+            names. A table present with an empty set has only a risky row
+            type. Tables with nothing risky are absent - the common case.
         """
         ...

@@ -504,6 +504,14 @@ class _FakePostgresEngine:
         """
         return frozenset()
 
+    def risky_type_columns(self) -> dict[str, frozenset[str]]:
+        """Nothing is risky on this fake - see `Engine.risky_type_columns`.
+
+        Live coverage lives in `tests/test_postgres_risky_types.py`, which
+        needs a real `pg_cast`/`pg_operator` to create a risky type in.
+        """
+        return {}
+
 
 # Each case is (accepted, sql). The resolution model under test: a qualifier
 # bound to a real table resolves against that table's columns; one bound to a
@@ -1050,3 +1058,102 @@ def test_qualification_fails_closed_when_the_splice_does_not_reparse(monkeypatch
     monkeypatch.setattr(safety.exp, "to_identifier", wrong_identifier)
     with pytest.raises(safety.TableQualificationError):
         _qualify("SELECT * FROM customers")
+
+
+# --- 2026-09-27: columns whose type can run user code (Codex Finding 1) ------
+
+
+class _FakePostgresEngineWithRiskyType(_FakePostgresEngine):
+    """`_FakePostgresEngine` plus `labels`, whose `v` column has a risky type.
+
+    Pins the touched-column resolution of `_touches_risky_column_type`
+    without a server; `tests/test_postgres_risky_types.py` is the live proof
+    that the catalogue half reports what this fake asserts.
+    """
+
+    name = "fake-postgres-with-risky-type"
+    allowed_functions: frozenset[str] | None = frozenset({"count", "upper", "lower"})
+
+    def table_names(self) -> frozenset[str]:
+        return super().table_names() | {"labels", "public.labels"}
+
+    def table_columns(self) -> dict[str, frozenset[str]]:
+        labels = frozenset({"id", "v"})
+        return {**super().table_columns(), "labels": labels, "public.labels": labels}
+
+    def risky_type_columns(self) -> dict[str, frozenset[str]]:
+        return {"labels": frozenset({"v"}), "public.labels": frozenset({"v"})}
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT upper(v) FROM labels",
+        "SELECT upper(l.v) FROM public.labels l",
+        "SELECT id FROM labels WHERE v = 'x'",
+        "SELECT id FROM labels ORDER BY v",
+        "SELECT count(*) FROM labels GROUP BY v",
+        "SELECT upper(x) FROM (SELECT v AS x FROM labels) q",
+        "WITH q AS (SELECT v FROM labels) SELECT upper(q.v) FROM q",
+        "SELECT upper(x) FROM labels AS l(i, x)",
+        "SELECT * FROM labels",
+        "SELECT l.* FROM labels l",
+        "SELECT count(*) FROM (SELECT * FROM labels) q",
+        "SELECT l FROM labels l",
+        "SELECT upper(labels) FROM labels",
+        "SELECT count(l) FROM labels l",
+        "SELECT 1 FROM labels a JOIN labels b USING (v)",
+        "SELECT 1 FROM labels a NATURAL JOIN customers b",
+        # A correlated reference from another scope is still a reference.
+        "SELECT name FROM customers c WHERE EXISTS (SELECT 1 FROM labels WHERE upper(v) = c.name)",
+    ],
+)
+def test_a_statement_touching_a_risky_column_is_refused_with_its_own_code(sql: str) -> None:
+    from text_to_sql_agent.safety import query_refusal
+
+    engine = _FakePostgresEngineWithRiskyType()
+    assert query_refusal(sql, engine=engine) == "BLOCKED_UNSUPPORTED_COLUMN_TYPE", sql
+    assert not agent.is_safe_query(sql, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # The risky table, without its risky column.
+        "SELECT id FROM labels",
+        "SELECT count(*) FROM labels",
+        "SELECT l.id FROM labels l JOIN customers c ON c.customer_id = l.id",
+        # No risky table in the statement: stars and NATURAL joins are fine.
+        "SELECT * FROM customers",
+        "SELECT 1 FROM customers a NATURAL JOIN customers b",
+        # A CTE that merely shares the risky table's name is not that table.
+        "WITH labels AS (SELECT 1 AS v) SELECT count(v) FROM labels",
+    ],
+)
+def test_a_statement_not_touching_a_risky_column_is_accepted(sql: str) -> None:
+    from text_to_sql_agent.safety import query_refusal
+
+    assert query_refusal(sql, engine=_FakePostgresEngineWithRiskyType()) is None, sql
+
+
+def test_a_write_touching_a_risky_column_is_refused_as_unsafe_not_as_a_type_problem() -> None:
+    """The type refusal only describes statements every other rule accepts."""
+    from text_to_sql_agent.safety import query_refusal
+
+    engine = _FakePostgresEngineWithRiskyType()
+    assert query_refusal("DELETE FROM labels WHERE v = 'x'", engine=engine) == (
+        "BLOCKED_UNSAFE_SQL"
+    )
+    assert query_refusal("SELECT lo_get(v) FROM labels", engine=engine) == "BLOCKED_UNSAFE_SQL"
+
+
+def test_engines_without_risky_types_never_see_the_new_refusal(customers_db: str) -> None:
+    """SQLite (`engine=None` and a real engine) and DuckDB answer exactly as before."""
+    from text_to_sql_agent.engines import open_engine
+    from text_to_sql_agent.engines.duckdb import DuckDBEngine
+    from text_to_sql_agent.safety import query_refusal
+
+    assert query_refusal("SELECT * FROM customers") is None
+    assert query_refusal("DROP TABLE customers") == "BLOCKED_UNSAFE_SQL"
+    assert open_engine(customers_db).risky_type_columns() == {}
+    assert DuckDBEngine("unused.duckdb").risky_type_columns() == {}
