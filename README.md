@@ -189,9 +189,14 @@ PostgreSQL queries run with `search_path` pinned to `pg_catalog`, so the agent
 schema-qualifies each table itself before running it; the SQL shown beside a
 result is that qualified text (`SELECT name FROM "public".customers`), because
 it is what actually ran. One consequence to know about: operators an extension
-installed on the search path are not used. `citext` columns compare
-case-sensitively (silently — fewer rows, no error) and `pg_trgm`'s `%` fails
-with "operator does not exist". See `docs/3_decisions.md`'s 2026-09-27 entry.
+installed on the search path are not used, so `pg_trgm`'s `%` fails with
+"operator does not exist". A query that touches a column whose type carries
+casts or operators of its own outside `pg_catalog` - `citext`, or a custom
+type with a user-defined cast - is refused with
+`BLOCKED_UNSUPPORTED_COLUMN_TYPE` rather than run, because under the pin such
+a query can either run user code or (for `citext`) silently compare
+case-sensitively. Plain enums and domains over built-in types are unaffected.
+See `docs/3_decisions.md`'s 2026-09-27 entries.
 
 ## Run The App
 

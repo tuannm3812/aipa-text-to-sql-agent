@@ -119,7 +119,10 @@ reworked anyway" — see `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`
 - Error codes returned in `QueryResult.error` are `SCREAMING_SNAKE_CASE` string
   constants (`BLOCKED_UNSAFE_SQL`, `UNANSWERABLE_WITH_GIVEN_SCHEMA`), never
   free-form prose, because `app.py` and the evaluation harness branch on them.
-  The full set is `BLOCKED_UNSAFE_SQL`, `UNANSWERABLE_WITH_GIVEN_SCHEMA`,
+  The full set is `BLOCKED_UNSAFE_SQL`, `BLOCKED_UNSUPPORTED_COLUMN_TYPE`
+  (PostgreSQL: the query touches a column whose type has casts or operators
+  of its own outside `pg_catalog` - `safety.query_refusal`; see
+  `docs/3_decisions.md`, 2026-09-27), `UNANSWERABLE_WITH_GIVEN_SCHEMA`,
   `RESULT_TRUNCATED_TO_<n>_ROWS`, and an abort-code family sharing the
   `QUERY_ABORTED_AFTER_` prefix: `QUERY_ABORTED_AFTER_<n>_VM_STEPS` for
   SQLite's VM-instruction budget, `QUERY_ABORTED_AFTER_<n>_MS` for the two

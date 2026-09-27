@@ -2,6 +2,113 @@
 
 Newest first. Each entry states what was chosen and what it ruled out.
 
+## 2026-09-27 — refuse queries that touch a column type with its own casts or operators
+
+**Owner's decision ("refuse risky types only").** Resolves Codex's P1 of
+2026-09-27 (`docs/6_agent_log.md`) and **supersedes the open `citext` cost**
+recorded in the pinned-`search_path` entry below.
+
+**The hole.** The pin stops a *name* resolving to user code; it does not stop
+PostgreSQL applying a user-defined **implicit cast** while coercing an
+argument for a built-in. Reproduced by Codex and the owner, and re-reproduced
+by `tests/test_postgres_risky_types.py` at `856cb7e`: an enum `label` with
+`CREATE CAST (label AS text) WITH FUNCTION cast_payload(label) AS IMPLICIT`,
+the function `SECURITY DEFINER` and reading a table `aipa_ro` cannot, made
+`SELECT upper(v) FROM source` validate and return `PROBE_SECRET` under the
+pin. The query names no cast and no function a structural rule can refuse.
+The same shape through a table's own row type (`CREATE CAST (rowtab AS
+text) ... AS IMPLICIT`) leaked via `SELECT upper(r) FROM rowtab r`.
+
+**Chosen:**
+
+1. **A type is risky** when it is not a `pg_catalog` type and either (a) a
+   `pg_cast` row with it as source or target has a `castfunc` outside
+   `pg_catalog`, or (b) an operator outside `pg_catalog` takes it as either
+   operand. Riskiness propagates to an array of, a domain over, a composite
+   (including a table's row type) containing, and a range or multirange over
+   a risky type. `engines/postgres.py::_fetch_risky_tables` computes it with
+   one recursive catalogue query, pinned, over the same
+   `_scope_schema_names` as every other catalogue read, with `SET LOCAL jit
+   = off` (the recursive CTE's row estimate otherwise triggered ~160 ms of
+   JIT compilation for a plan that runs in about one; measured ~3-13 ms per
+   call after).
+2. **`Engine.risky_type_columns()`** reports it per advertised table
+   spelling (`base.table_risk_spellings`, built from the same identity pass
+   as `table_names()`), cached per engine instance like
+   `shadowed_function_names()`. SQLite and DuckDB return `{}`.
+3. **`safety._touches_risky_column_type`** refuses a statement that touches
+   a risky column, as the *last* rule, so it only ever describes a
+   statement every other rule accepts. "Touches" is an over-approximation
+   that can refuse too much but not miss a binding: any `exp.Column`/`exp.Var`
+   whose own name is a risky column of any risky table in the statement
+   (qualifier ignored); any table-alias column-list name on a risky table;
+   the table's alias or name used as a value (a whole-row reference, which
+   touches every column and the row type); any `*` or `t.*` except
+   `count(*)`; `USING` names; and any `NATURAL` join. Only real base tables
+   count (`_relation_kind` minus `_names_visible_cte`).
+4. **A dedicated code, `BLOCKED_UNSUPPORTED_COLUMN_TYPE`**, returned by the
+   new `safety.query_refusal` (`is_safe_query` is now `query_refusal(...) is
+   None`) and surfaced by both pipeline entry points; `ui/results.py` explains
+   it. `BLOCKED_UNSAFE_SQL`'s "was not a read-only query" would be false for
+   a `citext` comparison.
+
+**Kept working, verified live:** a plain enum (`WHERE s = 'open'`,
+`upper(s::text)`) and a domain over `text` validate and execute with the
+server's own rows - their comparison and conversion are built-in, so neither
+is risky. A risky table's other columns (`SELECT id`, `count(*)`) stay
+queryable.
+
+**Ruled out:**
+
+- **Refusing every non-`pg_catalog` type** - explicitly not the decision;
+  it would refuse every enum and domain.
+- **Only refusing explicit casts** - the payload contains none.
+- **Precise per-reference column binding** - every missed shape (alias
+  column lists, stars through CTEs, whole-row references, `NATURAL`) would
+  be a leak; name matching over-refuses only on a same-named column.
+
+**Why the `citext` cost is now a loud refusal.** Under the pin a `citext` `=`
+fell back to case-sensitive `text = text` and silently returned no rows.
+`citext` has its own operators in `public`, so rule (b) refuses it; the
+extension-cost test now asserts `is_safe_query` refuses it while execution,
+bypassing the validator, still shows the silent behaviour. `pg_trgm`'s `%`
+on a `text` column is unchanged - `text` is a `pg_catalog` type, and the
+query already fails loudly with `UndefinedFunction`.
+
+**Out of scope, stated rather than covered.** A cast or operator between two
+`pg_catalog` types needs a superuser to create, and a superuser can do
+anything this check could stop. A base type's own I/O functions are not
+examined: custom I/O needs C functions, which need a superuser. A view whose
+definition itself applies a user cast is a principal choosing what data the
+view shows, which is the same precondition as every entry here: `aipa_ro`
+creates none of these objects. The catalogue answer is cached per engine
+instance, so a cast created mid-question is seen from the next question.
+
+## 2026-09-27 — table qualification uses scoped CTE visibility
+
+**Refines** the "What is qualified" rule of the pinned-`search_path` entry
+below. Resolves Codex's P2 of 2026-09-27.
+
+**Chosen:** `qualify_bare_table_references` asks `safety._names_visible_cte`,
+the same scoped answer the validator's unknown-table and qualified-column
+checks use, instead of a flat lowercased set of every CTE alias in the
+statement. For PostgreSQL `_visible_cte_names` compares server-folded names
+(quoted exact, unquoted ASCII-lowercased) and, under `WITH RECURSIVE`, admits
+every sibling including a later one; DuckDB and SQLite keep their lowercased,
+earlier-siblings-only rule.
+
+**Ruled out:** a third, qualifier-only implementation. Two answers to "what
+does this name mean" is what produced this defect: an inner `WITH customers`
+or a quoted `"CUSTOMERS"` left the outer, real `customers` bare, and the pin
+then failed it with `UndefinedTable`.
+
+**Why:** the fidelity corpus (`tests/test_engine_postgres.py`) grew from 47 to
+53 queries with Codex's two probes, a quoted mixed-case CTE, a `WITH
+RECURSIVE` forward reference, a recursive self-reference, and a
+non-recursive CTE whose body reads the same-named real table. All 53 return
+identical rows stock versus pinned, and each new one is pinned to its exact
+executed text, so only real base-table references gain `"public".`.
+
 ## 2026-09-27 — PostgreSQL executes under a pinned `search_path`; the engine qualifies tables itself
 
 **Owner-approved design.** Supersedes nothing; closes what the 2026-09-26
@@ -100,6 +207,10 @@ not SQL, and still scores 12/12.
   that order does not beat an exact-type match in a later schema.
 - **Letting the server keep resolving bare tables** (pinning only functions
   and operators): impossible - `search_path` is one setting for all four.
+
+**Superseded for `citext` (2026-09-27) by "refuse queries that touch a column
+type with its own casts or operators" above: such a query is now refused
+before it runs. The text below is kept as recorded.**
 
 **Cost - measured, and not what the owner's rationale assumed.** The pin
 cannot tell an extension's operators in `public` from a hostile one there.
