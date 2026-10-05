@@ -48,6 +48,9 @@ def ask_database(
         (`BLOCKED_UNSAFE_SQL`, or `BLOCKED_UNSUPPORTED_COLUMN_TYPE` for a
         column whose type can run user code) if the generated SQL was
         refused, or the exception text if generation or execution failed.
+        A refused *repair* is reported the same way as a refused first
+        attempt: its refusal code in `error` and the refused repair in `sql`,
+        never the first attempt's stale execution error.
 
     Raises:
         EngineUnreachableError: If `db_path` cannot be reached by its engine.
@@ -84,9 +87,15 @@ def ask_database(
                 max_repair_attempts=max_repair_attempts,
                 engine=engine,
             )
-            if repaired_sql and query_refusal(repaired_sql, engine=engine) is None:
-                return execute_query(db_path, repaired_sql)
-            raise
+            if not repaired_sql:
+                raise
+            # A refused repair is the terminal verdict: report its code with the
+            # SQL it is about, the same contract as a refused first attempt. The
+            # first attempt's error would read as repairable when nothing can run.
+            repair_refusal = query_refusal(repaired_sql, engine=engine)
+            if repair_refusal is not None:
+                return QueryResult(columns=[], rows=[], sql=repaired_sql, error=repair_refusal)
+            return execute_query(db_path, repaired_sql)
     except Exception as e:
         return QueryResult(columns=[], rows=[], error=f"{type(e).__name__}: {e}")
 
@@ -117,7 +126,8 @@ def ask_database_with_sql(
     Returns:
         A `(sql, QueryResult)` tuple. `sql` is `""` if generation itself
         failed; otherwise it is the SQL that was attempted (repaired SQL
-        replaces the original once a repair succeeds). Once execution
+        replaces the original once a repair succeeds, or once a repair is
+        refused - the refusal code is then about that SQL). Once execution
         returns, it is the SQL the engine reports it actually ran
         (`QueryResult.sql`) - identical to the generated text on SQLite and
         DuckDB, and on PostgreSQL the same text with each bare table
@@ -167,7 +177,14 @@ def ask_database_with_sql(
             max_repair_attempts=max_repair_attempts,
             engine=engine,
         )
-        if repaired_sql and query_refusal(repaired_sql, engine=engine) is None:
+        if repaired_sql:
+            # Same contract as `ask_database`: a refused repair is reported as
+            # its own refusal, paired with the refused SQL, never executed.
+            repair_refusal = query_refusal(repaired_sql, engine=engine)
+            if repair_refusal is not None:
+                return repaired_sql, QueryResult(
+                    columns=[], rows=[], sql=repaired_sql, error=repair_refusal
+                )
             try:
                 repaired_result = execute_query(db_path, repaired_sql)
                 return repaired_result.sql or repaired_sql, repaired_result

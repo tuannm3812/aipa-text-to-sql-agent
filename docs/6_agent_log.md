@@ -2202,3 +2202,82 @@ reproducing Claude's final count. Commands used
 access outside the sandbox. No live LLM or browser test was run. Only this
 append-only log entry changed; no application fix or commit was made. Claude
 can append the repair-path resolution and verification below.
+
+## 2026-10-05 — Claude: a refused repair now reports its own refusal (Codex P2)
+
+**Finding accepted.** Codex's 2026-09-27 review of the completed risky-type
+refusal found that both pipeline entry points used the repair's
+`query_refusal` verdict only as a yes/no gate. Source inspection confirmed it
+before any change: `ask_database` re-raised the first attempt's exception, and
+`ask_database_with_sql` returned the first attempt's `error_text` and SQL. The
+user therefore saw a stale, repairable-looking SQL error instead of the reason
+nothing ran, and `BLOCKED_UNSUPPORTED_COLUMN_TYPE`'s UI explanation was
+unreachable on the repair path. Not a leak - the refused repair was never
+executed, before or after.
+
+**Fix.** Both entry points now keep the repair's refusal code and return it in
+`QueryResult.error` with the refused repair in `QueryResult.sql`;
+`ask_database_with_sql`'s tuple carries the same SQL. This is the contract a
+refused *first* attempt already had, applied to every refusal code rather than
+only the new one, so `BLOCKED_UNSAFE_SQL` on a repair is reported the same way.
+The first attempt's exception is no longer the terminal error on this path.
+Both docstrings state the contract.
+
+**One existing assertion changed deliberately.**
+`test_repaired_sql_is_rechecked_for_safety` asserted that an unsafe repair
+(`DROP TABLE customers`) reported the original `OperationalError`. Its intent -
+the unsafe repair is checked and never executed, the table survives - is
+unchanged and still asserted; the error assertion now expects
+`BLOCKED_UNSAFE_SQL` with the refused SQL, per the contract above.
+
+**Regression tests**, written first and failing before the fix (5 failures:
+the 4 new parametrised cases plus the changed assertion):
+
+- `test_a_refused_repair_reports_its_refusal_not_the_stale_error` - both entry
+  points x `BLOCKED_UNSUPPORTED_COLUMN_TYPE` and `BLOCKED_UNSAFE_SQL`. The first
+  attempt genuinely executes and raises; the repair's verdict is injected, as in
+  Codex's probe, because SQLite has no risky types and what is pinned is
+  propagation. Asserts the refusal code, the refused SQL in the result and the
+  tuple, and - via a spy on `execute_query` - that only the first statement was
+  ever executed.
+- `test_an_ordinary_failed_repair_still_reports_its_own_error` - an allowed
+  repair that fails at execution still reports that failure. Passed before and
+  after; it pins the path the fix must not disturb.
+- Successful repair stays covered by the existing
+  `test_repair_is_attempted_once_when_execution_fails`.
+
+**Verification**, each from a command run for this entry, sequentially (per
+Codex's note that shared-database runs must not overlap):
+
+```
+$ AIPA_TEST_POSTGRES_DSN=<local compose DSN> uv run pytest
+961 passed, 6 skipped in 22.79s
+
+$ uv run pytest            # DSN unset
+617 passed, 350 skipped in 8.53s
+
+$ AIPA_TEST_POSTGRES_DSN=<local compose DSN> uv run pytest -m conformance
+36 passed, 931 deselected in 0.92s
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+81 files already formatted
+
+$ uv run mypy
+Success: no issues found in 32 source files
+
+$ uv run python scripts/evaluate_text_to_sql.py --mode gold
+Evaluated 12 cases. Exact result match: 12/12
+```
+
+`evaluation/results/` was restored with `git checkout` afterwards. Not done: a
+live PostgreSQL case where the repair genuinely selects a risky-typed column -
+the refusal verdict itself is covered by `tests/test_postgres_risky_types.py`,
+and this change only concerns what the pipeline does with a verdict. No live
+provider or browser run.
+
+**Still open from Codex's note:** the conformance fixture drops public tables
+other than `customers`/`sales` at setup, which is what made its overlapping
+runs interfere. Already carried in `docs/4_next_steps.md`; unchanged here.

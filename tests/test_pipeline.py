@@ -187,14 +187,66 @@ def test_repaired_sql_is_rechecked_for_safety(customers_db: str) -> None:
     assert len(safety_check_args) == 2
     assert safety_check_args[0] == "SELECT nope FROM customers"
     assert safety_check_args[1] == "DROP TABLE customers"
-    # Verify the unsafe repaired SQL was blocked
+    # Verify the unsafe repaired SQL was blocked, and that the terminal verdict
+    # is the refusal of the repair - not the stale error from the first attempt
+    # (Codex review, 2026-09-27) and not a "not authorized" from executing it.
     assert not result.ok
-    # Verify the error is the original execution error, not "not authorized"
-    assert "OperationalError" in (result.error or "")
+    assert result.error == "BLOCKED_UNSAFE_SQL"
+    assert result.sql == "DROP TABLE customers"
     # Verify the table still exists as a backstop
     with closing(sqlite3.connect(customers_db)) as conn:
         tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     assert ("customers",) in tables, "the table must still exist"
+
+
+@pytest.mark.parametrize("entry", ["ask_database", "ask_database_with_sql"])
+@pytest.mark.parametrize("code", ["BLOCKED_UNSUPPORTED_COLUMN_TYPE", "BLOCKED_UNSAFE_SQL"])
+def test_a_refused_repair_reports_its_refusal_not_the_stale_error(
+    customers_db: str, entry: str, code: str
+) -> None:
+    """When the first attempt genuinely fails and the repair is refused, the
+    result must carry the repair's refusal code and the refused SQL.
+
+    Codex's 2026-09-27 review found both entry points used the repair's
+    `query_refusal` verdict only as a yes/no gate: the user saw the original,
+    repairable-looking SQL error instead of the reason nothing ran, so the
+    dedicated `BLOCKED_UNSUPPORTED_COLUMN_TYPE` explanation never reached the
+    page on this path. The verdict is injected rather than provoked, because
+    SQLite has no risky column types - what is pinned here is propagation.
+    """
+    first, repair = "SELECT nope FROM customers", "SELECT name FROM customers"
+    executed: list[str] = []
+    from text_to_sql_agent.execution import execute_query as real_execute
+
+    def spy_execute(db_path: str, sql: str, **kwargs):
+        executed.append(sql)
+        return real_execute(db_path, sql, **kwargs)
+
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", side_effect=[first, repair]),
+        patch("text_to_sql_agent.pipeline.query_refusal", side_effect=[None, code]),
+        patch("text_to_sql_agent.pipeline.execute_query", side_effect=spy_execute),
+    ):
+        out = getattr(agent, entry)("list customers", db_path=customers_db)
+
+    result = out[1] if isinstance(out, tuple) else out
+    assert executed == [first], "the refused repair must never be executed"
+    assert result.error == code
+    assert result.sql == repair
+    assert result.rows == []
+    if isinstance(out, tuple):
+        assert out[0] == repair, "the SQL shown is the one the verdict is about"
+
+
+def test_an_ordinary_failed_repair_still_reports_its_own_error(customers_db: str) -> None:
+    """An allowed repair that fails at execution keeps reporting that failure."""
+    responses = ["SELECT nope FROM customers", "SELECT also_nope FROM customers"]
+    with patch("text_to_sql_agent.pipeline.generate_sql", side_effect=responses):
+        sql, result = agent.ask_database_with_sql("list customers", db_path=customers_db)
+
+    assert not result.ok
+    assert "also_nope" in (result.error or "")
+    assert sql == "SELECT nope FROM customers"
 
 
 def test_ask_database_raises_when_the_database_is_unreachable(tmp_path: Path) -> None:
