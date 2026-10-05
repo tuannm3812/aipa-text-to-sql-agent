@@ -2118,3 +2118,87 @@ fidelity, 6 exact-text; the count check was renamed, not added) and
 `test_ui_results.py` 13 -> 15 (+2: the new code in the known-codes
 parametrisation and the not-read-only message test). `test_safety.py`
 151 -> 182 (+31). With +24 in the new module the total is still +69, 887 -> 956.
+
+## 2026-09-27 — Codex review of the completed risky-type refusal
+
+**Scope:** `856cb7e..5e5cef4`, particularly `dbbae14`, the decision entry,
+Claude's response, and the new live regression tests. The application tree
+was clean; the owner's `.devcontainer/devcontainer.json` edit was preserved.
+
+**Assessment:** The specific implicit-cast leak from the previous P1 review
+now has the intended refusal: the regression proves the payload still runs
+when execution bypasses validation, then verifies both public question entry
+points refuse it before execution or repair with
+`BLOCKED_UNSUPPORTED_COLUMN_TYPE`. The `citext` comparison is likewise refused,
+while plain enum/domain and unaffected-column cases stay queryable. The CTE
+finding remains closed. This is acceptance of the reproduced fixes within
+the documented supported-type boundary, not an exhaustive PostgreSQL safety
+certification.
+
+### P2 — a refused repair loses the dedicated type error
+
+`pipeline.py:87-91` and `:170-176` use the repair's `query_refusal` result only
+as a boolean execution gate. If the repair returns
+`BLOCKED_UNSUPPORTED_COLUMN_TYPE`, `ask_database` re-raises the original SQL
+exception and `ask_database_with_sql` returns the original `error_text` and
+SQL. Neither surfaces the reason the repaired query was refused. The new UI
+explanation therefore works for initial-generation refusal but not this path.
+
+**Reproduced without a provider:** for each public entry point, use the real
+SQLite demo and patch `pipeline.generate_sql` to return, in sequence:
+
+1. `SELECT missing_column FROM students` (actually executed; raises the
+   missing-column error).
+2. `SELECT major FROM students` (the repair).
+
+Patch `pipeline.query_refusal` to return `None` and then
+`BLOCKED_UNSUPPORTED_COLUMN_TYPE`. This isolates propagation of a known
+validator verdict; it does not assert that the second SQLite query genuinely
+has a risky type. Both calls make two safety checks, then return:
+
+```text
+ask_database:
+  error = OperationalError: no such column: missing_column
+  sql = None
+ask_database_with_sql:
+  error = OperationalError: no such column: missing_column
+  sql = SELECT missing_column FROM students
+```
+
+Source inspection confirms the refusal branch never executes the repair, so
+this is an error-reporting defect, not a reopened data leak. It matters when
+the first generation fails and repair chooses an unsupported PostgreSQL column:
+the user sees a stale, repairable SQL error instead of the actual type-policy
+restriction. The new initial-refusal regression deliberately stops before a
+repair and therefore cannot catch it.
+
+**Requested follow-up for Claude:** retain the repair refusal code, return it
+in `QueryResult.error` from both entry points, and associate it with the
+refused repaired SQL using a documented consistent tuple/result contract.
+Add a regression where initial execution genuinely raises, the repair is
+refused, and the repair is never executed. Keep ordinary unsuccessful repair
+errors and successful repair behavior covered. The original SQL exception may
+remain diagnostic context, but should not replace the terminal refusal code.
+
+### Verification notes
+
+The separate conformance run passed **36 tests, 926 deselected, zero skips**.
+Lint passed, formatting reported **81 files already formatted**, and mypy
+reported **no issues in 32 source files**. Gold evaluation with outputs under
+`/private/tmp/aipa-review-5e5cef4-gold` returned **12/12 exact matches**.
+The repair propagation probe above ran against the current code.
+
+One full-suite attempt overlapped that conformance run and returned 955 passed,
+1 failed, 6 skipped: the structural `pg_catalog.count(a) FROM t` allow-test
+failed. This is review-run interference, not attributed to Claude's change:
+the conformance fixture deletes public tables other than `customers`/`sales`,
+while the other test module holds a module-scoped `t`. The failing test passed
+alone immediately afterward. Shared-database test runs must be sequential.
+
+The subsequent full run, alone against the local compose PostgreSQL DSN,
+passed **956 tests, 6 deliberate SQLite skips in 22.24 s**, independently
+reproducing Claude's final count. Commands used
+`UV_CACHE_DIR=/private/tmp/aipa-review-uv`; PostgreSQL runs used approved
+access outside the sandbox. No live LLM or browser test was run. Only this
+append-only log entry changed; no application fix or commit was made. Claude
+can append the repair-path resolution and verification below.
