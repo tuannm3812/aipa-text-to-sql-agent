@@ -2612,3 +2612,65 @@ moves this session's working directory), and the Streamlit deployment still
 targets `tuannm3812/main-refinement` under the old repository name - GitHub
 redirects, but the owner should confirm the next deploy picks it up. Next:
 G0, date-stamping the README's May evaluation tables.
+
+## 2026-10-08 — Codex review of the rename, devcontainer fix and evaluation labels
+
+**Scope:** `43af9de..2c75e46`, concentrating on `222cc98`, `7653dea` and
+`2c75e46`. The checkout was clean at review start. Reviewed the code/config
+changes and local evidence for the log's claims; no remote deployment action
+was taken.
+
+**Verdict:** no new actionable implementation defect found in these changes.
+The previous refused-repair closure remains unchanged.
+
+- The devcontainer now installs `--extra engines`, addressing the missing
+  DuckDB/psycopg dependencies. This supplies drivers; PostgreSQL still needs a
+  reachable server and `TEXT_TO_SQL_TEST_POSTGRES_DSN`. Installing the extra
+  alone is not evidence that a fresh devcontainer runs PostgreSQL tests.
+- The new schema opt-in name is used consistently by the engine and its
+  tests. The test DSN rename is reflected in the fixture, CI and setup
+  instructions. The old variable names are not compatibility aliases; existing
+  deployments must migrate their environment settings, consistent with the
+  recorded rename decision. The unchanged `aipa_ro` role, `aipa` fixture
+  database and Streamlit subdomain are deliberate, not missed replacements.
+- The distribution name changes while `text_to_sql_agent` remains the import
+  name. Parsed the old and new lockfiles and compared every third-party
+  package's name/version: unchanged. The generated requirements changes are
+  project attribution comments, not dependency upgrades. The full suite's
+  packaging checks passed.
+- `3e5aba1` is dated 2026-05-19 and titled `Add evaluation results`; result
+  history is consistent with the README's new historical labels. Making the
+  pre-refactor LLM figures explicitly historical corrects the presentation
+  without pretending they measure today's implementation. No provider rerun
+  was performed in this review.
+
+**Publication discussion for Claude:** locally, `main` is `b38639a`, whose
+parents are `796cbae` and `7653dea`. Its only tree difference from reviewed
+HEAD is the README provenance update in `2c75e46`. Thus the local merge
+includes the rename and devcontainer change, but that `main` snapshot does not
+yet include G0's new labels. Include those labels when publishing from `main`.
+This observation is about local refs, not a fresh remote fetch. The reported
+GitHub CI run and Streamlit's configured repository/branch were not independently
+queried here. Treat a merged branch, published evaluation labels, and a
+verified live deployment as separate pieces of evidence; the log already
+acknowledges that the Streamlit target needs confirmation.
+
+**Fresh verification at `2c75e46`:**
+
+- `TEXT_TO_SQL_TEST_POSTGRES_DSN=<local compose DSN> uv run pytest` —
+  **961 passed, 6 deliberate SQLite skips in 23.24 s**. The new variable name
+  activated the PostgreSQL tests; this was not a server-free pass. Conformance
+  is included in the full suite; no overlapping database test run was started.
+- `uv run ruff check .` — **all checks passed**.
+- `uv run ruff format --check .` — **81 files already formatted**.
+- `uv run mypy` — **no issues in 32 source files**.
+- `uv run python scripts/evaluate_text_to_sql.py --mode gold --out-dir
+  /private/tmp/text-sql-review-2c75e46-gold` — **12/12 exact matches**.
+
+Used `UV_CACHE_DIR=/private/tmp/aipa-review-uv` and approved access to the local
+PostgreSQL container. No fresh devcontainer build, live LLM, browser, remote CI
+or Streamlit deployment verification was performed. The production-readiness
+gates discussed in earlier entries remain plans unless separately evidenced;
+this review does not mark the v2 benchmark, release or deployment gates done.
+Only this append-only log entry changed. No application changes, commits,
+pushes or tracked benchmark regeneration were made.
