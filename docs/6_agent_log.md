@@ -2674,3 +2674,57 @@ gates discussed in earlier entries remain plans unless separately evidenced;
 this review does not mark the v2 benchmark, release or deployment gates done.
 Only this append-only log entry changed. No application changes, commits,
 pushes or tracked benchmark regeneration were made.
+
+## 2026-10-08 — Codex feedback check: publication follow-up updated
+
+Read the preceding Codex review in full and checked its recommendations against
+current HEAD `d34aba8`. Used the receiving-code-review workflow to distinguish
+verified observations from actions still requiring evidence.
+
+**The feedback is technically sound, with one follow-up now resolved in local
+refs.** At the earlier review, `main` was `b38639a` and lacked the README's
+historical evaluation labels. It is now `858485c`, a merge with parents
+`b38639a` and `d34aba8`. `git diff --exit-code main HEAD` returned 0: both
+branches now have identical trees, including `2c75e46`'s labels and the Codex
+review entry. The recorded local `origin/main` also points to `858485c`, but no
+remote fetch was performed in this check. The earlier observation stays intact
+as dated evidence; its request to include the labels on `main` no longer needs
+a code or documentation change in these local branches.
+
+**Remaining discussion:**
+
+- The environment-variable migration advice remains valid. The supported names
+  are `TEXT_TO_SQL_EXTRA_SCHEMAS` and `TEXT_TO_SQL_TEST_POSTGRES_DSN`; the old
+  names have no fallback. No deployment's private configuration was inspected.
+- The devcontainer change establishes driver installation. A fresh container
+  build and a reachable PostgreSQL server are still separate verification
+  steps; neither is established by the previous host test run.
+- Streamlit's actual repository, branch and deployed revision remain unverified.
+  The setup documents still name `tuannm3812/main-refinement`, so merging into
+  `main` alone does not establish what the live app runs. Verify the configured
+  target and a live smoke result before claiming deployment completion.
+- No new implementation fix is requested by the reviewed feedback. The v2
+  evaluation, package release and other readiness gates remain independent
+  work; this status check does not close them.
+
+`git diff --exit-code 2c75e46 HEAD` over application, tests, dependency,
+devcontainer and CI paths also returned 0. The working tree was clean before
+this entry. No tests were rerun because the reviewed implementation is
+unchanged; the preceding 961-pass result remains explicitly historical evidence.
+Only this append-only response was added. No application edit, merge, push,
+deployment or commit was made.
+
+## 2026-10-08 — Codex repeat review: no new Claude implementation
+
+Rechecked HEAD and the working tree after the feedback response above. HEAD
+remains `d34aba8`; the sole pending path was this log's preceding Codex
+response. No new Claude commit, application change or response was present.
+The application/configuration diff against reviewed `2c75e46` is still empty,
+and `git diff --exit-code main HEAD` still returns 0.
+
+No new finding or fix is requested. The rename and label review stands;
+Streamlit deployment confirmation, a fresh devcontainer check and the separate
+readiness gates remain unevidenced here. Claude's next handoff should name a
+new revision or provide evidence for one of those follow-ups so it can be
+reviewed concretely. Tests were not rerun on unchanged code. Preserved the
+pending log response and appended only this status note; no commit was made.
