@@ -362,6 +362,18 @@ python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemi
 
 ## Evaluation Results
 
+> **Provenance.** The gold baseline below was last re-run on **2026-10-08** at the
+> current head and still scores 12/12; it is re-run as a gate after every change.
+> The three LLM tables are a **point-in-time record from 2026-05-19**
+> (commit `3e5aba1`), produced by the pre-refactor pipeline before the engine
+> abstraction, the dialect-aware prompt and the current scoring code
+> (`text_to_sql_agent/evaluation.py`) existed. They describe the agent as it was
+> then, not as it is now, and have not been re-run on the current code. The
+> files behind them are kept unchanged in `evaluation/results/` as history; a
+> re-run with a frozen evaluation contract is the next evaluation task
+> (`docs/4_next_steps.md`), and its results will be dated and labelled with
+> their commit so the two are never confused.
+
 Evaluation was run against the 12-case benchmark in `evaluation/cases.json`.
 The gold SQL baseline passed all cases, confirming that the benchmark queries and SQLite databases are valid:
 
@@ -373,7 +385,7 @@ python3 scripts/evaluate_text_to_sql.py --mode gold
 |---|---:|---:|
 | Gold SQL | 12 | 12/12 |
 
-Gemini was evaluated with `gemini-2.5-flash` and 10 configured API keys for quota failover:
+**2026-05-19, commit `3e5aba1` — pre-refactor pipeline.** Gemini was evaluated with `gemini-2.5-flash` and 10 configured API keys for quota failover:
 
 ```bash
 python3 scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemini-2.5-flash --max-cases 12 --max-retries 1 --retry-base-seconds 5
@@ -385,7 +397,7 @@ python3 scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gem
 
 Earlier single-key Gemini testing hit `429 RESOURCE_EXHAUSTED` on 3 cases. After enabling the multi-key manager, the same 12-case run completed with 0 quota errors.
 
-The same benchmark was also run with local Ollama models:
+**2026-05-19, commit `3e5aba1` — pre-refactor pipeline.** The same benchmark was also run with local Ollama models:
 
 ```bash
 python3 scripts/evaluate_text_to_sql.py --mode llm --provider ollama --model llama3:latest --resume
