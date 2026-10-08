@@ -1,7 +1,7 @@
 # Evaluation Contract v2 — Spider, BIRD and a safety suite
 
 **Date:** 2026-10-08
-**Status:** Awaiting review
+**Status:** Revised after Codex design review (2026-10-08); awaiting owner review
 **Parent:** the production-readiness direction, `docs/6_agent_log.md`
 (2026-10-07 and 2026-10-08 portfolio-session entries); gate **G2**
 **Baseline standard:** `~/Documents/GitHub/coding-standards/coding_standards.md`
@@ -65,8 +65,16 @@ Checked on 2026-10-08 against `d34aba8`.
 - The Spider dev set is 1,034 questions over 20 SQLite databases with
   `easy/medium/hard/extra` labels, CC BY-SA 4.0. The BIRD dev set is 1,534
   question–SQL pairs over 11 SQLite databases with a per-question `evidence`
-  string and `simple/moderate/challenging` labels, CC BY-NC(-SA) 4.0. Both run
-  on the existing `SQLiteEngine` with no new infrastructure.
+  string and `simple/moderate/challenging` labels. BIRD's licence changed to
+  CC BY-SA 4.0 on 2024-04-27, and a cleaner development split was published
+  on 2025-11-13 (Codex, 2026-10-08, from the official site); the adapter pins
+  that release and records the licence bundled with the archive it unpacked.
+  Both suites run on the existing `SQLiteEngine` with no new infrastructure.
+- `score_case`'s comparator was never specified for v2 and is lenient:
+  `canonical_value` lowercases text, stringifies `NULL` so it equals the text
+  `'None'`, rounds numbers to two decimals, and `rows_match` sorts rows. All
+  four were reproduced on 2026-10-08. §4.3 freezes a stricter comparator for v2
+  and leaves the legacy one untouched for the `demo` tab and v1 consumers.
 
 ## 4. Design
 
@@ -105,9 +113,11 @@ responsibility:
 
 - **Spider**: fetch the dev release, unpack its databases to
   `data/benchmarks/spider/`, write `evaluation/suites/spider_dev.jsonl`.
-- **BIRD**: fetch the dev release (`dev.json` plus `dev_databases`), unpack to
-  `data/benchmarks/bird/`, write `evaluation/suites/bird_dev.jsonl` with
-  `evidence` filled.
+- **BIRD**: fetch the **2025-11-13 development split** (`dev.json` plus
+  `dev_databases`), unpack to `data/benchmarks/bird/`, write
+  `evaluation/suites/bird_dev.jsonl` with `evidence` filled. The release
+  identifier and the licence text bundled with the archive are recorded, not
+  assumed.
 - Each adapter records the archive's SHA-256 and the release identifier into
   `evaluation/suites/<suite>.source.json`, which the manifest copies.
 
@@ -123,9 +133,11 @@ but reproducibility is a check, not a workflow.
 
 Both public suites run on `SQLiteEngine`, so every benchmark query — gold SQL
 included — goes through `is_safe_query` and the read-only authorizer exactly
-as a user's would. A gold query that fails the safety check is reported as
-`GOLD_SQL_UNSAFE`, counted, and listed in the report; it is never silently
-dropped and never executed.
+as a user's would. A gold query that fails the safety check is never executed.
+It gets the outcome `reference_invalid`, and the policy for it is in §4.3 and
+§4.4: it stays in the headline denominator, it is listed by ID in the report,
+and it fails the gold gate unless its ID is on a committed, reviewed exception
+list `evaluation/suites/<suite>.gold_exceptions.txt`.
 
 ### 4.3 Scorer and metrics
 
@@ -138,7 +150,40 @@ gold_result) -> Outcome` wraps it with the typed expectation:
 | `expect_refusal` | `correct` only if `result.error` is `BLOCKED_UNSAFE_SQL` or `BLOCKED_UNSUPPORTED_COLUMN_TYPE`; everything else `wrong` |
 | `expect_unanswerable` | `correct` only on `UNANSWERABLE_WITH_GIVEN_SCHEMA`; everything else `wrong` |
 
-A generic exception is never a correct refusal.
+A generic exception is never a correct refusal. An answerable case whose gold
+SQL is refused or fails to execute gets `reference_invalid` regardless of what
+the model produced: nothing can be judged against a missing reference.
+
+**The v2 comparator** (`rows_equal_v2`), which `score_v2` uses instead of the
+legacy `rows_match`:
+
+- Values compare **typed**. `NULL` equals only `NULL`; it never equals the
+  text `'None'` or `''`.
+- Text compares **exactly** after trimming surrounding whitespace — case is
+  preserved, because `'A'` and `'a'` are different answers.
+- Numbers compare as numbers across `int`/`float`/`Decimal`, equal when
+  `abs(a - b) <= 1e-6 * max(1, abs(a), abs(b))`. An integer-valued float
+  equals its integer. Text never equals a number.
+- Rows are a **multiset**: duplicates count. A result with an extra duplicate
+  row is wrong.
+- Order matters **iff the gold SQL has a top-level `ORDER BY`** (Spider's
+  rule, applied to both suites); otherwise rows are compared unordered.
+- Column *names* are ignored, column *count* must match, and columns are
+  compared positionally.
+
+This is stricter than the legacy comparator in every respect, and it is
+documented so that the report's "not comparable to the May tables" claim has
+a concrete reason. The legacy `score_case`/`rows_match` stay unchanged and
+versioned as `scorer v1`; v2 is `scorer v2`, and the manifest names which ran.
+
+**Denominators** — one policy for CLI, UI and gold mode:
+
+- **EX (headline)** = `correct` / **all** answerable cases. A
+  `reference_invalid` case counts as not-correct, so a validator change that
+  blocks more gold queries can only lower EX, never flatter it.
+- **EX over valid references** = `correct` / answerable cases whose reference
+  is valid. Reported beside the headline, labelled, with **reference coverage**
+  (valid / all) and the excluded IDs.
 
 Reported per run, overall and per hardness:
 
@@ -157,24 +202,42 @@ standard library suffice; NumPy is not added for one function).
 
 ### 4.4 Manifest and result files
 
-One run writes one directory,
-`evaluation/results/<YYYY-MM-DD>_<suite>_<provider>_<model>[_<tag>]/`:
+One run writes one directory named by a **unique run ID**:
+`evaluation/results/<YYYY-MM-DDTHHMMSS>_<suite>_<subset>_<provider>_<model>_<config>_<short-hash>/`,
+where `<config>` encodes the settings that change outcomes (`rag-on-k5`,
+`evidence-on`), `<model>` is sanitised for the filesystem (`/` and `:`
+become `-`), and `<short-hash>` is the first eight hex digits of the manifest's
+own SHA-256. The runner **refuses to overwrite** an existing completed run;
+`--resume` continues an incomplete one in place. Evidence on and off, RAG on
+and off, and two identical configurations on the same day therefore always
+produce distinct directories. The directory holds three files:
 
-- `manifest.json`: repo commit, suite and subset list (or `full`), the source
-  archive hash and release, scorer version (a constant in `evaluation.py`
-  bumped on any scoring change), prompt hash (SHA-256 of the assembled system
-  prompt for the engine), provider, model, `use_rag`, `rag_top_k`,
-  `evidence`, `work_limit`, `max_rows`, start time, duration, Python and
-  package versions.
+- `manifest.json`: repo commit **and whether the tree was dirty** (a dirty
+  run is marked `citable: false`), suite name and the **SHA-256 of the
+  normalised suite file**, subset name and the **SHA-256 of the ID list** (or
+  `full`), the source archive hash, release and licence, **adapter version**,
+  scorer version (a constant in `evaluation.py` bumped on any scoring
+  change), prompt hash (SHA-256 of the assembled system prompt for the
+  engine), provider, model, `use_rag`, `rag_top_k`, `evidence`, `work_limit`,
+  `max_rows`, `max_repair_attempts`, **retry policy and the outage count**,
+  start time, duration, Python and package versions, and a `status` of
+  `complete` or `incomplete`.
 - `cases.csv`: one row per case — outcome, generated SQL, error code
   (DSN-redacted), latency, tokens.
 - `report.md`: the metrics with intervals, overall and per hardness, and the
   manifest's identifying fields as a header.
 
-Rules: a result is never cited without its manifest; the README's tables carry
-date and commit and link to the directory; `report.md` states that v2 numbers
-are not comparable to the May tables; the old files stay where they are,
-labelled historical.
+Rules: a result is never cited without its manifest; only a `complete`,
+`citable` run may be cited; the README's tables carry date and commit and link
+to the directory; `report.md` states that v2 numbers are not comparable to the
+May tables; the old files stay where they are, labelled historical.
+
+**Outage policy.** A provider error that survives the retry policy (429, 5xx,
+timeout) marks the case `outage`, not `error`. A run with any `outage` is
+`incomplete`: its report is written, with the count, but it is not citable and
+not eligible for the regression gate until re-run with `--resume`, which
+retries only the `outage` cases. Outages are therefore never counted as model
+failures and never silently dropped.
 
 The gold baseline keeps its role as a gate. `--mode gold` runs no model, so
 it checks two different things: every answerable case's gold SQL executes and
@@ -196,10 +259,26 @@ reported only for model runs.
   must score 100 % EX on answerable cases and every non-answerable case must
   pass the structural check. This proves the harness, not the model.
 - **Accuracy regression gate (on demand, needs a model):** compares a new
-  subset run's EX with the last committed report for the same suite,
-  provider, model and evidence setting, and fails when the drop exceeds the
-  width of the new run's interval. Definition of done includes observing it
-  fail on a deliberately broken prompt and pass on the fix.
+  `complete` run with a named baseline run. The two are **compatible** only if
+  their manifests agree on suite hash, subset hash, source release, scorer
+  version, adapter version, provider, model, `evidence`, `use_rag`,
+  `rag_top_k`, `work_limit`, `max_rows`, `max_repair_attempts` and retry
+  policy — so the only things allowed to differ are the commit and the prompt
+  hash, which is what the gate exists to test. An incompatible or incomplete
+  pair is rejected with the differing fields named, never compared.
+
+  The decision rule is **paired**, because the cases are the same: for each
+  case, `new − old` on the correct indicator; a paired bootstrap (10,000
+  resamples, fixed seed) gives a 95 % interval for the mean difference. The
+  gate **fails** if that interval lies entirely below zero, **or** if the point
+  drop is 5 percentage points or more regardless of the interval (a practical
+  floor that also covers the degenerate 0/n and n/n cases, where a one-run
+  interval has zero width). The per-run case bootstrap in §4.3 describes
+  sampling uncertainty over cases; repeated local runs, as the direction asks
+  for on the ablation, describe generation variance, and the report states
+  which of the two an interval is. Definition of done includes observing the
+  gate fail on a deliberately broken prompt, pass on the fix, and reject an
+  incompatible pair.
 
 ### 4.6 The Streamlit evaluation tab
 
@@ -220,6 +299,21 @@ Tests live in `tests/test_evaluation.py` (extended) and
 - Scorer: one test per outcome row in §4.3's table, plus the two negative rules
   — a generic error is `wrong` for a refusal case, and a refusal is `refused`
   (never `correct`) for an answerable case.
+- Comparator: the four reproduced lenient cases (`'A'` vs `'a'`, `NULL` vs
+  `'None'`, `10.004` vs `10.0`, `[2, 1]` vs `[1, 2]` under an `ORDER BY`) are
+  each **not** equal under v2 and still equal under the legacy comparator;
+  `1` vs `1.0` and `0.1 + 0.2` vs `0.3` are equal; a duplicated row is not;
+  unordered equality holds without an `ORDER BY`.
+- Blocked gold: a fixture case whose gold SQL the validator refuses scores
+  `reference_invalid` without being executed, stays in the headline
+  denominator, is excluded from the conditional score, is listed by ID, fails
+  the gold gate, and passes it once its ID is on the exception list.
+- Run identity: evidence on/off, RAG on/off and two identical runs on one day
+  produce distinct directories; a second run into an existing completed
+  directory is refused; a model name containing `/` and `:` yields a valid
+  path; a dirty tree is recorded and marks the run not citable.
+- Outage: a persistent provider error yields `outage`, the run is
+  `incomplete`, and `--resume` retries only those cases.
 - Intervals: the bootstrap is deterministic under its seed; a rate of 0/n and
   n/n yields a degenerate interval; the interval narrows as n grows.
 - Adapters: each converts a hand-written three-record fixture in the
@@ -231,8 +325,10 @@ Tests live in `tests/test_evaluation.py` (extended) and
 - Gate: the gold gate passes on `demo` and `safety`; it fails when an
   answerable case's gold SQL is corrupted, and when a safety case is given an
   `expected` value the contract does not define.
-- Regression gate: fails on a synthetic report pair with a drop wider than the
-  interval, passes on one within it.
+- Regression gate: fails on a synthetic paired set whose difference interval
+  lies below zero, fails on a 5-point drop with an interval spanning zero,
+  passes on a small drop, rejects a pair differing in subset hash or scorer
+  version with the fields named, and rejects an incomplete run.
 - The May result files are untouched: a test asserts their contents' hashes.
 
 ## 5. Risks
@@ -242,9 +338,9 @@ Tests live in `tests/test_evaluation.py` (extended) and
   message, so a silently different release cannot produce comparable-looking
   numbers.
 - **BIRD gold SQL that our validator refuses.** Expected for a handful of
-  cases; reported as `GOLD_SQL_UNSAFE` and excluded from EX's denominator with
-  the count stated, never hidden. Each one is also a free probe of the
-  validator and is logged for review.
+  cases; scored `reference_invalid`, kept in the headline denominator, listed
+  by ID, and gated by the exception list (§4.2–4.4). Each one is also a free
+  probe of the validator and is logged for review.
 - **Large schemas overwhelm the n-gram RAG.** Likely on BIRD. That is a
   finding for Phase 4, not something this spec tunes around; `rag_top_k` is in
   the manifest so it can be varied deliberately.

@@ -2904,3 +2904,9 @@ Not changed: the two benchmarks, the evidence policy, the run policy, or the
 adapter architecture — all owner decisions from earlier today. Nothing was
 implemented; this is a documentation-only revision, so the application suite
 was not rerun. Only this append-only entry and the spec file changed.
+
+**Correction (same day).** The entry above was committed as `ad5e583` with a
+message saying the spec had been revised; it had not. The revision script
+stopped on one mismatched anchor before writing, so that commit carries only
+this log entry. The spec changes described above landed in the following
+commit. Nothing else in the entry is affected; it is left as written.
