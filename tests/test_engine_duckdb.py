@@ -1,0 +1,1606 @@
+"""DuckDB-specific safety tests: the connection-level filesystem-access guard.
+
+`read_only=True` on a DuckDB connection protects the database *file*, not the
+filesystem: a read-only connection can still run `read_csv`, a bare quoted
+path (which has no function name for `is_safe_query` to catch), `glob`, and
+`COPY ... TO`. These go in their own module, engine-specific rather than in
+`test_engine_conformance.py`, for the same reason SQLite's authorizer tests
+live in `test_execution.py` rather than the conformance suite: the mechanism
+under test - `enable_external_access=False` - has no equivalent on other
+engines.
+
+Each test calls `engine.execute` directly, bypassing `is_safe_query` entirely,
+because the point is to prove the *connection* refuses these regardless of
+what any validator in front of it does or doesn't catch.
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import pytest
+import sqlglot
+from sqlglot import exp
+
+duckdb = pytest.importorskip("duckdb", reason="install the duckdb extra")
+
+from text_to_sql_agent import is_safe_query  # noqa: E402
+from text_to_sql_agent import safety as _safety  # noqa: E402
+from text_to_sql_agent.engines import duckdb as _duckdb_engine_module  # noqa: E402
+from text_to_sql_agent.engines import open_engine  # noqa: E402
+from text_to_sql_agent.engines.duckdb import DuckDBEngine  # noqa: E402
+from text_to_sql_agent.execution import execute_query  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def engine_with_table_t(tmp_path_factory):
+    """A real DuckDB file with one empty table `t` (and nothing else), for
+    tests that need `is_safe_query`'s default-deny table check
+    (`_references_unknown_table`) to have a real table to say yes to -
+    `DuckDBEngine("unused.duckdb")`, used throughout this file before Fix 1,
+    stopped being enough once that check started calling `engine.table_names()`,
+    which needs a real, connectable database.
+
+    Module-scoped rather than rebuilt per test: nothing in this file mutates
+    the database (`engine.execute` is never called against it - only
+    `is_safe_query`, which is read-only validation), so one file safely backs
+    every test that needs it, including the 129-way `test_allowed_function_
+    round_trip` parametrization and the ~1,800-check catalogue sweep.
+
+    No column is referenced by name in `is_safe_query`'s own checks - it
+    validates table and function names, never column existence - so `t`'s
+    single dummy column is enough regardless of which column names a given
+    probe SQL string happens to mention.
+    """
+    db = tmp_path_factory.mktemp("default_deny_table_check") / "t.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE t (a INTEGER)")
+    con.close()
+    return open_engine(f"duckdb://{db}")
+
+
+@pytest.fixture
+def secret_and_engine(tmp_path):
+    secret = tmp_path / "secret.csv"
+    secret.write_text("k,v\napi_key,hunter2\n", encoding="utf-8")
+    db = tmp_path / "t.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE t (a INTEGER)")
+    con.close()
+    return secret, open_engine(f"duckdb://{db}")
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "SELECT * FROM read_csv('{secret}')",
+        "SELECT * FROM '{secret}'",
+        "SELECT * FROM glob('{parent}/*')",
+    ],
+)
+def test_filesystem_reads_are_refused_by_the_connection(secret_and_engine, template):
+    secret, engine = secret_and_engine
+    sql = template.format(secret=secret, parent=secret.parent)
+    with pytest.raises(Exception) as caught:  # noqa: B017
+        engine.execute(sql, max_rows=10, work_limit=0)
+    assert "hunter2" not in str(caught.value)
+
+
+def test_copy_to_a_file_is_refused_by_the_connection(secret_and_engine, tmp_path):
+    _, engine = secret_and_engine
+    target = tmp_path / "exfil.csv"
+    with pytest.raises(Exception):  # noqa: B017
+        engine.execute(f"COPY (SELECT 1) TO '{target}'", max_rows=10, work_limit=0)
+    assert not target.exists(), "nothing may be written to disk"
+
+
+# Every DuckDB table function that reads a file, given a single string-path
+# argument. Verified 2026-09-19 that each accepts exactly this shape and
+# raises `duckdb.PermissionException` at the connection layer before ever
+# opening the path - see the module docstring on why that layer, not
+# `is_safe_query`, is what actually stops them.
+FILE_READING_FUNCTIONS = [
+    "read_csv",
+    "read_csv_auto",
+    "read_json",
+    "read_json_auto",
+    "read_json_objects",
+    "read_json_objects_auto",
+    "read_ndjson",
+    "read_ndjson_auto",
+    "read_ndjson_objects",
+    "read_parquet",
+    "read_duckdb",
+    "read_text",
+    "read_blob",
+    "parquet_scan",
+    "glob",
+    "sniff_csv",
+]
+
+
+@pytest.mark.parametrize("function_name", FILE_READING_FUNCTIONS)
+def test_file_reading_functions_are_blocked_at_both_layers(secret_and_engine, function_name):
+    """Pins both layers together: the validator's name-based check (defence in
+    depth) and the connection's `enable_external_access=False` (load-bearing).
+
+    A regression that removed either layer alone would still pass the other
+    half of this test - only removing both would go unnoticed, which is why
+    Step 3a and this test are separate but both required.
+    """
+    secret, engine = secret_and_engine
+    sql = f"SELECT * FROM {function_name}('{secret}')"
+
+    assert not is_safe_query(sql, engine=engine), (
+        f"{function_name} must be in DuckDBEngine.internal_prefixes/internal_names"
+    )
+    with pytest.raises(Exception) as caught:  # noqa: B017
+        engine.execute(sql, max_rows=10, work_limit=0)
+    assert "hunter2" not in str(caught.value)
+
+
+# Task 6b (2026-09-19) replaced the standalone table-function allowlist that
+# used to live here with `DuckDBEngine.allowed_functions` - the brief was
+# explicit that the two must not compete as separate, driftable lists. Every
+# test below that needs "the table functions a legitimate analytical question
+# could use" reads them out of the engine's own set instead of hand-rolling a
+# second copy. `histogram`/`histogram_values`/`summary` were on the old
+# allowlist and are deliberately **not** carried forward: `histogram_values`
+# is a macro whose body calls `query_table(source)`, so
+# `SELECT * FROM histogram_values('information_schema.tables', ...)` read the
+# catalogue through a name that had passed every prior review round precisely
+# because it looked analytical. See `DuckDBEngine.allowed_functions`'s
+# docstring for the full account and `test_pinned_leaks_stay_rejected` below
+# for the regression pin.
+def _duckdb_catalog_function_names(*function_types: str) -> frozenset[str]:
+    """Every distinct `function_name` `duckdb_functions()` reports for the given types."""
+    con = duckdb.connect(":memory:")
+    try:
+        placeholders = ", ".join("?" for _ in function_types)
+        rows = con.execute(
+            f"SELECT DISTINCT function_name FROM duckdb_functions() "
+            f"WHERE function_type IN ({placeholders})",
+            list(function_types),
+        ).fetchall()
+    finally:
+        con.close()
+    return frozenset(row[0] for row in rows)
+
+
+# The table functions `DuckDBEngine.allowed_functions` actually authorises,
+# derived rather than hand-copied - `range`/`generate_series` both appear
+# because the set lists both spellings even though they resolve to the same
+# canonical token (see the comment on `allowed_functions`).
+ALLOWED_TABLE_FUNCTIONS = (DuckDBEngine.allowed_functions or frozenset()) & (
+    _duckdb_catalog_function_names("table", "table_macro")
+)
+
+
+@pytest.mark.parametrize(
+    "function_name",
+    sorted(ALLOWED_TABLE_FUNCTIONS - {"range", "generate_series", "repeat"}),
+)
+def test_allowed_table_functions_are_not_blocked_by_the_internals_check(function_name):
+    """`internal_prefixes`/`internal_names` must not shadow a function this
+    task deliberately allows as a table source - the two gates are
+    independent AND conditions, so a name blocked by one is unreachable no
+    matter what the other says.
+
+    `range`/`generate_series` are excluded because they need positional
+    arguments no bare `{name}()` probe supplies; their coverage comes from
+    the Step 5 analytics corpus instead. `repeat` is excluded deliberately,
+    not as a probe limitation: the literal name `repeat` is in
+    `allowed_functions` for the scalar string function
+    (`repeat('ab', 3)` -> `'ababab'`), a genuinely useful string helper, but
+    DuckDB also registers a *table* function of the same name (builds a
+    table of N copies of a literal value or row) that
+    `DuckDBEngine.internal_names` blocks on purpose - "no legitimate
+    analytical use", per that class's docstring. Resolution is
+    name-transparent for both (`repeat` parses as `exp.Anonymous` in either
+    position), so the same literal name is correctly allowed as a scalar and
+    correctly blocked as a table source; the two gates disagreeing on
+    `repeat` specifically is the intended outcome, not a defect.
+    """
+    engine = DuckDBEngine("unused.duckdb")
+    blocked = function_name.startswith(engine.internal_prefixes) or (
+        function_name in engine.internal_names
+    )
+    assert not blocked, f"{function_name} is both allowed and blocklisted - remove one"
+
+
+def test_repeat_is_allowed_as_a_scalar_and_blocked_as_a_table_source(engine_with_table_t):
+    """Names the `repeat` exception in `ALLOWED_TABLE_FUNCTIONS` above directly.
+
+    `is_safe_query` -> `engine.execute` end to end: the scalar use must both
+    validate and run; the table-position use must be rejected by
+    `is_safe_query` before `engine.execute` is ever called.
+    """
+    assert is_safe_query("SELECT repeat('ab', 3) FROM t", engine=engine_with_table_t)
+    assert not is_safe_query("SELECT * FROM repeat(1, 3)", engine=engine_with_table_t)
+
+
+# Window functions need an `OVER (...)` clause to parse at all; a handful
+# (`ntile`, `lag`, `lead`, `nth_value`, `first_value`, `last_value`) also
+# need specific non-empty arguments sqlglot's DuckDB dialect requires.
+_WINDOW_FUNCTION_ARGS = {
+    "ntile": "(4)",
+    "lag": "(a)",
+    "lead": "(a)",
+    "nth_value": "(a, 2)",
+    "first_value": "(a)",
+    "last_value": "(a)",
+}
+_WINDOW_FUNCTIONS = frozenset(
+    {
+        "row_number",
+        "rank",
+        "dense_rank",
+        "percent_rank",
+        "cume_dist",
+        "ntile",
+        "lag",
+        "lead",
+        "first_value",
+        "last_value",
+        "nth_value",
+    }
+)
+# Table functions are called in a `FROM` position with their own argument
+# shape, not a scalar `SELECT` list.
+_TABLE_FUNCTION_ARGS = {
+    "range": "(10)",
+    "generate_series": "(1, 10)",
+    "unnest": "(a)",
+    "json_each": "(a)",
+    "json_tree": "(a)",
+}
+# A plausible, parseable argument list for every remaining scalar/aggregate
+# entry in `DuckDBEngine.allowed_functions` - one call shape each function is
+# known to accept, used only to prove the round trip below, not to exercise
+# every overload. `current_date`, `now`, `extract`, `case` and `if` have their
+# own irregular syntax and are special-cased in `_round_trip_snippet` instead
+# of listed here.
+_SCALAR_FUNCTION_ARGS = {
+    "abs": "(a)",
+    "age": "(d1, d2)",
+    "approx_count_distinct": "(a)",
+    "arg_max": "(a, b)",
+    "arg_min": "(a, b)",
+    "array_agg": "(a)",
+    "avg": "(a)",
+    "bool_and": "(a)",
+    "bool_or": "(a)",
+    "cbrt": "(a)",
+    "ceil": "(a)",
+    "coalesce": "(a, b)",
+    "concat": "(a, b)",
+    "concat_ws": "(',', a, b)",
+    "contains": "(a, 'x')",
+    "corr": "(a, b)",
+    "count": "(a)",
+    "count_if": "(a)",
+    "covar_pop": "(a, b)",
+    "covar_samp": "(a, b)",
+    "date_add": "(d, INTERVAL 1 DAY)",
+    "date_diff": "('day', d1, d2)",
+    "date_part": "('year', d)",
+    "date_sub": "(d, INTERVAL 1 DAY)",
+    "date_trunc": "('month', d)",
+    "datepart": "('year', d)",
+    "day": "(d)",
+    "dayofweek": "(d)",
+    "dayofyear": "(d)",
+    "ends_with": "(a, 'x')",
+    "epoch": "(d)",
+    "epoch_ms": "(d)",
+    "exp": "(a)",
+    "first": "(a)",
+    "floor": "(a)",
+    "greatest": "(a, b)",
+    "hour": "(d)",
+    "isodow": "(d)",
+    "json_array_length": "(a)",
+    "json_extract": "(a, '$.x')",
+    "json_extract_string": "(a, '$.x')",
+    "json_keys": "(a)",
+    "json_type": "(a)",
+    "json_valid": "(a)",
+    "last": "(a)",
+    "last_day": "(d)",
+    "least": "(a, b)",
+    "left": "(a, 3)",
+    "length": "(a)",
+    "list_aggregate": "(a, 'sum')",
+    "list_contains": "(a, 1)",
+    "list_distinct": "(a)",
+    "list_extract": "(a, 1)",
+    "list_position": "(a, 1)",
+    "list_sort": "(a)",
+    "list_value": "(1, 2, 3)",
+    "ln": "(a)",
+    "log": "(a)",
+    "lower": "(a)",
+    "lpad": "(a, 5, '0')",
+    "make_date": "(2024, 1, 1)",
+    "max": "(a)",
+    "median": "(a)",
+    "min": "(a)",
+    "minute": "(d)",
+    "mode": "(a)",
+    "month": "(d)",
+    "nullif": "(a, b)",
+    "position": "('x' in a)",
+    "power": "(a, 2)",
+    "quantile": "(a, 0.5)",
+    "quantile_cont": "(a, 0.5)",
+    "quantile_disc": "(a, 0.5)",
+    "quarter": "(d)",
+    "regexp_extract": "(a, 'x')",
+    "regexp_full_match": "(a, 'x')",
+    "regexp_matches": "(a, 'x')",
+    "regexp_replace": "(a, 'x', 'y')",
+    "repeat": "(a, 3)",
+    "replace": "(a, 'x', 'y')",
+    "reverse": "(a)",
+    "right": "(a, 3)",
+    "round": "(a, 2)",
+    "second": "(d)",
+    "sign": "(a)",
+    "split_part": "(a, ',', 1)",
+    "sqrt": "(a)",
+    "starts_with": "(a, 'x')",
+    "stddev": "(a)",
+    "stddev_pop": "(a)",
+    "stddev_samp": "(a)",
+    "strftime": "(d, '%Y-%m')",
+    "string_agg": "(a, ',')",
+    "string_split": "(a, ',')",
+    "strptime": "(a, '%Y-%m-%d')",
+    "substring": "(a, 1, 3)",
+    "sum": "(a)",
+    "to_json": "(a)",
+    "trim": "(a)",
+    "upper": "(a)",
+    "var_pop": "(a)",
+    "variance": "(a)",
+    "week": "(d)",
+    "year": "(d)",
+}
+
+
+def _round_trip_snippet(name: str) -> str:
+    """A single, plausible SQL fragment calling `name`, for the round-trip test."""
+    if name in _WINDOW_FUNCTIONS:
+        args = _WINDOW_FUNCTION_ARGS.get(name, "()")
+        return f"{name}{args} OVER (PARTITION BY b ORDER BY c)"
+    if name in _TABLE_FUNCTION_ARGS:
+        return f"{name}{_TABLE_FUNCTION_ARGS[name]}"
+    if name in ("cast", "try_cast"):
+        return f"{name}(a AS INTEGER)"
+    if name == "extract":
+        return "extract(year FROM d)"
+    if name == "case":
+        return "case when a > 1 then 'x' else 'y' end"
+    if name == "if":
+        return "if(a > 1, 'x', 'y')"
+    if name == "current_date":
+        return "current_date"
+    if name == "now":
+        return "now()"
+    if name == "current_timestamp":
+        return "current_timestamp"
+    if name == "collate":
+        return "a COLLATE NOCASE"
+    return f"{name}{_SCALAR_FUNCTION_ARGS[name]}"
+
+
+@pytest.mark.parametrize("name", sorted(DuckDBEngine.allowed_functions))
+def test_allowed_function_round_trip(name, engine_with_table_t):
+    """The hardest part of this task, proven directly: for every one of the
+    129 names in `DuckDBEngine.allowed_functions`, a realistic call using
+    that name parses under the DuckDB dialect, and `safety._resolve_function_
+    name` resolves the parsed node back to a name that is itself in
+    `allowed_functions` - not necessarily the same literal spelling
+    (`range(10)` resolves to `"generate_series"`, since both parse to the
+    same typed AST node - see `_FUNCTION_NAME_OVERRIDES` in `safety.py`), but
+    always a member of the set, which is what makes `is_safe_query` accept
+    it. `is_safe_query` itself is asserted too, on the full statement, so
+    this is the real path the validator runs, not just the resolver in
+    isolation.
+
+    This is the round-trip proof the task brief requires: sqlglot parses
+    many calls into typed classes whose canonical name can differ from what
+    DuckDB registers or what a caller typed, and a mismatch here fails in one
+    of two directions - a legitimate function wrongly rejected (caught by
+    the `is_safe_query` assertion below), or a resolver that maps a
+    dangerous function onto an allowed name (which `test_every_unlisted_
+    duckdb_function_is_rejected_by_default_deny` above sweeps for
+    independently, across the whole catalogue rather than just this
+    allowlist).
+    """
+    engine = engine_with_table_t
+    snippet = _round_trip_snippet(name)
+    is_table_function = name in _TABLE_FUNCTION_ARGS
+    sql = f"SELECT * FROM {snippet}" if is_table_function else f"SELECT {snippet} FROM t"
+
+    parsed = sqlglot.parse_one(sql, read="duckdb")
+    funcs = list(parsed.find_all(exp.Func))
+    assert funcs, f"{sql!r} produced no exp.Func node to resolve"
+    resolved_names = {_safety._resolve_function_name(f) for f in funcs}
+    assert resolved_names & engine.allowed_functions, (
+        f"{name!r} (SQL: {sql!r}) resolved to {resolved_names}, none of which "
+        "are in DuckDBEngine.allowed_functions"
+    )
+    assert is_safe_query(sql, engine=engine), f"{sql!r} should have been allowed"
+
+
+# The 5 administrative functions Fix 2's review found passing `is_safe_query`
+# and actually executing against a real `DuckDBEngine`, under Fix 1's "does
+# not touch the filesystem" criterion. Confirmed grep-clean: none of these
+# names appear anywhere in text_to_sql_agent/, ui/, scripts/, or
+# evaluation/cases.json.
+_PREVIOUSLY_EXECUTED_ADMINISTRATIVE_FUNCTIONS = [
+    "checkpoint",
+    "enable_profiling",
+    "enable_logging",
+    "disable_logging",
+    "truncate_duckdb_logs",
+]
+
+
+@pytest.mark.parametrize("function_name", _PREVIOUSLY_EXECUTED_ADMINISTRATIVE_FUNCTIONS)
+def test_administrative_functions_are_refused_by_the_validator(function_name):
+    """Regression pin for Fix 2: these 5 passed `is_safe_query` and executed
+    before `DuckDBEngine.internal_names` grew an explicit administrative-
+    function bucket. A model has no legitimate reason to force a checkpoint
+    or toggle logging/profiling, so the validator must refuse them outright,
+    not merely fail to find a way to abuse them.
+    """
+    engine = DuckDBEngine("unused.duckdb")
+    assert not is_safe_query(f"SELECT * FROM {function_name}()", engine=engine)
+
+
+# Argument shapes tried, in order, when probing whether `name{args}` parses
+# under the DuckDB dialect. Several real functions need a specific shape
+# (`log(a)` parses; `concat_ws()` alone does not), so more than one template
+# is tried per name and per position before giving up on that name.
+_PROBE_ARG_TEMPLATES = (
+    "()",
+    "(a)",
+    "(a, b)",
+    "(a, b, c)",
+    "(1)",
+    "(1, 2)",
+    "('x')",
+    "('x', 'y')",
+)
+
+
+def _first_parseable_call(name: str, *, wrap: str) -> str | None:
+    """The first `wrap`-shaped SQL text using `name` that parses under DuckDB.
+
+    Args:
+        name: A candidate function name from `duckdb_functions()`.
+        wrap: A template with one `{call}` placeholder, e.g.
+            `"SELECT {call} FROM t"` for a scalar-position probe or
+            `"SELECT * FROM {call}"` for a table-position probe.
+
+    Returns:
+        The first probe SQL text that sqlglot's DuckDB dialect parses
+        without error, or `None` if every argument shape failed to parse.
+    """
+    import sqlglot
+
+    for args in _PROBE_ARG_TEMPLATES:
+        sql = wrap.format(call=f"{name}{args}")
+        try:
+            sqlglot.parse_one(sql, read="duckdb")
+        except Exception:
+            continue
+        return sql
+    return None
+
+
+def _resolved_name_of_only_func(sql: str) -> str | None:
+    """`safety._resolve_function_name` applied to the sole `exp.Func` in `sql`.
+
+    Every probe template in `_PROBE_ARG_TEMPLATES` uses bare column
+    references or scalar literals as arguments, never a bracketed list
+    literal (`[1, 2]`) or a nested call, so a probe that parses produces at
+    most one `exp.Func` node - the call under test itself. `mod(a, b)`,
+    `xor(a, b)`, `*(a)`, and a few other catalogue entries are native
+    operator syntax with **no** `exp.Func` node at all once parsed (DuckDB
+    registers operators as catalogue functions too, but sqlglot represents
+    `a % b` as `exp.Mod`, not a call) - those return `None` here and are
+    excluded from the sweep's leak check entirely, since there is no function
+    name for `_references_disallowed_function` to see, and no filesystem or
+    catalogue access an arithmetic/bitwise operator could perform regardless
+    of what gate does or doesn't inspect it.
+
+    Returns:
+        The resolved name, or `None` if the parse produced zero `exp.Func`
+        nodes. Never more than one, by the argument-shape guarantee above.
+    """
+    import sqlglot
+    from sqlglot import exp
+
+    parsed = sqlglot.parse_one(sql, read="duckdb")
+    funcs = list(parsed.find_all(exp.Func))
+    if not funcs:
+        return None
+    assert len(funcs) == 1, f"probe {sql!r} produced more than one Func node: {funcs}"
+    return _safety._resolve_function_name(funcs[0])
+
+
+def test_every_unlisted_duckdb_function_is_rejected_by_default_deny(engine_with_table_t):
+    """Step 4: proves the property, not the list.
+
+    Sweeps every distinct function name `duckdb_functions()` reports, across
+    every function type it has (`scalar`, `aggregate`, `table`,
+    `table_macro`, `macro`, `pragma`), and requires that `is_safe_query`
+    agrees exactly with the same resolution `_references_disallowed_function`
+    itself performs: rejected whenever the parsed call's *resolved* name is
+    not in `DuckDBEngine.allowed_functions`, and - only then - never
+    unexpectedly rejected when it is. Checked in a scalar position
+    (`SELECT name(...)`) and, separately, in a table position
+    (`SELECT * FROM name(...)`), since a name can be reachable in one
+    position and not the other.
+
+    Resolved rather than literal names are what the sweep must compare
+    against, or the sweep reports false leaks: DuckDB registers many
+    synonyms under distinct catalogue names that sqlglot parses into the
+    *same* typed AST node - `lpad`/`rpad` both become `exp.Pad`,
+    `var_samp`/`variance` both become `exp.Variance`,
+    `string_agg`/`group_concat`/`listagg` all become `exp.GroupConcat` - so a
+    literal catalogue name such as `listagg` correctly passes `is_safe_query`
+    even though only `string_agg` is spelled out in `allowed_functions`. That
+    is by design (see `_resolve_function_name`'s docstring in `safety.py`),
+    not a gap; comparing literal names against the allowlist instead of
+    resolved ones flagged every one of these as a false leak the first time
+    this test was written, catalogue-verified 2026-09-19 to always land on
+    an already-intentionally-allowed canonical token rather than smuggling a
+    different function through.
+
+    This supersedes Task 6's `test_every_duckdb_table_function_is_classified`
+    (table/table_macro only, classified by list membership rather than by
+    round-tripping through `is_safe_query`) for the same reason the brief
+    gives: under default-deny, "classified" no longer means "someone put it
+    in a list" - it means `is_safe_query` itself agrees with the resolver,
+    checked here directly. A future DuckDB release that adds a function
+    changes nothing about this test's outcome: an unrecognised name fails
+    closed by construction, and a new synonym of an already-allowed function
+    resolves to the same canonical token and is correctly allowed.
+
+    **What this does not prove**, per the 2026-09-19 review round: every
+    "expected" verdict in this sweep is derived from `_resolve_function_
+    name` itself (`resolved in allowed`, below), the very function
+    `is_safe_query` also uses internally - so this test can only ever show
+    that `is_safe_query` *agrees with the resolver*, never that the resolver
+    is correct in some independent sense. A bug shared by both the resolver
+    and this test's own "expected" computation (for instance, a function
+    whose *dispatch argument* names a second, unchecked function - Fix 1's
+    `list_aggregate` finding) is invisible here by construction: both sides
+    would agree, and agreement is all this sweep checks. `test_allowed_
+    function_round_trip` above and the hand-written attack/corpus tests
+    elsewhere in this file are what catch a class of bug like that; this
+    sweep's job is narrower - proving *coverage* (every catalogue name is
+    checked somewhere) and *consistency* (the two paths through the same
+    logic never diverge), not independent proof of the resolver's own
+    correctness or of the string-dispatch rule now applied on top of it (see
+    `_STRING_DISPATCH_FUNCTIONS` in `safety.py`).
+
+    This test also depends on a real table named `t` existing (via
+    `engine_with_table_t`) for every scalar-position probe now that
+    default-deny extends to tables as well as functions - `is_safe_query`
+    would otherwise reject every `SELECT name(...) FROM t` probe on the
+    table alone, regardless of whether `name` is allowed, which would make
+    every "should be allowed" case in this sweep a false mismatch rather
+    than a true one.
+    """
+    engine = engine_with_table_t
+    allowed = engine.allowed_functions or frozenset()
+    all_names = sorted(
+        _duckdb_catalog_function_names(
+            "scalar", "aggregate", "table", "table_macro", "macro", "pragma"
+        )
+    )
+    assert all_names, "the catalogue sweep returned nothing - duckdb_functions() query is broken"
+
+    mismatches: list[tuple[str, str, str, str, bool, bool]] = []
+    scalar_checked = 0
+    table_checked = 0
+    no_func_node = 0
+    for name in all_names:
+        for position, wrap in (
+            ("scalar", "SELECT {call} FROM t"),
+            ("table", "SELECT * FROM {call}"),
+        ):
+            sql = _first_parseable_call(name, wrap=wrap)
+            if sql is None:
+                continue
+            resolved = _resolved_name_of_only_func(sql)
+            if resolved is None:
+                no_func_node += 1
+                continue
+            if position == "scalar":
+                scalar_checked += 1
+            else:
+                table_checked += 1
+            actual_safe = is_safe_query(sql, engine=engine)
+            expected_safe = resolved in allowed
+            # `repeat` is the one deliberate exception: the literal name is
+            # allowed for the scalar string function but the *table*
+            # function of the same name is independently blocked by
+            # `internal_names` (see `test_repeat_is_allowed_as_a_scalar_and_
+            # blocked_as_a_table_source`), so the resolver alone
+            # under-predicts `is_safe_query` here on purpose - the internals
+            # gate is doing exactly what it is for.
+            if (position, resolved) == ("table", "repeat"):
+                assert not actual_safe, "repeat as a table source must stay blocked"
+                continue
+            # Fix 1: `list_aggregate` additionally requires its second
+            # argument to be a string literal naming an allowed function
+            # (`_dispatches_to_disallowed_function` in safety.py). None of
+            # `_PROBE_ARG_TEMPLATES` supplies one - the first template that
+            # merely *parses* (`()`, zero args) is what `_first_parseable_call`
+            # picks, and `is_safe_query` correctly rejects it regardless of
+            # `list_aggregate` itself being allowed. The dispatch-argument
+            # rule is exercised directly by
+            # `test_list_aggregate_dispatch_argument_is_validated` instead.
+            if resolved == "list_aggregate":
+                assert not actual_safe, (
+                    "list_aggregate without a valid dispatch argument must stay blocked"
+                )
+                continue
+            if actual_safe != expected_safe:
+                mismatches.append((position, name, sql, resolved, actual_safe, expected_safe))
+
+    assert not mismatches, (
+        f"is_safe_query disagreed with the resolver for {len(mismatches)} case(s): "
+        f"{mismatches[:10]}. A resolved name allowed here but rejected by is_safe_query "
+        "(or vice versa) means the two have drifted apart."
+    )
+    # A meaningful fraction of the catalogue must actually have been
+    # exercised in each position - this is what would catch the probe itself
+    # silently degenerating (e.g. every template failing to parse) rather
+    # than the property genuinely holding.
+    assert scalar_checked > 700, f"only {scalar_checked} names produced a parseable scalar probe"
+    assert table_checked > 20, f"only {table_checked} names produced a parseable table probe"
+    print(
+        f"\nStep 4 sweep: {len(all_names)} distinct catalogue names, "
+        f"{len(allowed)} in the allowlist; "
+        f"{scalar_checked} checked in scalar position, "
+        f"{table_checked} checked in table position, "
+        f"{no_func_node} probes produced no exp.Func node (operator syntax, "
+        "excluded from the check), 0 mismatches."
+    )
+
+
+def test_pinned_leaks_stay_rejected():
+    """Step 6: pins the two proven leaks from the task brief directly.
+
+    Both were verified live against this exact DuckDB build (2026-09-19):
+    `current_setting('secret_directory')` returned a real filesystem path
+    through the old blocklist, and
+    `SELECT * FROM histogram_values('information_schema.tables', 'table_name', 20, 'auto')`
+    read the catalogue through a macro that was on the old table-function
+    allowlist. Neither name is anywhere in `DuckDBEngine.allowed_functions`
+    now, so both are rejected by default-deny alone - this test exists so a
+    future change to that set cannot silently re-open either leak without a
+    test failing.
+    """
+    engine = DuckDBEngine("unused.duckdb")
+    # `current_setting` is a scalar - the exact shape that made a blocklist
+    # structurally unfit, since the internals check only ever fires in a
+    # table-source position.
+    assert not is_safe_query("SELECT current_setting('secret_directory')", engine=engine)
+    assert not is_safe_query(
+        "SELECT current_setting('secret_directory') AS x FROM t", engine=engine
+    )
+    # histogram/histogram_values/summary share the macro body that calls
+    # query_table(source) - pin all three directly against a catalogue
+    # source, not just the one from the brief.
+    assert not is_safe_query(
+        "SELECT * FROM histogram_values('information_schema.tables', 'table_name', 20, 'auto')",
+        engine=engine,
+    )
+    assert not is_safe_query(
+        "SELECT * FROM histogram('information_schema.tables', 'table_name')", engine=engine
+    )
+    assert not is_safe_query("SELECT * FROM summary('information_schema.tables')", engine=engine)
+
+
+def test_pinned_leaks_are_also_refused_by_the_connection(tmp_path):
+    """The same two leaks, end to end: `is_safe_query` rejects them (proven
+    above), and - belt and suspenders - the query never actually reaches
+    live data even if a future regression somehow made the validator agree
+    to run it, because a genuine catalogue read still succeeds at the
+    connection layer (unlike the filesystem functions, DuckDB's own
+    catalogue is readable over a read-only, external-access-disabled
+    connection - that is exactly why the validator, not the connection, has
+    to be the gate here).
+    """
+    db = tmp_path / "t.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE t (a INTEGER)")
+    con.close()
+    engine = open_engine(f"duckdb://{db}")
+
+    assert not is_safe_query("SELECT current_setting('secret_directory')", engine=engine)
+    result = engine.execute("SELECT current_setting('secret_directory')", max_rows=10, work_limit=0)
+    assert result.ok, (
+        "sanity check: the connection itself does not refuse this - the validator must"
+    )
+
+    assert not is_safe_query(
+        "SELECT * FROM histogram_values('information_schema.tables', 'table_name', 20, 'auto')",
+        engine=engine,
+    )
+    result = engine.execute(
+        "SELECT * FROM histogram_values('information_schema.tables', 'table_name', 20, 'auto')",
+        max_rows=10,
+        work_limit=0,
+    )
+    assert result.ok and result.rows, (
+        "sanity check: histogram_values genuinely reads the catalogue when nothing stops it"
+    )
+
+
+def test_dot_struct_field_access_on_a_real_column_is_not_rejected(tmp_path) -> None:
+    """Task 4 (2026-09-26), cross-engine regression proof: the PostgreSQL
+    `(expr).name` dot-call bypass fix (`safety._references_disallowed_dot_
+    call`) is gated on dialect (`_DOT_CALL_DIALECTS = {"postgres"}`) rather
+    than applied to every default-deny engine, precisely because DuckDB
+    parses the identical `exp.Dot` node shape for its own, unrelated
+    struct-field-extraction syntax: `(s).x` on a `STRUCT`-typed column - the
+    shape a genuine analytics question over a struct column would actually
+    produce - must keep validating and executing under DuckDB's
+    `allowed_functions`, even though `"x"` (the field name) is nowhere in
+    that allowlist, which is exactly what a dialect-blind version of the fix
+    would have wrongly rejected.
+
+    (An inline struct *literal* receiver, e.g. `({'x': 1}).x`, is not used
+    here: sqlglot's `exp.Struct` is itself an `exp.Func` subclass whose
+    resolved name - `"struct"` - is not in `DuckDBEngine.allowed_functions`,
+    so a struct literal is independently rejected by the pre-existing
+    function-name gate regardless of this fix. That is unrelated,
+    pre-existing behaviour, not a regression this task introduced, so it is
+    not what this test is proving.)
+    """
+    db = tmp_path / "struct.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE t (s STRUCT(x INTEGER, y INTEGER))")
+    con.execute("INSERT INTO t VALUES ({'x': 1, 'y': 2})")
+    con.close()
+    engine = open_engine(f"duckdb://{db}")
+
+    sql = "SELECT (s).x FROM t"
+    assert is_safe_query(sql, engine=engine), f"wrongly rejected: {sql!r}"
+    result = engine.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok, f"{sql!r} failed to execute: {result.error}"
+    assert result.rows == [(1,)]
+
+
+def test_oid_cast_check_is_inert_for_duckdb(engine_with_table_t) -> None:
+    """Task 4 (2026-09-26) Bypass 2's fix (`safety._casts_to_object_
+    identifier_type`) rejects a cast whose target parses to `exp.
+    ObjectIdentifier` - PostgreSQL's `regclass`/`regrole`/etc. Verified live
+    (2026-09-19 dialect probe, re-confirmed 2026-09-26) that DuckDB has no
+    such types and parses the identical spelling as an ordinary
+    `exp.DataType(this=Type.USERDEFINED, kind="regclass")` instead, so this
+    check can never fire for a DuckDB-parsed statement. `CAST('x' AS
+    regclass)` is still correctly rejected here, but for an unrelated
+    reason - `"regclass"` naming no real DuckDB type keeps this from
+    executing regardless - which this test does not depend on; it only
+    proves `is_safe_query`'s verdict is unaffected by the new check's
+    presence by comparing behaviour is unchanged for an ordinary, harmless
+    cast DuckDB does support.
+    """
+    sql = "SELECT CAST(a AS BIGINT) FROM t"
+    assert is_safe_query(sql, engine=engine_with_table_t), f"wrongly rejected: {sql!r}"
+
+
+@pytest.fixture
+def analytics_db(tmp_path):
+    """A richer DuckDB fixture for Step 5's analytics corpus: dated orders
+    with a category, a status, a JSON metadata blob, and a list column, over
+    two customer regions - enough surface for grouping, date bucketing,
+    window functions, string cleaning, and list/JSON access to all have
+    something real to operate on.
+
+    `"order items"` (Fix 1 addition) is a table whose name needs quoting
+    because it contains a space - part of the corpus proving
+    `_references_unknown_table` accepts a real table under any legal
+    identifier, not just the single-word, no-quoting-needed names every
+    other table here happens to have.
+    """
+    db = tmp_path / "analytics.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute(
+        """
+        CREATE TABLE customers (
+            customer_id INTEGER PRIMARY KEY,
+            name VARCHAR,
+            region VARCHAR,
+            signup_date DATE
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE orders (
+            order_id INTEGER PRIMARY KEY,
+            customer_id INTEGER REFERENCES customers(customer_id),
+            order_date DATE,
+            category VARCHAR,
+            status VARCHAR,
+            amount DOUBLE,
+            tags VARCHAR[],
+            metadata VARCHAR
+        )
+        """
+    )
+    con.execute(
+        "INSERT INTO customers VALUES "
+        "(1, '  Alice Smith ', 'north', DATE '2023-01-15'), "
+        "(2, 'bob jones', 'south', DATE '2023-03-02'), "
+        "(3, 'Carla Diaz', 'north', DATE '2024-02-20')"
+    )
+    con.execute(
+        """
+        INSERT INTO orders VALUES
+        (1, 1, DATE '2024-01-05', 'widgets', 'completed', 100.0, ['sale', 'priority'],
+         '{"channel": "web", "coupon": null}'),
+        (2, 1, DATE '2024-01-20', 'gadgets', 'completed', 250.5, ['sale'],
+         '{"channel": "store"}'),
+        (3, 2, DATE '2024-02-10', 'widgets', 'refunded', 75.0, [],
+         '{"channel": "web"}'),
+        (4, 2, DATE '2024-02-15', 'gizmos', 'completed', 400.0, ['priority'],
+         '{"channel": "web", "coupon": "SPRING10"}'),
+        (5, 3, DATE '2024-02-28', 'widgets', 'completed', 60.25, ['sale'],
+         '{"channel": "store"}'),
+        (6, 3, DATE '2024-03-03', 'gadgets', 'pending', NULL, [],
+         '{"channel": "app"}'),
+        (7, 1, DATE '2024-03-10', 'gizmos', 'completed', 310.0, ['priority', 'sale'],
+         '{"channel": "app", "coupon": "APR5"}'),
+        (8, 2, DATE '2024-03-22', 'widgets', 'completed', 90.0, ['sale'],
+         '{"channel": "web"}')
+        """
+    )
+    con.execute('CREATE TABLE "order items" (item_id INTEGER PRIMARY KEY, order_id INTEGER)')
+    con.execute('INSERT INTO "order items" VALUES (1, 1), (2, 1), (3, 4)')
+    con.close()
+    return open_engine(f"duckdb://{db}")
+
+
+# Step 5: at least 40 realistic analytical questions over `analytics_db`,
+# spanning grouping, aggregation, window functions, date bucketing with
+# date_trunc, string cleaning, CASE, CTEs, COALESCE, and list/JSON access.
+# Every one of these must both pass `is_safe_query` and execute
+# successfully - a false rejection here costs a user an unanswerable
+# question, which the task brief treats as seriously as an attack leaking.
+ANALYTICS_CORPUS = [
+    "SELECT COUNT(*) FROM orders",
+    "SELECT category, COUNT(*) AS n FROM orders GROUP BY category ORDER BY n DESC",
+    "SELECT category, SUM(amount) AS total FROM orders GROUP BY category",
+    "SELECT category, AVG(amount) AS avg_amount FROM orders GROUP BY category",
+    "SELECT status, COUNT(*) AS n, SUM(amount) AS total FROM orders GROUP BY status",
+    "SELECT category, MIN(amount) AS lo, MAX(amount) AS hi FROM orders GROUP BY category",
+    "SELECT category, MEDIAN(amount) AS median_amount FROM orders GROUP BY category",
+    "SELECT category, STDDEV(amount) AS spread FROM orders GROUP BY category",
+    "SELECT category FROM orders GROUP BY category HAVING COUNT(*) > 1",
+    "SELECT COUNT(DISTINCT customer_id) FROM orders",
+    (
+        "SELECT c.region, SUM(o.amount) AS total FROM orders o "
+        "JOIN customers c ON c.customer_id = o.customer_id GROUP BY c.region"
+    ),
+    (
+        "SELECT c.name, COUNT(*) AS n FROM orders o JOIN customers c "
+        "ON c.customer_id = o.customer_id GROUP BY c.name ORDER BY n DESC"
+    ),
+    # Window functions
+    "SELECT order_id, amount, ROW_NUMBER() OVER (ORDER BY amount DESC) AS rnk FROM orders",
+    (
+        "SELECT order_id, category, amount, "
+        "RANK() OVER (PARTITION BY category ORDER BY amount DESC) AS category_rank FROM orders"
+    ),
+    (
+        "SELECT order_id, category, amount, "
+        "DENSE_RANK() OVER (PARTITION BY category ORDER BY amount DESC) AS drnk FROM orders"
+    ),
+    (
+        "SELECT order_id, order_date, amount, "
+        "SUM(amount) OVER (ORDER BY order_date) AS running_total FROM orders"
+    ),
+    (
+        "SELECT order_id, customer_id, order_date, "
+        "LAG(order_date) OVER (PARTITION BY customer_id ORDER BY order_date) AS prev_order "
+        "FROM orders"
+    ),
+    (
+        "SELECT order_id, customer_id, order_date, "
+        "LEAD(order_date) OVER (PARTITION BY customer_id ORDER BY order_date) AS next_order "
+        "FROM orders"
+    ),
+    "SELECT order_id, amount, NTILE(4) OVER (ORDER BY amount) AS quartile FROM orders",
+    (
+        "SELECT order_id, category, amount, "
+        "FIRST_VALUE(amount) OVER (PARTITION BY category ORDER BY order_date) AS first_in_cat "
+        "FROM orders"
+    ),
+    (
+        "SELECT customer_id, order_date, "
+        "PERCENT_RANK() OVER (ORDER BY order_date) AS pct FROM orders"
+    ),
+    # Date bucketing
+    "SELECT date_trunc('month', order_date) AS month, SUM(amount) FROM orders GROUP BY month",
+    "SELECT date_trunc('week', order_date) AS wk, COUNT(*) FROM orders GROUP BY wk ORDER BY wk",
+    "SELECT EXTRACT(year FROM order_date) AS yr, SUM(amount) FROM orders GROUP BY yr",
+    "SELECT EXTRACT(month FROM order_date) AS mo, COUNT(*) FROM orders GROUP BY mo",
+    "SELECT year(order_date) AS yr, month(order_date) AS mo, COUNT(*) FROM orders GROUP BY yr, mo",
+    "SELECT strftime(order_date, '%Y-%m') AS ym, SUM(amount) FROM orders GROUP BY ym",
+    "SELECT DATE_DIFF('day', signup_date, CURRENT_DATE) AS days_since_signup FROM customers",
+    "SELECT customer_id, DATEPART('quarter', order_date) AS q FROM orders",
+    # String cleaning
+    "SELECT TRIM(name) AS clean_name FROM customers",
+    "SELECT UPPER(TRIM(name)) AS clean_name FROM customers",
+    "SELECT LOWER(region) AS region_lc FROM customers",
+    "SELECT customer_id, LENGTH(TRIM(name)) AS name_length FROM customers",
+    "SELECT REPLACE(status, 'pending', 'in_progress') AS normalised_status FROM orders",
+    "SELECT SUBSTRING(TRIM(name), 1, 1) AS initial FROM customers",
+    "SELECT CONCAT_WS(' ', region, status) AS label FROM orders o JOIN customers c "
+    "ON c.customer_id = o.customer_id",
+    "SELECT STARTS_WITH(status, 'comp') AS is_completed_like FROM orders",
+    # CASE
+    (
+        "SELECT order_id, "
+        "CASE WHEN amount IS NULL THEN 'unknown' "
+        "WHEN amount > 200 THEN 'large' ELSE 'small' END AS size_bucket FROM orders"
+    ),
+    (
+        "SELECT category, "
+        "SUM(CASE WHEN status = 'completed' THEN amount ELSE 0 END) AS completed_total "
+        "FROM orders GROUP BY category"
+    ),
+    # COALESCE
+    "SELECT order_id, COALESCE(amount, 0) AS amount_or_zero FROM orders",
+    "SELECT order_id, COALESCE(amount, 0) * 1.1 AS with_tax FROM orders",
+    # CTEs
+    (
+        "WITH totals AS (SELECT category, SUM(amount) AS total FROM orders GROUP BY category) "
+        "SELECT * FROM totals WHERE total > 100"
+    ),
+    (
+        "WITH ranked AS ("
+        "SELECT order_id, category, amount, "
+        "ROW_NUMBER() OVER (PARTITION BY category ORDER BY amount DESC) AS rnk FROM orders"
+        ") SELECT * FROM ranked WHERE rnk = 1"
+    ),
+    (
+        "WITH monthly AS ("
+        "SELECT date_trunc('month', order_date) AS month, SUM(amount) AS total FROM orders "
+        "GROUP BY month"
+        ") SELECT month, total, total - LAG(total) OVER (ORDER BY month) AS delta FROM monthly"
+    ),
+    # List / JSON access
+    "SELECT order_id, tags FROM orders WHERE list_contains(tags, 'priority')",
+    "SELECT order_id, LIST_EXTRACT(tags, 1) AS first_tag FROM orders WHERE len(tags) > 0",
+    "SELECT order_id, json_extract_string(metadata, '$.channel') AS channel FROM orders",
+    "SELECT json_extract_string(metadata, '$.channel') AS channel, COUNT(*) FROM orders "
+    "GROUP BY channel",
+    "SELECT order_id, json_extract_string(metadata, '$.coupon') AS coupon FROM orders "
+    "WHERE json_extract_string(metadata, '$.coupon') IS NOT NULL",
+    # Table functions
+    "SELECT * FROM range(5)",
+    "SELECT * FROM generate_series(1, 5)",
+    "SELECT unnest(tags) AS tag FROM orders",
+    # Combined, closer to a realistic multi-clause business question
+    (
+        "SELECT c.region, date_trunc('month', o.order_date) AS month, "
+        "COUNT(*) AS n_orders, SUM(o.amount) AS total, AVG(o.amount) AS avg_amount "
+        "FROM orders o JOIN customers c ON c.customer_id = o.customer_id "
+        "WHERE o.status = 'completed' "
+        "GROUP BY c.region, month ORDER BY month, c.region"
+    ),
+    # Fix 1 additions (2026-09-19 review round): EXTRACT's and TRIM's own
+    # FROM keyword must not be mistaken for a table source by the new
+    # table-existence check; list_aggregate's dispatch argument must still
+    # work for a legitimately allowed target; a schema-qualified `main.<table>`
+    # reference and a space-quoted table name must both resolve as real.
+    "SELECT EXTRACT(YEAR FROM DATE '2024-01-01') AS yr",
+    "SELECT customer_id, TRIM(BOTH ' ' FROM name) AS clean_name FROM customers",
+    "SELECT order_id, list_aggregate(tags, 'count') AS tag_count FROM orders",
+    "SELECT COUNT(*) FROM main.orders",
+    'SELECT COUNT(*) FROM "order items"',
+    # False-rejection fix (2026-09-26 review round): sqlglot parses `AND`,
+    # `OR` and `EXISTS` as `exp.Func` subclasses, which the default-deny
+    # function-name gate previously rejected outright since `"and"`/`"or"`/
+    # `"exists"` are not - and structurally cannot be - entries in
+    # `allowed_functions`. These shapes are what the corpus missed before
+    # this fix: a multi-condition `WHERE` joined by `AND`, one joined by
+    # `OR`, and an `EXISTS` subquery predicate. See `safety.
+    # _PURE_SYNTAX_FUNC_TYPES` for the structural fix and why it is not a
+    # three-name addition to this file's own allowlist instead.
+    "SELECT order_id FROM orders WHERE amount > 50 AND status = 'completed'",
+    "SELECT order_id FROM orders WHERE status = 'refunded' OR status = 'pending'",
+    (
+        "SELECT c.name FROM customers c WHERE EXISTS "
+        "(SELECT 1 FROM orders o WHERE o.customer_id = c.customer_id)"
+    ),
+]
+
+
+# Task 4, Bypass 3 (2026-09-26): the PostgreSQL-only column rules must be
+# provably inert here, not merely assumed to be. DuckDB has no `alias.name`
+# -> `name(alias)` sugar, so applying either rule to DuckDB could only cost
+# false rejections - a DuckDB struct/JSON access legitimately writes
+# `alias.field` for arbitrary user-chosen field names that are not columns of
+# anything.
+
+
+def test_duckdbs_dialect_is_deliberately_outside_the_dot_call_dialects():
+    """The inertness pin, and the reason it is a test rather than a comment:
+    `safety._DOT_CALL_DIALECTS` is what keeps all three of PostgreSQL's
+    dotted-notation rules off DuckDB. Adding `"duckdb"` to that set - or
+    renaming `DuckDBEngine.sqlglot_dialect` to something already in it -
+    would silently subject every DuckDB struct access to a column-existence
+    check it cannot pass.
+    """
+    assert DuckDBEngine.sqlglot_dialect not in _safety._DOT_CALL_DIALECTS
+
+
+def test_duckdb_table_columns_reports_each_table_separately(analytics_db):
+    """`Engine.table_columns()` is implemented for DuckDB even though
+    `is_safe_query` never calls it here - same principle as `table_names`,
+    and pinned so the implementation cannot rot unnoticed behind the dialect
+    gate above. Keyed per table spelling rather than unioned, matching the
+    2026-09-26 contract change that closed the regression on PostgreSQL.
+    """
+    columns = analytics_db.table_columns()
+    assert {"order_id", "customer_id", "amount", "order_date", "tags"} <= columns["orders"]
+    assert columns["main.orders"] == columns["orders"]
+
+
+def test_duckdb_struct_field_access_is_not_treated_as_a_column_call(tmp_path):
+    """The concrete cost the dialect gate avoids, against a real STRUCT
+    column: `x.s.b` parses to exactly the `exp.Column` shape PostgreSQL's
+    Bypass 3 rules key on, but `b` is a struct field - arbitrary user data,
+    never a column of any table. A blanket column-existence rule would
+    reject it. It must still validate *and* execute here.
+    """
+    db = tmp_path / "structs.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE t (s STRUCT(b INTEGER))")
+    con.execute("INSERT INTO t VALUES ({'b': 7})")
+    con.close()
+    engine = open_engine(f"duckdb://{db}")
+
+    sql = "SELECT x.s.b FROM t x"
+    assert is_safe_query(sql, engine=engine), f"wrongly rejected: {sql!r}"
+    result = engine.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok, result.error
+    assert result.rows == [(7,)]
+
+
+# Final whole-phase review, 2026-09-26. The PostgreSQL half of this phase
+# added `"collate"` to `PostgresEngine.allowed_functions` with a comment
+# explaining that `exp.Collate` is an `exp.Func` subclass wrongly refused by
+# default-deny. Every word of that applies to DuckDB, which also uses
+# default-deny and also supports `COLLATE` - the entry was simply never
+# mirrored. Sweeping the whole set difference (`PostgresEngine.
+# allowed_functions - DuckDBEngine.allowed_functions`) turned up one more of
+# the same kind, `current_timestamp` (`exp.CurrentTimestamp`, also pure
+# grammar, also an `exp.Func` subclass), and one that is *not*: `initcap`,
+# which DuckDB genuinely does not register (`Catalog Error: Scalar Function
+# with name initcap does not exist`, verified 2026-09-26) and which therefore
+# correctly stays off this list.
+_PURE_GRAMMAR_PARSED_AS_A_FUNCTION: list[tuple[str, str]] = [
+    ("collate", "SELECT name FROM customers ORDER BY name COLLATE NOCASE"),
+    ("current_timestamp", "SELECT CURRENT_TIMESTAMP AS t FROM customers"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,sql",
+    _PURE_GRAMMAR_PARSED_AS_A_FUNCTION,
+    ids=[label for label, _ in _PURE_GRAMMAR_PARSED_AS_A_FUNCTION],
+)
+def test_pure_grammar_parsed_as_a_function_is_allowed(analytics_db, label, sql):
+    """Both spellings are SQL grammar rather than a call to any DuckDB
+    catalogue entry, and DuckDB itself runs both - so a refusal here is a
+    pure false rejection. Validated *and* executed, because the whole reason
+    the gap existed is that nothing previously ran these through the real
+    engine.
+    """
+    assert is_safe_query(sql, engine=analytics_db), f"wrongly rejected ({label}): {sql!r}"
+    result = analytics_db.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok, f"{sql!r} failed to execute: {result.error}"
+
+
+def test_allowlist_parity_with_postgres_is_deliberate():
+    """The set difference above is a decision, not drift. Anything
+    PostgreSQL allows and DuckDB does not must be a name DuckDB genuinely
+    lacks - if a third pure-grammar node ever lands here, this fails rather
+    than silently costing users a legal query.
+    """
+    from text_to_sql_agent.engines.postgres import PostgresEngine
+
+    assert PostgresEngine.allowed_functions is not None
+    assert DuckDBEngine.allowed_functions is not None
+    only_postgres = PostgresEngine.allowed_functions - DuckDBEngine.allowed_functions
+    assert only_postgres == {"initcap"}
+
+
+def test_analytics_corpus_size_is_at_least_forty():
+    """Guards the corpus itself, not just what it proves - a corpus that
+    silently shrank below the brief's stated floor would make every other
+    assertion about it in the task report false.
+    """
+    assert len(ANALYTICS_CORPUS) >= 40
+
+
+@pytest.mark.parametrize("sql", ANALYTICS_CORPUS)
+def test_analytics_corpus_passes_validation_and_executes(analytics_db, sql):
+    """Step 5: every query in `ANALYTICS_CORPUS` must both pass `is_safe_query`
+    and actually execute against a real DuckDB database - the two are
+    checked separately so a failure names which side broke.
+    """
+    assert is_safe_query(sql, engine=analytics_db), f"wrongly rejected: {sql!r}"
+    result = analytics_db.execute(sql, max_rows=1000, work_limit=0)
+    assert result.ok, f"{sql!r} failed to execute: {result.error}"
+
+
+# Fix 2 (2026-09-19 review round): `_references_unknown_table` used to collect
+# every `exp.CTE` alias across the whole parsed tree, unscoped. DuckDB scopes
+# CTEs like any other SQL engine, so an inner `WITH`'s alias leaking into an
+# outer sibling reference let a query like the one below sail through the
+# validator while DuckDB itself performs a real replacement scan (file read)
+# on the outer reference. `_visible_cte_names` now walks the AST ancestor
+# chain instead, admitting a CTE's alias only where DuckDB would actually
+# resolve a reference to it. Every test below was checked against a real,
+# live DuckDB connection - either through the app's own engine (`is_safe_query`
+# plus `engine.execute`) or, where the point is specifically to show what an
+# *unscoped* reference resolves to, a bare `duckdb.connect` with external
+# access left at its default (enabled), reading a real file from `tmp_path`.
+
+
+def test_reviewer_reproduction_is_rejected(engine_with_table_t):
+    """The exact reproduction from the task brief: an inner CTE named like a
+    file path must not leak into the outer, sibling table reference of the
+    same name - `_references_unknown_table` must reject this regardless of
+    `enable_external_access`, which is a second, independent defence and must
+    not be the only thing standing between this query and a real file read.
+    """
+    sql = """
+        SELECT * FROM (
+          WITH "/tmp/x/leak.csv" AS (SELECT 1 AS a) SELECT * FROM "/tmp/x/leak.csv"
+        ) x, "/tmp/x/leak.csv"
+    """
+    assert not is_safe_query(sql, engine=engine_with_table_t)
+
+
+@pytest.fixture
+def leaking_csv_pair(tmp_path):
+    """Two real CSV files, each with content distinguishable from the other
+    and from any CTE body used in the tests below, plus their absolute paths
+    quoted for direct use in SQL. Backs the raw-`duckdb.connect` probes that
+    show what DuckDB does with a table reference that does *not* resolve to
+    a CTE: with external access left enabled (unlike the app's own engine),
+    DuckDB's replacement scan actually reads the file, and the returned rows
+    prove it rather than merely asserting it.
+    """
+    leak = tmp_path / "leak.csv"
+    leak.write_text("k,v\nleaked,secret\n", encoding="utf-8")
+    later = tmp_path / "later.csv"
+    later.write_text("k,v\nlater,fromfile\n", encoding="utf-8")
+    return leak, later
+
+
+def test_cte_not_visible_outside_owning_query(leaking_csv_pair, engine_with_table_t):
+    """Rule 2: a CTE is visible in the `WITH`'s own main query, but NOT
+    outside the query that owns the `WITH` - the reviewer's case, generalised
+    to a real file so the "what does DuckDB actually do" half is provable
+    rather than assumed.
+
+    Real DuckDB (external access enabled) resolves the *inner* reference
+    against the CTE (the file's real content, `('leaked', 'secret')`, never
+    appears) but performs a genuine replacement scan for the *outer* one,
+    returning the file's real row. `is_safe_query` must reject the query
+    outright - it cannot approve a query on the strength of the inner
+    resolution while the outer one silently reads a file.
+    """
+    leak, _later = leaking_csv_pair
+    sql = f"""
+        SELECT * FROM (
+          WITH '{leak}' AS (SELECT 1 AS a) SELECT * FROM '{leak}'
+        ) x, '{leak}'
+    """
+    con = duckdb.connect(":memory:")
+    try:
+        rows = con.execute(sql).fetchall()
+    finally:
+        con.close()
+    assert rows == [(1, "leaked", "secret")], (
+        "sanity check: DuckDB must actually perform a replacement scan for the outer "
+        f"reference, proving the inner CTE's name does not leak outward; got {rows!r}"
+    )
+    assert not is_safe_query(sql, engine=engine_with_table_t)
+
+
+def test_cte_forward_reference_is_not_visible(leaking_csv_pair, engine_with_table_t):
+    """Rule 3: within one `WITH` list, a CTE is visible only to CTEs defined
+    *after* it, not before. Checked against real DuckDB rather than assumed:
+    the first CTE here (aliased to the `leak.csv` path) references the
+    second CTE's alias (the `later.csv` path) before it is defined.
+
+    Real DuckDB does not resolve the forward reference against the sibling
+    CTE at all - it falls straight through to a replacement scan on the
+    path, returning `later.csv`'s real file content
+    (`('later', 'fromfile')`). `is_safe_query` must agree and reject.
+    """
+    leak, later = leaking_csv_pair
+    sql = f"""
+        WITH '{leak}' AS (SELECT * FROM '{later}'), '{later}' AS (SELECT 1 AS x)
+        SELECT * FROM '{leak}'
+    """
+    con = duckdb.connect(":memory:")
+    try:
+        rows = con.execute(sql).fetchall()
+    finally:
+        con.close()
+    assert rows == [("later", "fromfile")], (
+        "sanity check: DuckDB must treat the forward reference as unresolved and read "
+        f"the file instead; got {rows!r}"
+    )
+    assert not is_safe_query(sql, engine=engine_with_table_t)
+
+
+def test_cte_backward_reference_is_visible_and_executes(engine_with_table_t):
+    """Rule 3, the legitimate half: a CTE defined *after* an earlier one may
+    still reference that earlier one - ordinary, common SQL
+    (`WITH a AS (...), b AS (SELECT * FROM a) SELECT * FROM b`) that the
+    scoped visibility check must not start rejecting.
+    """
+    sql = "WITH later AS (SELECT 1 AS x), leak AS (SELECT * FROM later) SELECT * FROM leak"
+    assert is_safe_query(sql, engine=engine_with_table_t)
+    result = engine_with_table_t.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok and result.rows == [(1,)], result.error
+
+
+def test_cte_visible_in_nested_subquery_of_main_query(engine_with_table_t):
+    """Rule 1: a CTE is visible in its `WITH`'s main query, including inside
+    a subquery nested in that main query - not just a direct
+    `FROM <cte alias>` at the top level of the main query.
+    """
+    sql = "WITH totals AS (SELECT 1 AS a) SELECT * FROM (SELECT * FROM totals) x"
+    assert is_safe_query(sql, engine=engine_with_table_t)
+    result = engine_with_table_t.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok and result.rows == [(1,)], result.error
+
+
+def test_recursive_cte_is_visible_in_its_own_body(engine_with_table_t):
+    """Rule 4: a `WITH RECURSIVE` CTE is visible inside its own body - the
+    self-reference that makes recursion possible at all must not be rejected
+    as an unknown table.
+    """
+    sql = (
+        "WITH RECURSIVE counter AS ("
+        "SELECT 1 AS n UNION ALL SELECT n + 1 FROM counter WHERE n < 5"
+        ") SELECT * FROM counter ORDER BY n"
+    )
+    assert is_safe_query(sql, engine=engine_with_table_t)
+    result = engine_with_table_t.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok and result.rows == [(1,), (2,), (3,), (4,), (5,)], result.error
+
+
+def test_inner_cte_shadows_outer_of_the_same_name(engine_with_table_t):
+    """Rule 5: an inner CTE with the same name as an outer one shadows it
+    within the inner scope - checked against real DuckDB's own resolution
+    (the inner definition's value, 2, not the outer's, 1) so the test proves
+    shadowing rather than merely a name being "some" visible CTE.
+    """
+    sql = "WITH x AS (SELECT 1 AS a) SELECT * FROM (WITH x AS (SELECT 2 AS a) SELECT * FROM x) y"
+    con = duckdb.connect(":memory:")
+    try:
+        rows = con.execute(sql).fetchall()
+    finally:
+        con.close()
+    assert rows == [(2,)], f"sanity check: the inner CTE must shadow the outer one; got {rows!r}"
+    assert is_safe_query(sql, engine=engine_with_table_t)
+    result = engine_with_table_t.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok and result.rows == [(2,)], result.error
+
+
+def test_cte_referenced_directly_from_main_query_executes(engine_with_table_t):
+    """The baseline legitimate case every rule above is a variation on: a CTE
+    referenced straight from its own `WITH`'s main query, over a real table.
+    """
+    sql = "WITH c AS (SELECT a FROM t) SELECT * FROM c"
+    assert is_safe_query(sql, engine=engine_with_table_t)
+    result = engine_with_table_t.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok, result.error
+
+
+def test_cte_scoping_fix_is_load_bearing(monkeypatch, engine_with_table_t):
+    """Proves Fix 2 actually matters: monkeypatches `_visible_cte_names` back
+    to the pre-fix behaviour (every CTE alias in the whole parsed tree,
+    unscoped) and confirms the reviewer's reproduction is then wrongly
+    approved - then leaves the monkeypatch to be undone automatically at
+    teardown, restoring the real, scoped implementation.
+    """
+
+    def _unscoped_cte_names(table: exp.Table, **_kwargs: object) -> frozenset[str]:
+        parsed = table
+        while parsed.parent is not None:
+            parsed = parsed.parent
+        return frozenset((cte.alias or "").lower() for cte in parsed.find_all(exp.CTE))
+
+    sql = """
+        SELECT * FROM (
+          WITH "/tmp/x/leak.csv" AS (SELECT 1 AS a) SELECT * FROM "/tmp/x/leak.csv"
+        ) x, "/tmp/x/leak.csv"
+    """
+    # Sanity check first: the real, fixed implementation rejects this.
+    assert not is_safe_query(sql, engine=engine_with_table_t)
+
+    monkeypatch.setattr(_safety, "_visible_cte_names", _unscoped_cte_names)
+    assert is_safe_query(sql, engine=engine_with_table_t), (
+        "the pre-fix, unscoped CTE collection was expected to wrongly approve the "
+        "reviewer's reproduction - if this fails, the fix may no longer be load-bearing "
+        "for this case"
+    )
+
+
+# --- Cross-schema regression tests (Codex review, 2026-09-21) ---
+#
+# These two fixtures are the reviewer's live reproductions of the two failures
+# a non-`main` table caused: a `BinderException` while building the schema at
+# all (a duplicate table name across schemas, read through an unqualified
+# value-hint query), and an "advertised then blocked" inversion where the
+# model was shown a table the validator would never accept.
+#
+# The 2026-09-25 fix answered both by narrowing every layer to `main`
+# (`docs/3_decisions.md`), and these tests then asserted that narrow contract.
+# Phase 3b Task 6 replaced it with schema-qualified identity, so they are
+# **updated, not deleted**: the fixtures are unchanged, and what they now
+# assert is that the crash still does not happen and that both tables are
+# reachable under their qualified names. Preserving the crash reproduction is
+# the point - a future refactor of the value-hint or chunk-keying code must
+# still hit it here.
+
+
+@pytest.fixture
+def cross_schema_duplicate_name_db(tmp_path, monkeypatch):
+    """`main.shared` and `analytics.shared`, same table name, disjoint columns.
+
+    Reproduces the reviewer's live probe: a value-hint query for
+    `analytics.shared`'s `analytics_only` column, issued unqualified, resolves
+    to `main.shared` (found first on the default search path) and raises
+    `duckdb.BinderException` because that column does not exist there.
+
+    Schema scope became opt-in after this fixture was written (owner
+    decision, 2026-09-26): DuckDB has no privilege model to fall back on, so
+    `AIPA_EXTRA_SCHEMAS` is the only gate on `analytics` being read at all.
+    `monkeypatch.setenv` here opts it in so the fixture still reproduces the
+    scenario it was built for, rather than the schema simply being invisible.
+    """
+    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "analytics")
+    db = tmp_path / "dup.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE main.shared (main_only INTEGER)")
+    con.execute("INSERT INTO main.shared VALUES (1)")
+    con.execute("CREATE SCHEMA analytics")
+    con.execute("CREATE TABLE analytics.shared (analytics_only VARCHAR)")
+    con.execute("INSERT INTO analytics.shared VALUES ('x')")
+    con.close()
+    return open_engine(f"duckdb://{db}")
+
+
+def test_duplicate_table_name_across_schemas_does_not_crash_schema_building(
+    cross_schema_duplicate_name_db,
+):
+    """At BASE (pre-2026-09-25): `engine.table_names()` (which routes through
+    `schema_chunks()`) raised `duckdb.BinderException: Referenced column
+    "analytics_only" not found in FROM clause!` while querying value hints for
+    the unqualified, ambiguous `shared` table.
+
+    It still must not, and now for a reason that keeps both tables: every
+    catalogue map is keyed by `(schema, table)` so the two never merge, and
+    `_value_hints_for_table` qualifies its own `FROM` so it reads the table it
+    was asked about rather than whichever the search path finds first. Both
+    `shared` tables are present, each with its own columns and hints, and each
+    reachable under exactly one spelling: `main.shared` also answers to bare
+    `shared` (the engine resolves it that way), `analytics.shared` does not.
+    """
+    engine = cross_schema_duplicate_name_db
+    names = engine.table_names()
+    assert names == frozenset({"shared", "main.shared", "analytics.shared"})
+
+    chunks = {c.qualified_name: c for c in engine.schema_chunks()}
+    assert set(chunks) == {"shared", "analytics.shared"}
+    assert chunks["shared"].columns == ["main_only"]
+    assert chunks["shared"].schema_name == ""
+    assert chunks["analytics.shared"].columns == ["analytics_only"]
+    assert chunks["analytics.shared"].schema_name == "analytics"
+    # The value hint proves the qualified read landed on the right table: `x`
+    # is a row of `analytics.shared` only, and asking `main.shared` for
+    # `analytics_only` is the exact `BinderException` this test reproduces.
+    assert chunks["shared"].value_hints == {}
+    assert chunks["analytics.shared"].value_hints == {"analytics_only": ["x"]}
+
+    assert is_safe_query("SELECT main_only FROM shared", engine=engine)
+    assert is_safe_query("SELECT main_only FROM main.shared", engine=engine)
+    assert is_safe_query("SELECT analytics_only FROM analytics.shared", engine=engine)
+    assert engine.execute(
+        "SELECT analytics_only FROM analytics.shared", max_rows=10, work_limit=0
+    ).rows == [("x",)]
+
+
+@pytest.fixture
+def non_main_schema_only_db(tmp_path, monkeypatch):
+    """`analytics.sales` exists; `main.sales` does not.
+
+    Reproduces the reviewer's second failure: before the 2026-09-25 fix,
+    `raw_schema()` advertised `sales` to the model and `table_names()`
+    returned it, but the validator (`main`-only) rejected the qualified query
+    the model should have needed and, after wrongly approving the unqualified
+    form, the query failed against the real database anyway.
+
+    Opts `analytics` in via `AIPA_EXTRA_SCHEMAS` - see `cross_schema_
+    duplicate_name_db`'s docstring for why, now that schema scope is opt-in.
+    """
+    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "analytics")
+    db = tmp_path / "nonmain.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE SCHEMA analytics")
+    con.execute("CREATE TABLE analytics.sales (amt INTEGER)")
+    con.execute("INSERT INTO analytics.sales VALUES (10)")
+    con.close()
+    return open_engine(f"duckdb://{db}")
+
+
+def test_table_outside_main_is_advertised_and_accepted_only_when_qualified(
+    non_main_schema_only_db,
+):
+    """At BASE (pre-2026-09-25): `raw_schema()` mentioned `sales` and
+    `table_names()` returned it, yet `is_safe_query("SELECT amt FROM
+    analytics.sales", ...)` was `False` (the correct, schema-qualified query
+    blocked) while `is_safe_query("SELECT amt FROM sales", ...)` was wrongly
+    `True` even though executing it raises `CatalogException` (no `main.sales`
+    exists). 2026-09-25 answered that by hiding the table; Task 6 answers it
+    by making all three layers agree on one spelling.
+
+    The inversion is what must never come back, in either direction: the
+    spelling that is advertised is the spelling that validates *and* runs, and
+    the spelling that cannot run is the one refused. `docs/3_decisions.md`'s
+    stated cost - "a DuckDB database whose tables all live outside `main` now
+    presents an empty schema and answers `UNANSWERABLE_WITH_GIVEN_SCHEMA`" -
+    is paid off by the first two assertions.
+    """
+    engine = non_main_schema_only_db
+    assert "sales" in engine.raw_schema()
+    assert "analytics.sales" in engine.table_names()
+    assert "sales" not in engine.table_names()
+    assert is_safe_query("SELECT amt FROM analytics.sales", engine=engine)
+    assert engine.execute("SELECT amt FROM analytics.sales", max_rows=10, work_limit=0).rows == [
+        (10,)
+    ]
+    # The bare form stays refused because it stays unrunnable: DuckDB resolves
+    # it against `main`, which has no `sales`.
+    assert not is_safe_query("SELECT amt FROM sales", engine=engine)
+    with pytest.raises(duckdb.CatalogException):
+        engine.execute("SELECT amt FROM sales", max_rows=10, work_limit=0)
+
+
+# --- Schema scope is opt-in (2026-09-26 owner decision) ---------------------
+#
+# DuckDB has no privilege model the way PostgreSQL does (`_user_schema_names`,
+# `has_schema_privilege`) - opening the file grants access to every schema in
+# it - so `AIPA_EXTRA_SCHEMAS` is the *only* gate here, not a second one
+# alongside a grant check. `non_main_schema_only_db`/
+# `cross_schema_duplicate_name_db` above already prove the opted-in case
+# (they opt `analytics` in via `monkeypatch.setenv`); these prove the default
+# (not opted in) and the cache-invalidation half.
+
+
+def test_a_schema_outside_main_is_not_advertised_without_opting_in(tmp_path, monkeypatch):
+    """The safe default: a schema nobody opted into is invisible everywhere
+    and a qualified query against it is refused, even though nothing in
+    DuckDB itself would stop the read - unlike PostgreSQL, there is no grant
+    for a deployment to have forgotten; the opt-in is the whole guard.
+    """
+    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    db = tmp_path / "not_opted_in.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE SCHEMA analytics")
+    con.execute("CREATE TABLE analytics.sales (amt INTEGER)")
+    con.execute("INSERT INTO analytics.sales VALUES (10)")
+    con.close()
+
+    engine = open_engine(f"duckdb://{db}")
+    assert "sales" not in engine.raw_schema()
+    assert "analytics.sales" not in engine.table_names()
+    assert {c.table_name for c in engine.schema_chunks()} == set()
+    assert not is_safe_query("SELECT amt FROM analytics.sales", engine=engine)
+
+
+def test_duckdb_schema_fingerprint_changes_when_the_opted_in_set_changes(tmp_path, monkeypatch):
+    """`AIPA_EXTRA_SCHEMAS` is process configuration the DuckDB file itself
+    never records, so neither its mtime nor its size changes when the opt-in
+    set does - see `DuckDBEngine.schema_fingerprint`'s docstring for why the
+    config is hashed in directly rather than relying on the file to reflect
+    it. Without this, `schema.py`'s cache would keep serving the pre-change
+    schema to a process whose opt-in set had already changed.
+    """
+    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    db = tmp_path / "fingerprint_opt_in.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE SCHEMA analytics")
+    con.execute("CREATE TABLE analytics.sales (amt INTEGER)")
+    con.close()
+
+    before = open_engine(f"duckdb://{db}").schema_fingerprint()
+    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "analytics")
+    after = open_engine(f"duckdb://{db}").schema_fingerprint()
+
+    assert after != before
+
+
+def test_internal_schema_filter_arity_tracks_internal_schemas_length(tmp_path, monkeypatch):
+    """Review finding (2026-09-26): `raw_schema()`/`schema_chunks()` used to
+    spell `"schema_name NOT IN (?, ?)"` literally - a placeholder count that
+    only happened to match `_INTERNAL_SCHEMAS`'s length of two. Growing that
+    tuple to three without touching either SQL string would raise
+    `duckdb.Error` (a bind parameter/placeholder count mismatch) at query
+    time, with every other test in this suite still green, because nothing
+    else exercises a three-entry `_INTERNAL_SCHEMAS`. This monkeypatches it
+    to three and proves both call sites still run.
+    """
+    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    db = tmp_path / "arity.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE customers (id INTEGER)")
+    con.close()
+
+    monkeypatch.setattr(
+        _duckdb_engine_module,
+        "_INTERNAL_SCHEMAS",
+        ("information_schema", "pg_catalog", "a_third_internal_schema"),
+    )
+    engine = open_engine(f"duckdb://{db}")
+    assert "customers" in engine.raw_schema()
+    assert {c.table_name for c in engine.schema_chunks()} == {"customers"}
+
+
+def test_duckdb_default_work_limit_is_5000_ms() -> None:
+    """DuckDB's budget is wall-clock milliseconds, not SQLite's VM-step count.
+
+    Pinned because `execute_query` resolves a caller-omitted limit from this
+    attribute: before `Engine.default_work_limit` existed, every engine got
+    SQLite's `DEFAULT_MAX_VM_STEPS` (100_000) verbatim, which a millisecond
+    engine reads as a 100-second timeout. PostgreSQL and SQLite both carry
+    the same pin; this one closes the third corner.
+    """
+    assert DuckDBEngine.default_work_limit == 5000
+
+
+def test_a_slow_duckdb_query_aborts_near_5_seconds_not_100(tmp_path: Path) -> None:
+    """The default resolves end-to-end through `execute_query`, not just as an
+    attribute. A query with no row cap to hit and no error to raise must come
+    back as a typed abort code well inside the old 100-second budget.
+    """
+    db = tmp_path / "slow.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE t AS SELECT * FROM range(3000000) AS r(i)")
+    con.close()
+
+    started = time.monotonic()
+    result = execute_query(
+        f"duckdb://{db}",
+        "SELECT COUNT(*) FROM t a JOIN t b ON a.i % 7 = b.i % 7",
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.error == "QUERY_ABORTED_AFTER_5000_MS", result.error
+    assert elapsed < 30, f"took {elapsed:.1f}s - the default did not apply"

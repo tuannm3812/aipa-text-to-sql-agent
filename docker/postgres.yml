@@ -1,0 +1,24 @@
+# Local PostgreSQL for the engine tests. CI uses a service container instead;
+# both create the same aipa_ro role via postgres-init.sql.
+#
+#   docker compose -f docker/postgres.yml up -d
+#   export AIPA_TEST_POSTGRES_DSN=postgresql://aipa_ro:aipa_ro_pw@127.0.0.1:55432/aipa
+#   uv run pytest
+#
+# Credentials here are local-only test values and are deliberately committed;
+# nothing in this file is used by the app or the hosted demo.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: aipa
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "55432:5432"
+    volumes:
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d aipa"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

@@ -1,22 +1,31 @@
+"""SQL generation via Gemini or Ollama, given a question and a database schema."""
+
 from __future__ import annotations
 
 import os
 import re
-from typing import Any
+from typing import Any, cast
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_OLLAMA_MODEL, DEFAULT_PROVIDER
+from .engines import Engine
+from .engines.sqlite import SQLiteEngine
 from .env import load_env
 from .gemini_manager import get_default_gemini_manager
 
-SQL_TRANSLATION_SYSTEM_PROMPT = """\
+# Placeholders swapped for one engine's prompt fragments by `_assemble_prompt`.
+# Each is unique within `_PROMPT_BODY`, so `str.replace` cannot touch anything
+# else. `_DIALECT_NAME_PLACEHOLDER` appears twice (the job statement and the
+# case-insensitivity rule); `str.replace` substitutes both occurrences with
+# the same engine name, which is what both call sites want.
+_DIALECT_PLACEHOLDER = "{{DIALECT_SECTION}}"
+_DIALECT_NAME_PLACEHOLDER = "{{DIALECT_NAME}}"
+_ENGINE_RULES_PLACEHOLDER = "{{ENGINE_RULES_BLOCK}}"
+
+_PROMPT_BODY = """\
 You are an expert data analyst and SQL translator.
-Your ONLY job is to translate the user's question into a SINGLE SQLite SELECT query.
+Your ONLY job is to translate the user's question into a SINGLE {{DIALECT_NAME}} SELECT query.
 
-SQLITE DIALECT (must follow):
-- Generate SQLite-compatible SQL only.
-- Do NOT use EXTRACT, DATE_TRUNC, ILIKE, INTERVAL, FILTER, DISTINCT ON.
-- For dates/timestamps use SQLite functions like: strftime('%Y', col), strftime('%Y-%m', col), date(col), datetime(col).
-
+{{DIALECT_SECTION}}
 If the question cannot be answered using the schema, output exactly:
 SELECT 'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error;
 
@@ -33,11 +42,9 @@ Rules (must follow):
 - Do NOT use any data-modifying statements: INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, REPLACE, TRUNCATE, VACUUM, PRAGMA, ATTACH, DETACH.
 - Do NOT repeat or restate the schema/DDL. Never output CREATE TABLE or column lists.
 - Output must start with SELECT (or WITH) and contain exactly one query.
-- Do NOT reference sqlite_master or any internal SQLite tables.
-- Prefer simple SQL compatible with SQLite.
-
+{{ENGINE_RULES_BLOCK}}
 *** CRITICAL TEXT SEARCHING RULES ***
-1. CASE INSENSITIVITY: SQLite '=' is case-sensitive. Whenever you filter by text, you MUST make it case-insensitive. Use `LOWER(column) = LOWER('value')` or `LIKE`.
+1. CASE INSENSITIVITY: {{DIALECT_NAME}} '=' is case-sensitive. Whenever you filter by text, you MUST make it case-insensitive. Use `LOWER(column) = LOWER('value')` or `LIKE`.
 2. PARTIAL MATCHES: When a user searches for a location, venue, or keyword (e.g., 'bathurst' or 'marine rescue'), assume it is a partial match. ALWAYS use `LIKE '%keyword%'` to search within fields like addresses, names, or descriptions.
 
 ADDITIONAL RULES - DIFFERENCE / DELTA QUESTIONS (must follow):
@@ -56,10 +63,41 @@ ADDITONAL RULES - COMPARATIVE QUESTIONS (must follow):
 """
 
 
+def _assemble_prompt(dialect_section: str, dialect_name: str, engine_rules_block: str) -> str:
+    """Build the system prompt for one engine's dialect.
+
+    Args:
+        dialect_section: The engine's `prompt_dialect_section` - its own
+            labelled block (e.g. "SQLITE DIALECT (must follow): ...").
+        dialect_name: The engine's `prompt_dialect_name` (e.g. "SQLite"),
+            substituted everywhere `_PROMPT_BODY` names the target dialect
+            inline, outside the labelled section.
+        engine_rules_block: The engine's `prompt_engine_rules_block` - the
+            internals/compatibility bullet rules that must name the target
+            engine's own internal tables, not another engine's.
+    """
+    return (
+        _PROMPT_BODY.replace(_DIALECT_PLACEHOLDER, dialect_section)
+        .replace(_DIALECT_NAME_PLACEHOLDER, dialect_name)
+        .replace(_ENGINE_RULES_PLACEHOLDER, engine_rules_block)
+    )
+
+
+# SQLite's assembled prompt, unchanged by the split above: a sha256 test pins
+# this exact value because every evaluation figure this project has reported
+# was produced under this text.
+SQL_TRANSLATION_SYSTEM_PROMPT = _assemble_prompt(
+    SQLiteEngine.prompt_dialect_section,
+    SQLiteEngine.prompt_dialect_name,
+    SQLiteEngine.prompt_engine_rules_block,
+)
+
+
 def _load_gemini_sdk() -> tuple[str, Any, Any | None]:
     try:
-        from google import genai  # type: ignore
-        from google.genai import types  # type: ignore
+        from google import genai
+        from google.genai import types
+
         return "google-genai", genai, types
     except ModuleNotFoundError as e:  # pragma: no cover
         try:
@@ -73,8 +111,8 @@ def _load_gemini_sdk() -> tuple[str, Any, Any | None]:
 
 def _load_ollama_sdk() -> tuple[Any, Any, Any]:
     try:
-        from langchain_ollama import ChatOllama  # type: ignore
-        from langchain_core.messages import HumanMessage, SystemMessage  # type: ignore
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from langchain_ollama import ChatOllama
     except ModuleNotFoundError as e:  # pragma: no cover
         raise ModuleNotFoundError(
             "Ollama support requires langchain-ollama and langchain-core. "
@@ -92,65 +130,61 @@ def _extract_sql_from_text(raw_output: str) -> str:
     )
     for block in blocks:
         if re.search(r"(?is)^\s*(SELECT|WITH)\b", block):
-            return block.strip()
+            return cast(str, block.strip())
     if blocks:
-        return blocks[0].strip()
+        return cast(str, blocks[0].strip())
 
     match = re.search(r"(?is)\b(SELECT|WITH)\b.*?;?$", raw_output)
     if match:
-        return raw_output[match.start():].strip()
+        return raw_output[match.start() :].strip()
     return raw_output
 
 
-def generate_sql(
-    user_question: str,
-    schema_text: str,
-    *,
-    model_name: str = DEFAULT_MODEL_NAME,
-    provider: str | None = None,
-) -> str:
-    """Call Gemini or Ollama to generate SQLite SQL from a question and schema."""
-    load_env()
-    selected_provider = (provider or os.environ.get("TEXT_TO_SQL_PROVIDER") or DEFAULT_PROVIDER).strip().lower()
-    prompt = f"""\
-### SQLite schema (DDL)
-{schema_text}
+def _call_provider(prompt: str, user_prompt: str, *, model_name: str, provider: str) -> str:
+    """Send an assembled system prompt and the user prompt to the resolved provider.
 
-### User question
-{user_question}
-"""
+    `prompt` is the dialect-aware system prompt from `_assemble_prompt` (SQLite's
+    by default, or one from `generate_sql`'s `engine` argument); `user_prompt`
+    carries the schema and question. Both Gemini and Ollama branches route through
+    here unchanged from their previous inline form in `generate_sql`, so a test can
+    assert which system prompt reached the model without patching a vendor SDK.
 
-    if selected_provider == "gemini":
+    Raises:
+        ValueError: If `provider` is neither `"gemini"` nor `"ollama"`.
+        ModuleNotFoundError: If the SDK required by `provider` is not installed.
+    """
+    if provider == "gemini":
         sdk_name, genai, genai_types = _load_gemini_sdk()
         key_manager = get_default_gemini_manager()
 
         def generate_with_key(api_key: str) -> str:
             if sdk_name == "google-genai":
+                assert genai_types is not None
                 client = genai.Client(api_key=api_key)
                 response = client.models.generate_content(
                     model=model_name or DEFAULT_MODEL_NAME,
-                    contents=prompt,
+                    contents=user_prompt,
                     config=genai_types.GenerateContentConfig(
                         temperature=0.0,
                         max_output_tokens=512,
-                        system_instruction=SQL_TRANSLATION_SYSTEM_PROMPT,
+                        system_instruction=prompt,
                     ),
                 )
             else:
                 genai.configure(api_key=api_key)
                 model = genai.GenerativeModel(
                     model_name or DEFAULT_MODEL_NAME,
-                    system_instruction=SQL_TRANSLATION_SYSTEM_PROMPT,
+                    system_instruction=prompt,
                 )
                 response = model.generate_content(
-                    contents=prompt,
+                    contents=user_prompt,
                     generation_config={"temperature": 0.0, "max_output_tokens": 512},
                 )
             return _extract_sql_from_text(str(response.text or ""))
 
         return key_manager.run(generate_with_key)
 
-    if selected_provider == "ollama":
+    if provider == "ollama":
         ChatOllama, HumanMessage, SystemMessage = _load_ollama_sdk()
         model = ChatOllama(
             model=model_name or DEFAULT_OLLAMA_MODEL,
@@ -159,10 +193,67 @@ def generate_sql(
         )
         response = model.invoke(
             [
-                SystemMessage(content=SQL_TRANSLATION_SYSTEM_PROMPT),
-                HumanMessage(content=prompt),
+                SystemMessage(content=prompt),
+                HumanMessage(content=user_prompt),
             ]
         )
         return _extract_sql_from_text(str(response.content or ""))
 
     raise ValueError("Unsupported provider. Use 'gemini' or 'ollama'.")
+
+
+def generate_sql(
+    user_question: str,
+    schema_text: str,
+    *,
+    model_name: str = DEFAULT_MODEL_NAME,
+    provider: str | None = None,
+    engine: Engine | None = None,
+) -> str:
+    """Call Gemini or Ollama to generate SQL from a question and schema.
+
+    Args:
+        user_question: The user's natural-language question.
+        schema_text: DDL and hints describing the tables available to query.
+        model_name: Provider-specific model identifier.
+        provider: `"gemini"` or `"ollama"`. Defaults to the
+            `TEXT_TO_SQL_PROVIDER` environment variable, then
+            `DEFAULT_PROVIDER`.
+        engine: The target database's engine, whose `prompt_dialect_section`
+            is assembled into the system prompt so the model is instructed in
+            the right dialect. Defaults to SQLite's when omitted.
+
+    Returns:
+        The generated SQL text, extracted from the model's raw response.
+
+    Raises:
+        ValueError: If the resolved provider is neither `"gemini"` nor
+            `"ollama"`.
+        ModuleNotFoundError: If the SDK required by the resolved provider is
+            not installed.
+    """
+    load_env()
+    selected_provider = (
+        (provider or os.environ.get("TEXT_TO_SQL_PROVIDER") or DEFAULT_PROVIDER).strip().lower()
+    )
+    system_prompt = (
+        SQL_TRANSLATION_SYSTEM_PROMPT
+        if engine is None
+        else _assemble_prompt(
+            engine.prompt_dialect_section,
+            engine.prompt_dialect_name,
+            engine.prompt_engine_rules_block,
+        )
+    )
+    schema_header = SQLiteEngine.schema_header if engine is None else engine.schema_header
+    user_prompt = f"""\
+### {schema_header}
+{schema_text}
+
+### User question
+{user_question}
+"""
+
+    return _call_provider(
+        system_prompt, user_prompt, model_name=model_name, provider=selected_provider
+    )

@@ -1,0 +1,151 @@
+# Architecture Notes
+
+The draw.io source file is available at:
+
+```text
+docs/diagrams/architecture.drawio
+```
+
+Open it with [diagrams.net](https://app.diagrams.net/) and export it as PNG or PDF for the final report and slide deck.
+
+Two other renderings of the same "User Tool Workflow" diagram exist for different purposes:
+
+- `docs/diagrams/architecture-workflow.html` - a hand-built HTML/SVG page (open it in any browser) styled as a dark circuit schematic. `docs/screenshots/00-architecture-workflow.png` is its export, and is what `README.md` actually embeds.
+- `docs/diagrams/architecture-workflow.excalidraw` - the same diagram in [Excalidraw](https://excalidraw.com)'s hand-drawn sketch style. Open it at excalidraw.com (`File -> Open`) or in the Excalidraw VS Code extension to view or restyle it further.
+
+All three describe the identical flow (same boxes, same non-crossing two-row layout); keep them in sync if the runtime flow changes.
+
+## Current Implementation
+
+The current project is an end-to-end Text-to-SQL decision support prototype. A user selects a demo database, points at a SQLite or DuckDB file, enters a connection string, or uploads CSV files in Streamlit, asks a natural-language question, and receives generated SQL plus a local query result table.
+
+The implemented backend flow is:
+
+1. Resolve the database's DSN to an `Engine` (`text_to_sql_agent/engines/` — SQLite, DuckDB, or PostgreSQL, dispatched by DSN scheme through a registry in `engines/__init__.py`) via `open_engine`, and confirm it is reachable before doing anything else. For PostgreSQL, reachability also fails closed on an over-privileged connecting role (`EngineForbiddenError`) — see `docs/3_decisions.md`.
+2. Extract that engine's schema metadata and foreign-key relationships through `Engine.raw_schema()`/`schema_chunks()`, cached in `schema.py` by `(dsn, engine.schema_fingerprint())` rather than a SQLite-specific filesystem stat. Scope is the engine's own default schema (`main`/`current_schema()`, normally `public`) plus whatever the `AIPA_EXTRA_SCHEMAS` environment variable opts into, comma-separated — an engine never reads a schema merely because it can, since everything it reads is sent to the LLM provider. PostgreSQL additionally requires `has_schema_privilege` on each opted-in name; DuckDB has no privilege model, so the opt-in is its only gate. `schema_fingerprint()` includes the opted-in set, so changing it invalidates the cache. The user-visible consequence of leaving it unset against a database whose tables live elsewhere is an empty schema and `UNANSWERABLE_WITH_GIVEN_SCHEMA` on every question — see `README.md` and `docs/3_decisions.md`.
+3. Build table-level schema chunks with columns, DDL, relationship data, and low-cardinality value hints.
+4. Retrieve relevant schema using hybrid lexical, synonym, character n-gram, hashed embedding, value-hint, and graph-neighbour signals.
+5. Generate one query with Gemini or a local Ollama model, using a dialect-aware system prompt assembled from a shared body plus the engine's own `prompt_dialect_section` (SQLite's stays byte-identical to the pre-Phase-3 prompt).
+6. Validate that the query is read-only: it must be a single statement, start with `SELECT`/`WITH`, reference no engine internals, and contain no data-modifying node. Enforced by `sqlglot` AST parsing, which is required rather than optional — if `sqlglot` is unavailable the check fails closed and refuses the query. SQLite keeps a blocklist-only check; DuckDB and PostgreSQL's much larger function surfaces (945 and 3,286 catalogue functions respectively) additionally use a default-deny function and table allowlist (see `docs/3_decisions.md`), because neither engine's own connection-level guard stops a catalogue-internals read by itself. PostgreSQL's validator also resolves qualified column references against the tables a statement actually references, closing several PostgreSQL-specific function-call-sugar bypasses (`(expr).name`, `::regclass`-family casts, `alias.name`) that a purely name-based check could not see.
+7. Execute through the engine's own read-only connection — SQLite's `PRAGMA query_only` plus an authorizer, DuckDB's `read_only=True` plus `enable_external_access=False`, PostgreSQL's least-privilege `aipa_ro` role plus a read-only transaction (`conn.read_only = True`) — with no shared enforcement mechanism between them; `tests/test_engine_conformance.py` is what proves all three meet the same guarantee. Each engine also carries its own `default_work_limit` and unit: 100,000 VM steps for SQLite, 5,000 ms for DuckDB and PostgreSQL.
+8. Display generated SQL, result rows, selected schema context, and retrieval diagnostics in Streamlit, with an automatic bar chart when the result is a two-column category + number shape.
+
+The local verification status as of this documentation pass (2026-09-26) is:
+
+- Unit tests: `786` passed, `6` skipped with `uv run pytest` (`uv sync --extra engines`, `AIPA_TEST_POSTGRES_DSN` set against a live `docker compose -f docker/postgres.yml up -d` container). The 6 skips are a deliberate SQLite exemption (`ATTACH` is denied, so SQLite has exactly one schema), not a PostgreSQL gap. Without `AIPA_TEST_POSTGRES_DSN` set, the same command reports `538` passed, `254` skipped — the subset that needs a live PostgreSQL server.
+- Engine conformance: `36` tests passing (12 per engine, SQLite, DuckDB, and PostgreSQL), `0` skipped, with `uv run pytest -m conformance -rs` and the DSN set. CI (`.github/workflows/tests.yml`) runs a `postgres:16` service container and fails the build if any conformance test is skipped.
+- Gold evaluation: `12/12` safe, executed, value-matched, row-matched, and exact-matched cases with `uv run python scripts/evaluate_text_to_sql.py --mode gold`.
+- Gemini evaluation: `gemini-2.5-flash` completed all `12` cases with multi-key quota failover, reaching `11/12` value match.
+- Local LLM evaluation: Ollama `llama3:latest` reached `8/12` value match with `12/12` safe/executed queries; `gemma4:latest` reached `8/12` value match overall and `8/10` among executed queries.
+
+## Diagram Source
+
+The file has four pages:
+
+- `User Tool Workflow`: use this page as the main architecture figure. It shows only the live user path: question input, database connection, schema retrieval, SQL generation, safety validation, read-only execution, and answer display (including the optional auto bar chart). It carries small tech-stack marks (Streamlit, SQLite, Python, Gemini, Ollama) next to the box each technology belongs to, colored to match the badges already used in `README.md`.
+- `Hybrid Schema RAG Detail`: use this page when explaining the retrieval method. It expands the Schema RAG internals into tokenisation, synonym expansion, query decomposition, schema chunking, retrieval signals, graph expansion, ranking, prompt context, and diagnostics.
+- `Offline Evaluation Workflow`: use this page only in the empirical results section. It is deliberately separated from the user tool workflow because benchmark evaluation is a local validation process, not part of normal app usage.
+- `Implementation Modules`: use this page if the teacher asks how the code is organised after the refactor.
+
+Dashed boxes represent supporting or optional runtime behaviour, such as Gemini key failover or the one-attempt SQL repair path. They are not separate user actions.
+
+The diagram is styled with Google Sans throughout (every cell across all four pages sets `fontFamily=Google Sans`). If the font is not available on the export machine, diagrams.net will fall back to the closest installed sans-serif font; the layout should still remain readable.
+
+The tech-stack logos on the `User Tool Workflow` page are loaded from `cdn.simpleicons.org` by URL, not embedded in the file. diagrams.net needs internet access to fetch and render them when you open or export the diagram; if you need a fully offline copy, re-export the PNG once online and the raster copy will no longer need network access.
+
+The `User Tool Workflow` page uses a two-row layout: a top row that flows left to right (ask the question, connect data, retrieve schema, generate SQL), and a bottom row that flows right to left (validate, execute, answer), joined by a single vertical connector where SQL generation hands off to the safety gate. Branch-only outcomes (blocked/unsafe, one-shot repair, auto chart) drop straight down from their trigger box instead of looping back across the diagram, which is what keeps the connector lines from crossing each other.
+
+The `Hybrid Schema RAG Detail` page uses a method layout:
+
+- Question normalisation and tokenisation
+- Domain synonym expansion
+- Query-intent decomposition
+- Schema chunk cache
+- Retrieval scoring signals
+- Foreign-key graph expansion
+- Ranked prompt context and retrieval diagnostics
+
+## Export Guidance
+
+In diagrams.net, open `docs/diagrams/architecture.drawio`, choose the page tab at the bottom, then use `File -> Export as -> PNG` or `PDF`. For slides, export the `User Tool Workflow` page as a PNG with a transparent background disabled so it remains readable on a white slide.
+
+Exports already exist for the report figures:
+
+- `User Tool Workflow`: use `docs/screenshots/00-architecture-workflow.png` (the designed HTML/SVG version, not a draw.io export - see above) for the main workflow figure.
+- `Hybrid Schema RAG Detail`: [`docs/diagrams/architecture-rag-detail.png`](diagrams/architecture-rag-detail.png) for the retrieval-method figure.
+- `Offline Evaluation Workflow`: [`docs/diagrams/architecture-evaluation-workflow.jpeg`](diagrams/architecture-evaluation-workflow.jpeg) for the empirical-results figure.
+- `Implementation Modules`: [`docs/diagrams/architecture-implementation-modules.jpeg`](diagrams/architecture-implementation-modules.jpeg) as backup evidence if asked how the refactored code maps to the system design.
+
+Re-export a page only if its content in `architecture.drawio` changes; otherwise these four files stay current.
+
+## Diagram Caption
+
+The Enterprise Text-to-SQL Agent lets a user ask a natural-language question over a selected SQLite database or uploaded CSV-derived database, grounds SQL generation using hybrid schema RAG, validates the generated SQL candidate through deterministic and AST-based safety checks, executes only read-only SQLite queries, and returns results with generated SQL and retrieval evidence.
+
+## Recommended Placement
+
+- `User Tool Workflow`: report Section 4.1 and the system workflow slide.
+- `Hybrid Schema RAG Detail`: report Section 4.3 or 4.4 when explaining retrieval.
+- `Offline Evaluation Workflow`: report Section 5.1 or 5.4 when explaining benchmark evidence.
+
+## Screenshots
+
+Use screenshots from the deployed Streamlit app and local evaluation output as evidence in the report and presentation. The screenshots should show the current workflow: database selection, Schema RAG, generated SQL, local execution results, and evaluation evidence.
+
+### Current README Screenshots
+
+`docs/screenshots/` holds the screenshots embedded in the top-level `README.md`, captured from a local run of `app.py` (Ollama provider, Retail Analytics demo database):
+
+- `00-architecture-workflow.png` - the "Runtime Architecture" schematic (request trace / response trace, safety gate, optional branches), exported from `docs/diagrams/architecture-workflow.html`, a self-contained HTML/SVG page (open it directly in a browser) rather than from `architecture.drawio`. Edit the SVG in that file and re-screenshot to regenerate.
+- `01-chat-ui.png` - initial chat UI with a demo database selected in the sidebar.
+- `02-query-result.png` - a result table for "Show the number of returns for each return reason, ranked from most to least common."
+- `03-generated-sql.png` - the same turn with the "Generated SQL" expander open.
+- `04-schema-rag-report.png` - the same turn with the "Schema RAG retrieval report" expander open, scrolled to the top of the report.
+
+Regenerate `01`-`04` whenever the chat UI, RAG report format, or demo databases change materially, so the README doesn't go stale.
+
+### Recommended Captions
+
+1. **Application UI and demo database workflow**
+   - Shows the deployed Streamlit interface, Gemini model selection, API key status, Schema RAG toggle, demo database selector, and sample question workflow.
+   - Use in the presentation when introducing the prototype.
+
+2. **Natural-language query result and generated SQL**
+   - Shows the Retail Analytics demo answering: "Which return reasons occur most often?"
+   - Result table: Changed Mind, Other, Late Delivery, Damaged, Wrong Size.
+   - Generated SQL demonstrates transparent LLM output before/after execution.
+   - Use in the report methodology/results section.
+
+3. **Retrieved schema context**
+   - Shows only selected relevant schema snippets, such as `returns`, `customer_support_tickets`, and `customers`.
+   - This demonstrates schema grounding and RAG-based context reduction.
+   - Use when explaining the difference between static schema injection and RAG.
+
+4. **Evaluation dashboard**
+   - Shows Gold SQL baseline metrics:
+     - Safe SQL: 12/12
+     - Executed: 12/12
+     - Value match: 12/12
+     - Row match: 12/12
+     - Exact match: 12/12
+     - Schema recall: 1.00
+   - Use in the empirical evaluation section.
+
+5. **LLM evaluation comparison**
+   - Shows or reproduces the model comparison from the project README:
+     - Gemini 2.5 Flash multi-key: 11/12 value match.
+     - Ollama `llama3:latest`: 8/12 value match, 12/12 safe and executed.
+     - Ollama `gemma4:latest`: 8/12 value match overall, 8/10 among executed queries.
+   - Use to explain hosted vs local model trade-offs.
+
+6. **Safety or error handling example**
+   - Optional but useful if time allows.
+   - Show an unsafe or invalid generated query being blocked, or a quota/API error being displayed without executing SQL.
+   - Use in the limitations or ethics section to show that the project handles failure visibly.
+
+### Notes
+
+- The current local verification command is `python3 scripts/evaluate_text_to_sql.py --mode gold`, which writes `evaluation/results/evaluation_gold.md` and `evaluation/results/evaluation_gold.csv`.
+- If the RAG report appears stale after deployment, refresh/redeploy and ask a new question so Streamlit loads the latest code.
+- The screenshots should be inserted into the final PDF and slide deck rather than referenced only as external files.
+- Avoid showing real API keys, local filesystem paths that are not relevant, or private uploaded data in screenshots.

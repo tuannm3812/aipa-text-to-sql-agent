@@ -1,3 +1,6 @@
+# macOS
+.DS_Store
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -219,3 +222,27 @@ __marimo__/
 
 # Local app outputs
 data/audit_log.jsonl
+.claude/
+
+# Subagent-driven development scratch (controller ledger, task briefs, reviews)
+.superpowers/
+# macOS
+.DS_Store
+
+# Demo fixtures (master coding standard §8: ignore the class, negate the
+# exceptions). These six files are tracked deliberately, but only three are
+# load-bearing: university_agent.db, retail_analytics.db, and
+# healthcare_analytics.db are the three databases app.py's DEMO_DATABASES
+# offers and the three evaluation/cases.json runs its twelve cases against, so
+# the hosted demo is non-functional without them. customers.csv and sales.csv
+# are illustrative CSV-upload samples, and dynamic_agent.db is not read by any
+# code path - it just matches the default output filename of
+# ingestion.ingest_csvs_to_db. Kept anyway; see docs/0_coding_standards.md.
+data/**/*.db
+data/**/*.csv
+!data/customers.csv
+!data/sales.csv
+!data/dynamic_agent.db
+!data/healthcare_analytics.db
+!data/retail_analytics.db
+!data/university_agent.db

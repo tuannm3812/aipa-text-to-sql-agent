@@ -1,14 +1,16 @@
+"""End-to-end Text-to-SQL orchestration: retrieval, generation, safety, execution."""
+
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_RAG_TOP_K
+from .engines import Engine, open_engine
 from .execution import execute_query
 from .ingestion import ingest_csvs_to_db
 from .llm import generate_sql
 from .rag import retrieve_relevant_schema
-from .safety import is_safe_query
+from .safety import query_refusal
 from .schema import get_schema
 from .types import QueryResult
 
@@ -23,9 +25,39 @@ def ask_database(
     rag_top_k: int = DEFAULT_RAG_TOP_K,
     max_repair_attempts: int = 1,
 ) -> QueryResult:
-    """End-to-end Text-to-SQL wrapper: schema retrieval, generation, safety, execution."""
-    if not os.path.exists(db_path):
-        raise FileNotFoundError("input database not found")
+    """End-to-end Text-to-SQL wrapper: schema retrieval, generation, safety, execution.
+
+    On failure at any stage (generation, safety check, or execution after a
+    failed repair attempt), the error is captured in the returned
+    `QueryResult.error` rather than raised.
+
+    Args:
+        question: The user's natural-language question.
+        db_path: Filesystem path to the SQLite database to query.
+        model_name: Provider-specific model identifier passed to `generate_sql`.
+        provider: `"gemini"` or `"ollama"`; see `generate_sql` for the default.
+        use_rag: Whether to retrieve a relevant schema subset via
+            `retrieve_relevant_schema` instead of the full schema.
+        rag_top_k: Number of schema chunks to retrieve when `use_rag` is set.
+        max_repair_attempts: Number of times to ask the model to repair SQL
+            that failed execution. `0` disables repair.
+
+    Returns:
+        A `QueryResult`. `error` is set to `UNANSWERABLE_WITH_GIVEN_SCHEMA` if
+        the model could not answer from the schema, the `query_refusal` code
+        (`BLOCKED_UNSAFE_SQL`, or `BLOCKED_UNSUPPORTED_COLUMN_TYPE` for a
+        column whose type can run user code) if the generated SQL was
+        refused, or the exception text if generation or execution failed.
+        A refused *repair* is reported the same way as a refused first
+        attempt: its refusal code in `error` and the refused repair in `sql`,
+        never the first attempt's stale execution error.
+
+    Raises:
+        EngineUnreachableError: If `db_path` cannot be reached by its engine.
+            Also a `FileNotFoundError`, for callers relying on that contract.
+    """
+    engine = open_engine(db_path)
+    engine.check_reachable()
 
     try:
         schema_text = (
@@ -33,12 +65,15 @@ def ask_database(
             if use_rag
             else get_schema(db_path)
         )
-        sql = generate_sql(question, schema_text, model_name=model_name, provider=provider)
+        sql = generate_sql(
+            question, schema_text, model_name=model_name, provider=provider, engine=engine
+        )
 
         if "UNANSWERABLE_WITH_GIVEN_SCHEMA" in sql:
             return QueryResult(columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA")
-        if not is_safe_query(sql):
-            return QueryResult(columns=[], rows=[], sql=sql, error="BLOCKED_UNSAFE_SQL")
+        refusal = query_refusal(sql, engine=engine)
+        if refusal is not None:
+            return QueryResult(columns=[], rows=[], sql=sql, error=refusal)
         try:
             return execute_query(db_path, sql)
         except Exception as e:
@@ -50,10 +85,17 @@ def ask_database(
                 model_name=model_name,
                 provider=provider,
                 max_repair_attempts=max_repair_attempts,
+                engine=engine,
             )
-            if repaired_sql and is_safe_query(repaired_sql):
-                return execute_query(db_path, repaired_sql)
-            raise
+            if not repaired_sql:
+                raise
+            # A refused repair is the terminal verdict: report its code with the
+            # SQL it is about, the same contract as a refused first attempt. The
+            # first attempt's error would read as repairable when nothing can run.
+            repair_refusal = query_refusal(repaired_sql, engine=engine)
+            if repair_refusal is not None:
+                return QueryResult(columns=[], rows=[], sql=repaired_sql, error=repair_refusal)
+            return execute_query(db_path, repaired_sql)
     except Exception as e:
         return QueryResult(columns=[], rows=[], error=f"{type(e).__name__}: {e}")
 
@@ -68,9 +110,37 @@ def ask_database_with_sql(
     rag_top_k: int = DEFAULT_RAG_TOP_K,
     max_repair_attempts: int = 1,
 ) -> tuple[str, QueryResult]:
-    """Same as `ask_database`, but also returns the generated SQL for UI display."""
-    if not os.path.exists(db_path):
-        raise FileNotFoundError("input database not found")
+    """Same as `ask_database`, but also returns the generated SQL for UI display.
+
+    Args:
+        question: The user's natural-language question.
+        db_path: Filesystem path to the SQLite database to query.
+        model_name: Provider-specific model identifier passed to `generate_sql`.
+        provider: `"gemini"` or `"ollama"`; see `generate_sql` for the default.
+        use_rag: Whether to retrieve a relevant schema subset via
+            `retrieve_relevant_schema` instead of the full schema.
+        rag_top_k: Number of schema chunks to retrieve when `use_rag` is set.
+        max_repair_attempts: Number of times to ask the model to repair SQL
+            that failed execution. `0` disables repair.
+
+    Returns:
+        A `(sql, QueryResult)` tuple. `sql` is `""` if generation itself
+        failed; otherwise it is the SQL that was attempted (repaired SQL
+        replaces the original once a repair succeeds, or once a repair is
+        refused - the refusal code is then about that SQL). Once execution
+        returns, it is the SQL the engine reports it actually ran
+        (`QueryResult.sql`) - identical to the generated text on SQLite and
+        DuckDB, and on PostgreSQL the same text with each bare table
+        schema-qualified (2026-09-27, `PostgresEngine.execute`), because that
+        is what produced the rows shown beside it. See `ask_database` for the
+        `QueryResult.error` values used.
+
+    Raises:
+        EngineUnreachableError: If `db_path` cannot be reached by its engine.
+            Also a `FileNotFoundError`, for callers relying on that contract.
+    """
+    engine = open_engine(db_path)
+    engine.check_reachable()
 
     schema_text = (
         retrieve_relevant_schema(db_path, question, top_k=rag_top_k)
@@ -78,17 +148,23 @@ def ask_database_with_sql(
         else get_schema(db_path)
     )
     try:
-        sql = generate_sql(question, schema_text, model_name=model_name, provider=provider)
+        sql = generate_sql(
+            question, schema_text, model_name=model_name, provider=provider, engine=engine
+        )
     except Exception as e:
         return "", QueryResult(columns=[], rows=[], error=f"{type(e).__name__}: {e}")
 
     if "UNANSWERABLE_WITH_GIVEN_SCHEMA" in sql:
-        return sql, QueryResult(columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA")
-    if not is_safe_query(sql):
-        return sql, QueryResult(columns=[], rows=[], sql=sql, error="BLOCKED_UNSAFE_SQL")
+        return sql, QueryResult(
+            columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA"
+        )
+    refusal = query_refusal(sql, engine=engine)
+    if refusal is not None:
+        return sql, QueryResult(columns=[], rows=[], sql=sql, error=refusal)
 
     try:
-        return sql, execute_query(db_path, sql)
+        result = execute_query(db_path, sql)
+        return result.sql or sql, result
     except Exception as e:
         error_text = f"{type(e).__name__}: {e}"
         repaired_sql = _repair_sql(
@@ -99,10 +175,19 @@ def ask_database_with_sql(
             model_name=model_name,
             provider=provider,
             max_repair_attempts=max_repair_attempts,
+            engine=engine,
         )
-        if repaired_sql and is_safe_query(repaired_sql):
+        if repaired_sql:
+            # Same contract as `ask_database`: a refused repair is reported as
+            # its own refusal, paired with the refused SQL, never executed.
+            repair_refusal = query_refusal(repaired_sql, engine=engine)
+            if repair_refusal is not None:
+                return repaired_sql, QueryResult(
+                    columns=[], rows=[], sql=repaired_sql, error=repair_refusal
+                )
             try:
-                return repaired_sql, execute_query(db_path, repaired_sql)
+                repaired_result = execute_query(db_path, repaired_sql)
+                return repaired_result.sql or repaired_sql, repaired_result
             except Exception as repaired_error:
                 error_text = f"{type(repaired_error).__name__}: {repaired_error}"
         return sql, QueryResult(columns=[], rows=[], sql=sql, error=error_text)
@@ -119,7 +204,29 @@ def ask_from_files(
     rag_top_k: int = DEFAULT_RAG_TOP_K,
     max_repair_attempts: int = 1,
 ) -> QueryResult:
-    """Route a `.db` file directly or ingest CSV files before querying."""
+    """Route a `.db` file directly or ingest CSV files before querying.
+
+    Args:
+        question: The user's natural-language question.
+        file_paths: One `.db` path, or one or more `.csv` paths (mixing
+            extensions is not supported).
+        output_db_path: Destination path when `file_paths` are CSVs; ignored
+            for a `.db` path.
+        model_name: Provider-specific model identifier passed to `generate_sql`.
+        provider: `"gemini"` or `"ollama"`; see `generate_sql` for the default.
+        use_rag: Whether to retrieve a relevant schema subset via
+            `retrieve_relevant_schema` instead of the full schema.
+        rag_top_k: Number of schema chunks to retrieve when `use_rag` is set.
+        max_repair_attempts: Number of times to ask the model to repair SQL
+            that failed execution. `0` disables repair.
+
+    Returns:
+        The `QueryResult` from `ask_database` against the resolved database.
+
+    Raises:
+        ValueError: If `file_paths` is empty, mixes file extensions, contains
+            more than one `.db` path, or uses an unsupported extension.
+    """
     paths = [file_paths] if isinstance(file_paths, str) else list(file_paths)
     if not paths:
         raise ValueError("file_paths must contain at least one path")
@@ -162,9 +269,11 @@ def _repair_sql(
     model_name: str,
     provider: str | None,
     max_repair_attempts: int,
+    engine: Engine,
 ) -> str | None:
     if max_repair_attempts < 1:
         return None
+    dialect_name = engine.prompt_dialect_name
     repair_question = f"""\
 Repair the SQL for the original question.
 
@@ -174,12 +283,14 @@ Original question:
 Failed SQL:
 {failed_sql}
 
-SQLite error:
+{dialect_name} error:
 {error_text}
 
-Return only one corrected SQLite SELECT query.
+Return only one corrected {dialect_name} SELECT query.
 """
     try:
-        return generate_sql(repair_question, schema_text, model_name=model_name, provider=provider)
+        return generate_sql(
+            repair_question, schema_text, model_name=model_name, provider=provider, engine=engine
+        )
     except Exception:
         return None

@@ -1,3 +1,5 @@
+"""Hybrid schema retrieval: BM25, char-ngram, and embedding scoring with a graph boost."""
+
 from __future__ import annotations
 
 import math
@@ -75,7 +77,7 @@ def _hashed_embedding(text: str, *, dimensions: int = 256) -> list[float]:
 def _cosine_vector_similarity(left: list[float], right: list[float]) -> float:
     if not left or not right:
         return 0.0
-    return sum(l * r for l, r in zip(left, right))
+    return sum(a * b for a, b in zip(left, right, strict=False))
 
 
 def _schema_prompt_chars(chunks: list[SchemaChunk]) -> int:
@@ -88,6 +90,19 @@ def _schema_prompt_chars(chunks: list[SchemaChunk]) -> int:
 
 
 def decompose_question(question: str) -> dict[str, list[str]]:
+    """Break a question into entities, aggregations, filters, and comparisons.
+
+    A lightweight, keyword-based decomposition used both for schema-retrieval
+    scoring and for the retrieval report shown in the UI.
+
+    Args:
+        question: The user's natural-language question.
+
+    Returns:
+        A dict with keys `"entities_or_metrics"`, `"aggregations"`,
+        `"filters_or_dimensions"`, and `"comparisons"`, each a sorted list of
+        matched tokens (empty if none matched).
+    """
     tokens = _tokenize_for_rag(question)
     aggregations = []
     if any(token in tokens for token in ("count", "many", "number")):
@@ -137,6 +152,20 @@ def retrieve_schema_chunks(
     top_k: int = DEFAULT_RAG_TOP_K,
     include_neighbors: int = DEFAULT_RAG_NEIGHBORS,
 ) -> list[SchemaChunk]:
+    """Return the schema chunks selected by `retrieve_schema_context`.
+
+    Args:
+        db_path: Filesystem path to the SQLite database.
+        question: The user's natural-language question.
+        top_k: Maximum number of top-scored chunks to select before
+            neighbor expansion.
+        include_neighbors: Number of foreign-key hops to expand the
+            selection by.
+
+    Returns:
+        The retrieved `SchemaChunk`s, most relevant first. See
+        `retrieve_schema_context` for the full retrieval result.
+    """
     return retrieve_schema_context(
         db_path,
         question,
@@ -154,6 +183,27 @@ def retrieve_schema_context(
     semantic_weight: float = DEFAULT_RAG_SEMANTIC_WEIGHT,
     embedding_weight: float = DEFAULT_RAG_EMBEDDING_WEIGHT,
 ) -> SchemaRetrievalResult:
+    """Score and select the schema chunks most relevant to a question.
+
+    Combines BM25-style lexical scoring, table/column name matches, a
+    char-ngram cosine similarity, and a hashed-embedding cosine similarity,
+    then expands the top-scored chunks with their foreign-key neighbors.
+
+    Args:
+        db_path: Filesystem path to the SQLite database.
+        question: The user's natural-language question.
+        top_k: Maximum number of top-scored chunks to select before
+            neighbor expansion. `0` or negative returns all chunks unscored.
+        include_neighbors: Number of foreign-key hops to expand the
+            selection by, adding each unselected neighbor at most once.
+        semantic_weight: Weight applied to the char-ngram similarity score.
+        embedding_weight: Weight applied to the hashed-embedding similarity
+            score.
+
+    Returns:
+        A `SchemaRetrievalResult` with the selected chunks, the tokens
+        derived from the question, and retrieval statistics.
+    """
     before_cache = get_schema_chunk_cache_info()
     chunks = get_schema_chunks(db_path)
     after_cache = get_schema_chunk_cache_info()
@@ -198,7 +248,7 @@ def retrieve_schema_context(
     query_counter = Counter(expanded_tokens)
     query_embedding = _hashed_embedding(" ".join(expanded_tokens) or question)
     scored: list[SchemaChunk] = []
-    for chunk, tokens, doc_len in zip(chunks, doc_tokens, doc_lengths):
+    for chunk, tokens, doc_len in zip(chunks, doc_tokens, doc_lengths, strict=False):
         token_counts = Counter(tokens)
         table_tokens = set(_tokenize_for_rag(chunk.table_name))
         column_tokens = set(_tokenize_for_rag(" ".join(chunk.columns)))
@@ -236,7 +286,9 @@ def retrieve_schema_context(
             score += semantic_weight * semantic_score
             reasons.append(f"semantic similarity: {semantic_score:.2f}")
 
-        embedding_score = _cosine_vector_similarity(query_embedding, _hashed_embedding(chunk.search_text))
+        embedding_score = _cosine_vector_similarity(
+            query_embedding, _hashed_embedding(chunk.search_text)
+        )
         if embedding_score > 0:
             score += embedding_weight * embedding_score
             reasons.append(f"embedding similarity: {embedding_score:.2f}")
@@ -248,6 +300,12 @@ def retrieve_schema_context(
                 columns=chunk.columns,
                 foreign_tables=chunk.foreign_tables,
                 search_text=chunk.search_text,
+                # Phase 3b Task 6: a rescored copy must keep the identity of
+                # the chunk it copies. Dropping `schema_name` here would give
+                # a table outside the engine's default schema the identity of
+                # a same-named table inside it.
+                schema_name=chunk.schema_name,
+                home_schema=chunk.home_schema,
                 value_hints=chunk.value_hints,
                 score=score,
                 matched_terms=sorted(matched_terms),
@@ -259,9 +317,15 @@ def retrieve_schema_context(
     if all(chunk.score == 0 for chunk in selected):
         selected = sorted(scored, key=lambda c: c.table_name)[:top_k]
 
-    selected_names = {chunk.table_name for chunk in selected}
+    # Keyed by `qualified_name`, not `table_name`, for the same reason
+    # `foreign_tables` now holds qualified names (Phase 3b Task 6): two
+    # schemas may hold a table of the same name, and a bare-name key would
+    # make one chunk's foreign-key edges resolve to the other's chunk. For a
+    # single-schema database the two keys are the same string, so this is a
+    # no-op there.
+    selected_names = {chunk.qualified_name for chunk in selected}
     if include_neighbors > 0:
-        chunk_by_name = {chunk.table_name: chunk for chunk in scored}
+        chunk_by_name = {chunk.qualified_name: chunk for chunk in scored}
         frontier = list(selected)
         for depth in range(include_neighbors):
             next_frontier: list[SchemaChunk] = []
@@ -277,6 +341,8 @@ def retrieve_schema_context(
                                 columns=neighbor_chunk.columns,
                                 foreign_tables=neighbor_chunk.foreign_tables,
                                 search_text=neighbor_chunk.search_text,
+                                schema_name=neighbor_chunk.schema_name,
+                                home_schema=neighbor_chunk.home_schema,
                                 value_hints=neighbor_chunk.value_hints,
                                 score=max(neighbor_chunk.score, chunk.score * (0.35 / (depth + 1))),
                                 matched_terms=neighbor_chunk.matched_terms or [],
@@ -309,4 +375,16 @@ def retrieve_relevant_schema(
     *,
     top_k: int = DEFAULT_RAG_TOP_K,
 ) -> str:
+    """Return prompt-ready schema text for the chunks most relevant to a question.
+
+    Args:
+        db_path: Filesystem path to the SQLite database.
+        question: The user's natural-language question.
+        top_k: Maximum number of top-scored chunks to select; see
+            `retrieve_schema_context`.
+
+    Returns:
+        DDL and value hints for the retrieved chunks, formatted for
+        inclusion in an LLM prompt (see `SchemaRetrievalResult.schema_text`).
+    """
     return retrieve_schema_context(db_path, question, top_k=top_k).schema_text

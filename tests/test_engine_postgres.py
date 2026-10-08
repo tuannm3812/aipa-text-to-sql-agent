@@ -1,0 +1,1923 @@
+"""PostgreSQL-specific tests: proving the read-only guarantee is two mechanisms,
+and that the connection cannot reach the host filesystem or run a program.
+
+`PostgresEngine` always connects with both the `aipa_ro` least-privilege role
+and a read-only transaction (`conn.read_only = True`). The conformance suite
+(`test_engine_conformance.py`) proves that combination refuses a write; it
+cannot prove *either one alone* would - that's what the first two tests below
+are for, per Phase 3's design
+(`docs/superpowers/specs/2026-09-14-phase-3-engine-abstraction-design.md`
+§4.2): a single point of failure in either mechanism must not be silently
+covered for by the other.
+
+The tests further down are a different question: not "can it write?" but
+"can it read the host filesystem or run a program?". DuckDB's `read_only=True`
+was assumed to mean exactly that and turned out not to - `read_csv`, a bare
+quoted path, `glob` and `COPY ... TO` all reached the filesystem from a
+read-only DuckDB connection (see `test_engine_duckdb.py`'s module docstring).
+The fix there was a connection-level setting, `enable_external_access=False`,
+because a validator can only refuse what it anticipates. PostgreSQL has no
+single flag like that; instead, `aipa_ro` is never granted the
+`pg_read_server_files`, `pg_write_server_files` or `pg_execute_server_program`
+role memberships that every file- or program-reaching built-in requires (see
+`docker/postgres-init.sql`). Every probe below calls `engine.execute`
+directly, bypassing `is_safe_query` entirely - the point is to prove what the
+*connection and role* refuse, not what a validator in front of them catches.
+A hole found here would need to be fixed at the connection or role level,
+never by adding a validator rule (that is Task 4's separate, second line of
+defence).
+"""
+
+from __future__ import annotations
+
+import time
+from unittest.mock import patch
+
+import pytest
+import sqlglot
+from sqlglot import exp
+
+psycopg = pytest.importorskip("psycopg", reason="install the postgres extra")
+
+from text_to_sql_agent import is_safe_query  # noqa: E402
+from text_to_sql_agent import safety as _safety  # noqa: E402
+from text_to_sql_agent.config import DEFAULT_VALUE_HINT_LIMIT  # noqa: E402
+from text_to_sql_agent.engines import open_engine  # noqa: E402
+from text_to_sql_agent.engines.postgres import PostgresEngine  # noqa: E402
+from text_to_sql_agent.execution import execute_query  # noqa: E402
+
+
+def _as_postgres_superuser(dsn: str) -> str:
+    """Swap the DSN's role for the compose file's `postgres` superuser.
+
+    Same substitution `test_engine_conformance.py`'s `_as_postgres_superuser`
+    makes, duplicated here rather than imported: this module intentionally
+    has no dependency on the conformance suite's internals, and the
+    substitution is one line.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    parts = urlsplit(dsn)
+    netloc = f"postgres:postgres@{parts.hostname}"
+    if parts.port is not None:
+        netloc += f":{parts.port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+def test_the_role_is_load_bearing_without_the_read_only_transaction(postgres_dsn: str) -> None:
+    """Removing the read-only transaction flag must still leave the write refused.
+
+    Connects as `aipa_ro` **without** setting `conn.read_only`, then attempts
+    an INSERT `aipa_ro` holds no grant for. If a write went through here, the
+    role would be decoration and the transaction flag would be the single
+    point of failure carrying the whole guarantee - exactly what Phase 3's
+    design refused to accept.
+    """
+    conn = psycopg.connect(postgres_dsn, connect_timeout=5)
+    try:
+        with pytest.raises(Exception) as caught:
+            conn.execute("INSERT INTO customers VALUES (999, 'Mallory')")
+        # Observed 2026-09-26: psycopg.errors.InsufficientPrivilege
+        # ("permission denied for table customers") - the role's own grants
+        # refuse the write before the read-only transaction flag (which is
+        # not set on this connection) ever enters into it.
+        assert isinstance(caught.value, psycopg.errors.InsufficientPrivilege)
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+def test_the_transaction_flag_is_load_bearing_for_a_privileged_connection(
+    postgres_dsn: str,
+) -> None:
+    """Removing the least-privilege role must still leave the write refused.
+
+    Connects as the `postgres` superuser - who holds every grant - but with
+    `conn.read_only = True` set. If a write went through here, the read-only
+    transaction flag would be decoration and the role would be the single
+    point of failure - the other half of the same guarantee the test above
+    checks.
+    """
+    conn = psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5)
+    conn.read_only = True
+    try:
+        with pytest.raises(Exception) as caught:
+            conn.execute("INSERT INTO customers VALUES (999, 'Mallory')")
+        # Observed 2026-09-26: psycopg.errors.ReadOnlySqlTransaction
+        # ("cannot execute INSERT in a read-only transaction") - a superuser
+        # has every grant, so only the read-only transaction flag is left to
+        # refuse this.
+        assert isinstance(caught.value, psycopg.errors.ReadOnlySqlTransaction)
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+def test_check_reachable_message_never_contains_the_dsn() -> None:
+    """A driver error commonly echoes the DSN it failed to reach - the message
+    `check_reachable` raises must not repeat that mistake, since the DSN
+    carries a password (`docs/0_coding_standards.md` §4's credential rule).
+    """
+    dsn = "postgresql://aipa_ro:aipa_ro_pw@127.0.0.1:1/does-not-matter"
+    engine = PostgresEngine(dsn)
+
+    with pytest.raises(Exception) as caught:
+        engine.check_reachable()
+
+    message = str(caught.value)
+    assert "aipa_ro_pw" not in message
+    assert dsn not in message
+
+
+# --- Fail closed on an over-privileged role (2026-09-26 owner decision) -----
+#
+# PostgreSQL has no connection-level flag equivalent to DuckDB's
+# `enable_external_access=False` (`duckdb.py`'s module docstring); its
+# defence against `pg_read_file`, `COPY ... TO/FROM PROGRAM` and the rest of
+# the filesystem/program surface proven refused above rests entirely on how
+# the connecting role was provisioned. `check_reachable()` now checks that at
+# connect time and refuses with `EngineForbiddenError` rather than trusting
+# every deployment to have gotten `docker/postgres-init.sql`'s shape right.
+
+
+def test_check_reachable_refuses_a_superuser_dsn(postgres_dsn: str) -> None:
+    """A superuser DSN must be refused with a clear message and no DSN in it.
+
+    `_as_postgres_superuser` swaps in the compose file's `postgres`
+    superuser - the same substitution the role-isolation tests at the top of
+    this module use for setup, applied here as the thing under test instead.
+    """
+    from text_to_sql_agent.engines.base import EngineForbiddenError
+
+    su_dsn = _as_postgres_superuser(postgres_dsn)
+    engine = PostgresEngine(su_dsn)
+
+    with pytest.raises(EngineForbiddenError) as caught:
+        engine.check_reachable()
+
+    message = str(caught.value)
+    assert "postgres:postgres" not in message
+    assert su_dsn not in message
+    assert "superuser" in message
+    assert "aipa_ro" in message  # names what the role should look like
+
+
+def test_check_reachable_permits_aipa_ro(postgres_dsn: str) -> None:
+    """The least-privilege role from `docker/postgres-init.sql` must still connect."""
+    PostgresEngine(postgres_dsn).check_reachable()  # must not raise
+
+
+def test_check_reachable_refuses_a_role_holding_only_file_privileges(
+    postgres_dsn: str,
+) -> None:
+    """Not a superuser-only check: a non-superuser role holding one of the
+    three file/program memberships must be refused too, naming that specific
+    membership rather than only ever saying "superuser".
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    from text_to_sql_agent.engines.base import EngineForbiddenError
+
+    role = "task_decision2_overprivileged"
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        conn.execute(f"DROP ROLE IF EXISTS {role}")
+        conn.execute(f"CREATE ROLE {role} LOGIN PASSWORD 'x' IN ROLE pg_read_server_files")
+    try:
+        parts = urlsplit(postgres_dsn)
+        netloc = f"{role}:x@{parts.hostname}"
+        if parts.port is not None:
+            netloc += f":{parts.port}"
+        role_dsn = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+        engine = PostgresEngine(role_dsn)
+
+        with pytest.raises(EngineForbiddenError) as caught:
+            engine.check_reachable()
+
+        message = str(caught.value)
+        assert "pg_read_server_files" in message
+        assert "is a superuser" not in message  # the reason given, not the guidance text
+        assert "x@" not in message  # the role's password
+    finally:
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            conn.execute(f"DROP ROLE IF EXISTS {role}")
+
+
+def test_ask_database_raises_engine_forbidden_error_for_a_superuser_dsn(
+    postgres_dsn: str,
+) -> None:
+    """The fail-closed check must actually reach a pipeline caller, not just
+    `PostgresEngine.check_reachable()` in isolation - `pipeline.ask_database`
+    calls `engine.check_reachable()` before its own `try` block (the same
+    place `EngineUnreachableError` is already proven to propagate from,
+    `tests/test_pipeline.py::test_ask_database_raises_when_the_database_is_
+    unreachable`), so this is the same contract, exercised through the real
+    entry point rather than assumed from the unit-level test above.
+    """
+    from text_to_sql_agent.engines.base import EngineForbiddenError
+    from text_to_sql_agent.pipeline import ask_database
+
+    su_dsn = _as_postgres_superuser(postgres_dsn)
+    with pytest.raises(EngineForbiddenError):
+        ask_database("irrelevant question", db_path=su_dsn)
+
+
+# --- Filesystem and program-execution surface (Task 3) ---------------------
+#
+# Every entry is (label, sql). Probed 2026-09-26 through `engine.execute` as
+# `aipa_ro` against the compose container - every one of these returned
+# `psycopg.errors.InsufficientPrivilege`, refused by the role's grants, not
+# by the read-only transaction flag (`COPY ... TO/FROM` and the file/program
+# functions all name a specific missing role membership in their DETAIL text:
+# `pg_read_server_files`, `pg_write_server_files` or
+# `pg_execute_server_program`). See `docker/postgres-init.sql` - `aipa_ro` is
+# never granted any of the three.
+_FILESYSTEM_AND_PROGRAM_PROBES: list[tuple[str, str]] = [
+    ("pg_read_file_absolute", "SELECT pg_read_file('/etc/passwd')"),
+    ("pg_ls_dir_root", "SELECT pg_ls_dir('/')"),
+    ("lo_import_absolute", "SELECT lo_import('/etc/passwd')"),
+    ("pg_stat_file_absolute", "SELECT * FROM pg_stat_file('/etc/passwd')"),
+    ("pg_shadow", "SELECT usename, passwd FROM pg_shadow"),
+    ("copy_to_program", "COPY (SELECT 1) TO PROGRAM 'touch /tmp/aipa-task3-pwned'"),
+    ("current_setting_data_directory", "SELECT current_setting('data_directory')"),
+    # Beyond the brief's own list: pg_ls_waldir and a *relative* path (inside
+    # the data directory, not an absolute path like /etc/passwd) for the
+    # file-reading functions - a role could plausibly be denied absolute
+    # paths yet allowed relative ones, so this checks that directly rather
+    # than assuming the absolute-path result generalises.
+    ("pg_ls_waldir", "SELECT * FROM pg_ls_waldir()"),
+    ("pg_read_binary_file_relative", "SELECT pg_read_binary_file('PG_VERSION')"),
+    ("pg_stat_file_relative", "SELECT * FROM pg_stat_file('PG_VERSION')"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,sql",
+    _FILESYSTEM_AND_PROGRAM_PROBES,
+    ids=[label for label, _ in _FILESYSTEM_AND_PROGRAM_PROBES],
+)
+def test_filesystem_and_program_functions_are_refused(
+    postgres_dsn: str, label: str, sql: str
+) -> None:
+    """A file-reading or program-running built-in must be refused as `aipa_ro`.
+
+    If any of these succeeded, `aipa_ro` could read arbitrary files on the
+    PostgreSQL host (`/etc/passwd`, the WAL directory, a relative path inside
+    the data directory) or run an OS command, entirely through
+    `engine.execute` - the same class of hole DuckDB's `read_only=True` had,
+    just reached through PostgreSQL's own built-ins instead of DuckDB's table
+    functions. This would be a connection/role hole, not something Task 4's
+    validator could be relied on to catch, since a validator only refuses
+    what it was told to anticipate.
+    """
+    engine = open_engine(postgres_dsn)
+    with pytest.raises(Exception) as caught:
+        engine.execute(sql, max_rows=3, work_limit=5000)
+    assert isinstance(caught.value, psycopg.errors.InsufficientPrivilege)
+
+
+def test_copy_table_to_a_server_side_file_is_refused(postgres_dsn: str) -> None:
+    """`COPY customers TO '<server path>'` must be refused before it writes.
+
+    This is the exfiltration direction: a working query could copy real row
+    data from a table `aipa_ro` can legitimately `SELECT` out to a file on
+    the PostgreSQL *server's* filesystem (inside its container, not this test
+    process's), entirely outside anything the app ever reads back - a leak
+    the read-only transaction flag does not address, because `COPY TO` a file
+    is a server-side write PostgreSQL treats as separate from writing to a
+    table. `InsufficientPrivilege` is raised before the write is attempted,
+    which is what proves nothing reached disk; there is no local path this
+    test can check, since the file would land inside the server's container.
+    """
+    engine = open_engine(postgres_dsn)
+    target = "/tmp/aipa-task3-probe-out.csv"
+    with pytest.raises(Exception) as caught:
+        engine.execute(f"COPY customers TO '{target}'", max_rows=3, work_limit=5000)
+    assert isinstance(caught.value, psycopg.errors.InsufficientPrivilege)
+
+
+def test_copy_table_from_a_server_side_file_is_refused(postgres_dsn: str) -> None:
+    """`COPY customers FROM '<server path>'` must be refused.
+
+    If this succeeded, `aipa_ro` - a role with no `INSERT` grant at all -
+    could still load arbitrary file content (here, `/etc/passwd`) into a real
+    table via the file-based `COPY` path, sidestepping the role's own
+    `GRANT`s the same way an `INSERT` statement is refused by
+    `test_the_role_is_load_bearing_without_the_read_only_transaction` above.
+    """
+    engine = open_engine(postgres_dsn)
+    with pytest.raises(Exception) as caught:
+        engine.execute("COPY customers FROM '/etc/passwd'", max_rows=3, work_limit=5000)
+    assert isinstance(caught.value, psycopg.errors.InsufficientPrivilege)
+
+
+@pytest.mark.parametrize("extension_name", ["dblink", "postgres_fdw"])
+def test_create_extension_is_refused_through_the_engine(
+    postgres_dsn: str, extension_name: str
+) -> None:
+    """`CREATE EXTENSION dblink`/`postgres_fdw` must be refused end-to-end.
+
+    Either extension, once installed, lets a connection reach an arbitrary
+    other network host as its own PostgreSQL server. If installation
+    succeeded here it would change the entire threat model this engine
+    relies on - an available `dblink`/`postgres_fdw` turns a single
+    read-only, single-database role into a pivot onto anything else the
+    Postgres host can reach.
+    """
+    engine = open_engine(postgres_dsn)
+    with pytest.raises(Exception) as caught:
+        engine.execute(f"CREATE EXTENSION {extension_name}", max_rows=3, work_limit=5000)
+    # Refused twice over: the read-only transaction flag refuses CREATE
+    # EXTENSION outright, so this alone would not prove the *role* lacks the
+    # privilege - see the test below, which isolates that half.
+    assert isinstance(caught.value, psycopg.errors.ReadOnlySqlTransaction)
+
+
+@pytest.mark.parametrize("extension_name", ["dblink", "postgres_fdw"])
+def test_create_extension_is_refused_by_privilege_alone(
+    postgres_dsn: str, extension_name: str
+) -> None:
+    """`CREATE EXTENSION` must be refused by `aipa_ro`'s own grants, not only
+    by the read-only transaction flag the test above goes through.
+
+    Connects as `aipa_ro` **without** setting `conn.read_only`, the same
+    isolation `test_the_role_is_load_bearing_without_the_read_only_transaction`
+    uses above. `dblink` and `postgres_fdw` are both untrusted extensions
+    PostgreSQL restricts to superusers regardless of schema-level `CREATE`
+    grants; if this passed for `aipa_ro`, the "must be a superuser to install
+    this" restriction this task's guarantee assumes would not actually apply
+    to the role the agent connects as, and the read-only transaction flag
+    tested above would be the *only* thing standing between the agent and a
+    network pivot.
+    """
+    conn = psycopg.connect(postgres_dsn, connect_timeout=5)
+    try:
+        with pytest.raises(Exception) as caught:
+            conn.execute(f"CREATE EXTENSION {extension_name}")
+        assert isinstance(caught.value, psycopg.errors.InsufficientPrivilege)
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+def test_aipa_ro_holds_none_of_the_file_or_program_roles(postgres_dsn: str) -> None:
+    """`aipa_ro` must not be a member of `pg_read_server_files`,
+    `pg_write_server_files` or `pg_execute_server_program`.
+
+    `docker/postgres-init.sql`'s comment asserts this in prose but Task 1
+    never verified it against the catalogue. If any membership were present,
+    every probe above would be trusting a claim the init script did not
+    actually enforce - the guarantee this whole module pins rests entirely
+    on `aipa_ro` holding none of these three role memberships, so this is the
+    one test that checks the premise the others assume.
+    """
+    conn = psycopg.connect(postgres_dsn, connect_timeout=5)
+    try:
+        rows = conn.execute(
+            "SELECT rolname, pg_has_role('aipa_ro', rolname, 'MEMBER') "
+            "FROM pg_roles "
+            "WHERE rolname IN "
+            "('pg_read_server_files', 'pg_write_server_files', 'pg_execute_server_program') "
+            "ORDER BY rolname"
+        ).fetchall()
+        assert rows == [
+            ("pg_execute_server_program", False),
+            ("pg_read_server_files", False),
+            ("pg_write_server_files", False),
+        ]
+    finally:
+        conn.close()
+
+
+# --- Task 4: default-deny function and table validation ---------------------
+#
+# `PostgresEngine.allowed_functions` (see that attribute's own long comment
+# for how it was built, verified against `pg_proc`, and what was deliberately
+# left off) switches `safety.is_safe_query` from SQLite's blocklist-only
+# behaviour to DuckDB-style default-deny: every function call anywhere in the
+# query - not just in a table-source position - must resolve to a name in
+# that set, and every `FROM`/`JOIN` target must be a real table or a CTE.
+# Everything below proves that allowlist means what a reviewer reads it to
+# mean, the same three things `test_engine_duckdb.py` proves for DuckDB's:
+# the round trip (every name really resolves to itself through sqlglot), the
+# rejections (the functions Task 3 found the *connection* does not refuse),
+# and the acceptances (a realistic corpus that both validates and executes).
+
+
+@pytest.fixture(scope="module")
+def engine_with_table_t(postgres_dsn: str) -> PostgresEngine:
+    """A real table `t` (one dummy integer column, no rows), for tests that
+    need `is_safe_query`'s default-deny table check (`_references_unknown_
+    table`) to have a real table to say yes to - mirrors `test_engine_duckdb.
+    py`'s fixture of the same name and purpose.
+
+    `is_safe_query` never checks column existence, only table and function
+    names, so `t`'s single dummy column is enough regardless of which column
+    name a given round-trip snippet happens to reference.
+
+    Created (and dropped) through the `postgres` superuser connection, since
+    `aipa_ro` holds no DDL grant - the same substitution `_as_postgres_
+    superuser` above provides for the rest of this module. `aipa_ro` can
+    `SELECT` from `t` with no separate `GRANT`: `docker/postgres-init.sql`'s
+    `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO
+    aipa_ro` already covers every table the `postgres` role creates
+    afterwards, the same way it already covers `customers`/`sales`.
+
+    Module-scoped: nothing in this file mutates `t` (only `is_safe_query`,
+    read-only validation, ever looks at it), so one table safely backs every
+    round-trip check in this module.
+    """
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        conn.execute("DROP TABLE IF EXISTS t")
+        conn.execute("CREATE TABLE t (a INTEGER)")
+    engine = open_engine(postgres_dsn)
+    yield engine
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        conn.execute("DROP TABLE IF EXISTS t")
+
+
+# Window functions need an `OVER (...)` clause to parse at all; a handful
+# also need specific non-empty arguments sqlglot's `postgres` dialect
+# requires - the same subset DuckDB's own round-trip test carries, since
+# these are standard SQL window functions with the same signatures in both
+# engines.
+_WINDOW_FUNCTION_ARGS = {
+    "ntile": "(4)",
+    "lag": "(a)",
+    "lead": "(a)",
+    "nth_value": "(a, 2)",
+    "first_value": "(a)",
+    "last_value": "(a)",
+}
+_WINDOW_FUNCTIONS = frozenset(
+    {
+        "row_number",
+        "rank",
+        "dense_rank",
+        "percent_rank",
+        "cume_dist",
+        "ntile",
+        "lag",
+        "lead",
+        "first_value",
+        "last_value",
+        "nth_value",
+    }
+)
+# Table functions are called in a `FROM` position with their own argument
+# shape, not a scalar `SELECT` list. `generate_series` is
+# `PostgresEngine.allowed_functions`'s only table-function entry - see that
+# attribute's comment for why `unnest` was left off.
+_TABLE_FUNCTION_ARGS = {
+    "generate_series": "(1, 10)",
+}
+# A plausible, parseable argument list for every remaining scalar/aggregate
+# entry in `PostgresEngine.allowed_functions` - one call shape each function
+# is known to accept, used only to prove the round trip below, not to
+# exercise every overload or to type-check against `t.a`'s actual INTEGER
+# type (`is_safe_query` never executes the SQL, so a string literal passed
+# where a real query would pass a text column is fine here). `cast`,
+# `extract`, `case`, `if`, `current_date`, `current_timestamp` and `mode`
+# have their own irregular syntax and are special-cased in `_round_trip_
+# snippet` instead of listed here, matching `test_engine_duckdb.py`'s own
+# pattern for `current_date`/`now`/`extract`/`case`/`if`.
+_SCALAR_FUNCTION_ARGS = {
+    "abs": "(a)",
+    "age": "(a, a)",
+    "array_agg": "(a)",
+    "avg": "(a)",
+    "bool_and": "(a)",
+    "bool_or": "(a)",
+    "cbrt": "(a)",
+    "ceil": "(a)",
+    "coalesce": "(a, a)",
+    "concat": "(a, a)",
+    "concat_ws": "(',', a, a)",
+    "corr": "(a, a)",
+    "count": "(a)",
+    "covar_pop": "(a, a)",
+    "covar_samp": "(a, a)",
+    "date_trunc": "('month', a)",
+    "exp": "(a)",
+    "floor": "(a)",
+    "greatest": "(a, a)",
+    "initcap": "(a)",
+    "least": "(a, a)",
+    "left": "(a, 3)",
+    "length": "(a)",
+    "ln": "(a)",
+    "log": "(a)",
+    "lower": "(a)",
+    "lpad": "(a, 5, '0')",
+    "make_date": "(2024, 1, 1)",
+    "max": "(a)",
+    "min": "(a)",
+    "nullif": "(a, a)",
+    "position": "('x' in a)",
+    "power": "(a, 2)",
+    "regexp_replace": "(a, 'x', 'y')",
+    "regexp_matches": "(a, 'x')",
+    "repeat": "(a, 3)",
+    "replace": "(a, 'x', 'y')",
+    "reverse": "(a)",
+    "right": "(a, 3)",
+    "round": "(a, 2)",
+    "sign": "(a)",
+    "split_part": "(a, ',', 1)",
+    "sqrt": "(a)",
+    "starts_with": "(a, 'x')",
+    "stddev": "(a)",
+    "stddev_pop": "(a)",
+    "stddev_samp": "(a)",
+    "string_agg": "(a, ',')",
+    "substring": "(a from 1 for 3)",
+    "sum": "(a)",
+    "trim": "(a)",
+    "upper": "(a)",
+    "var_pop": "(a)",
+    "variance": "(a)",
+}
+
+
+def _round_trip_snippet(name: str) -> str:
+    """A single, plausible SQL fragment calling `name`, for the round-trip test."""
+    if name in _WINDOW_FUNCTIONS:
+        args = _WINDOW_FUNCTION_ARGS.get(name, "()")
+        return f"{name}{args} OVER (ORDER BY a)"
+    if name in _TABLE_FUNCTION_ARGS:
+        return f"{name}{_TABLE_FUNCTION_ARGS[name]}"
+    if name == "cast":
+        return "cast(a AS INTEGER)"
+    if name == "extract":
+        return "extract(year FROM a)"
+    if name == "case":
+        return "case when a > 1 then 'x' else 'y' end"
+    if name == "if":
+        return "if(a > 1, 'x', 'y')"
+    if name == "current_date":
+        return "current_date"
+    if name == "current_timestamp":
+        return "current_timestamp"
+    if name == "mode":
+        return "mode() within group (order by a)"
+    if name == "collate":
+        return 'a COLLATE "C"'
+    return f"{name}{_SCALAR_FUNCTION_ARGS[name]}"
+
+
+@pytest.mark.parametrize("name", sorted(PostgresEngine.allowed_functions))
+def test_allowed_function_round_trip(name, engine_with_table_t):
+    """The task brief's Step 3, proven directly: for every one of the 74
+    names in `PostgresEngine.allowed_functions`, a realistic call using that
+    name parses under the `postgres` dialect, and `safety._resolve_function_
+    name` resolves at least one parsed node in the statement back to `name`
+    itself - not necessarily every node the statement contains
+    (`case`/`if`'s snippet also produces a sibling `exp.If`/`exp.Case` node
+    for the other of the pair, since every `CASE ... WHEN` branch parses to
+    its own child `exp.If` node - see `_FUNCTION_NAME_OVERRIDES`'s module
+    comment), but `name` itself must be among the resolved set - not merely
+    *some* allowed name (Task 4, 2026-09-26: the original assertion checked
+    `resolved_names & engine.allowed_functions`, which is satisfied by any
+    other allowed name appearing anywhere in the statement and would stay
+    green even if `name`'s own snippet resolved to nothing in
+    `allowed_functions` at all, as long as some other node did - it asserts
+    non-emptiness of an intersection, not that the name under test actually
+    round-trips). `is_safe_query` itself is asserted too, on the full
+    statement, so this is the real path the validator runs, not just the
+    resolver in isolation.
+
+    A mismatch here fails in one of two directions: a legitimate function
+    wrongly rejected (caught by the `is_safe_query` assertion below), or a
+    resolver that maps a dangerous function onto an allowed name (which
+    `test_dangerous_functions_are_rejected` below checks independently, for
+    the specific names the task brief calls out, though not as an exhaustive
+    sweep of PostgreSQL's ~3,300-function catalogue the way DuckDB's
+    `test_every_unlisted_duckdb_function_is_rejected_by_default_deny` sweeps
+    DuckDB's).
+    """
+    engine = engine_with_table_t
+    snippet = _round_trip_snippet(name)
+    is_table_function = name in _TABLE_FUNCTION_ARGS
+    sql = f"SELECT * FROM {snippet}" if is_table_function else f"SELECT {snippet} FROM t"
+
+    parsed = sqlglot.parse_one(sql, read="postgres")
+    funcs = list(parsed.find_all(exp.Func))
+    assert funcs, f"{sql!r} produced no exp.Func node to resolve"
+    resolved_names = {_safety._resolve_function_name(f) for f in funcs}
+    assert name in resolved_names, (
+        f"{name!r} (SQL: {sql!r}) resolved to {resolved_names}, which does not "
+        f"contain {name!r} itself"
+    )
+    assert is_safe_query(sql, engine=engine), f"{sql!r} should have been allowed"
+
+
+# The task brief's "at minimum" rejection list, plus the specific gap Task 3
+# deferred to this task: `current_setting` and every route it or an
+# equivalent built-in offers to reading server configuration or the
+# `pg_settings` catalogue view - proven both as a function call (any
+# position) and as a table source, per the brief's Step 4/Step 5. None of
+# these are refused by the connection or the `aipa_ro` role (Task 3 proved
+# `SELECT * FROM pg_settings` executes successfully as `aipa_ro` - privileges
+# do not block it); `is_safe_query` is the only thing standing between an LLM
+# and any of them.
+_DANGEROUS_FUNCTION_PROBES: list[tuple[str, str]] = [
+    ("pg_read_file", "SELECT pg_read_file('/etc/passwd')"),
+    ("pg_sleep", "SELECT pg_sleep(5)"),
+    ("dblink", "SELECT dblink('host=evil', 'select 1')"),
+    ("query_to_xml", "SELECT query_to_xml('select 1', false, false, '')"),
+    ("lo_import", "SELECT lo_import('/etc/passwd')"),
+    ("current_setting_scalar", "SELECT current_setting('data_directory')"),
+    ("current_setting_missing_ok", "SELECT current_setting('data_directory', true)"),
+    ("current_setting_in_where", "SELECT * FROM sales WHERE current_setting('port') = '5432'"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,sql", _DANGEROUS_FUNCTION_PROBES, ids=[label for label, _ in _DANGEROUS_FUNCTION_PROBES]
+)
+def test_dangerous_functions_are_rejected(engine_with_table_t, label: str, sql: str) -> None:
+    """`is_safe_query` must refuse every one of these regardless of where in
+    the query it appears - `current_setting_in_where` in particular proves
+    the scalar/value-position case, not just a bare `SELECT current_setting(
+    ...)`, since a `WHERE` clause is exactly the kind of place a function
+    check restricted to table-source position (like `internal_prefixes`/
+    `internal_names`) could never reach.
+    """
+    assert not is_safe_query(sql, engine=engine_with_table_t), f"should have rejected: {sql!r}"
+
+
+# Task 4 (2026-09-26 review round), Bypass 1: PostgreSQL's `(expr).name` is
+# grammar sugar for `name(expr)` - a single-argument function call - for any
+# `name` `expr`'s type has no field called that. sqlglot parses this into
+# `exp.Dot(this=<expr>, expression=exp.Identifier(name))`, never an
+# `exp.Func`, so the pre-fix `_references_disallowed_function`'s
+# `find_all(exp.Func)` walk never saw it. Reproduced live against
+# `postgresql://aipa_ro:...@127.0.0.1:55432/aipa` (2026-09-26):
+# `SELECT ('port').current_setting` returned `['5432']`,
+# `SELECT ('/etc/passwd').pg_read_file` raised `InsufficientPrivilege` (the
+# connection's own defence, not the validator's - `is_safe_query` still
+# wrongly said yes), and `SELECT ('customers'::regclass).pg_relation_
+# filepath` returned `['base/16384/16387']`. Every variant below reproduces
+# a distinct shape the review confirmed working: doubled parens, a quoted
+# right-hand identifier, inside `WHERE`, inside a scalar subquery, inside
+# `CAST`, inside another function call, and chained.
+_DOT_CALL_BYPASS_PROBES: list[tuple[str, str]] = [
+    ("simple", "SELECT ('port').current_setting"),
+    ("pg_read_file", "SELECT ('/etc/passwd').pg_read_file"),
+    ("pg_relation_filepath", "SELECT ('customers'::regclass).pg_relation_filepath"),
+    ("doubled_parens", "SELECT (('port')).current_setting"),
+    ("quoted_identifier", "SELECT ('port').\"current_setting\""),
+    ("in_where", "SELECT * FROM sales WHERE ('port').current_setting = '5432'"),
+    ("scalar_subquery", "SELECT (SELECT ('port').current_setting)"),
+    ("inside_cast", "SELECT CAST(('port').current_setting AS text)"),
+    ("inside_another_function", "SELECT upper(('port').current_setting)"),
+    ("chained", "SELECT (('port').current_setting).upper"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,sql", _DOT_CALL_BYPASS_PROBES, ids=[label for label, _ in _DOT_CALL_BYPASS_PROBES]
+)
+def test_dot_call_bypass_is_rejected(engine_with_table_t, label: str, sql: str) -> None:
+    """Every variant of Bypass 1 must be refused post-fix - each one passed
+    `is_safe_query` at BASE (commit 20dd3e9), before `safety._references_
+    disallowed_dot_call` existed.
+    """
+    assert not is_safe_query(sql, engine=engine_with_table_t), f"should have rejected: {sql!r}"
+
+
+def test_dot_call_with_its_own_arguments_was_already_covered(engine_with_table_t) -> None:
+    """Not a new gap: `(expr).name(more, args)` - as opposed to the bare
+    `(expr).name` form above - parses `.expression` as `exp.Anonymous`
+    (itself an `exp.Func` subclass), which `_references_disallowed_function`
+    already walks via `find_all(exp.Func)`. Pinned here so a future change
+    cannot silently narrow that coverage without a test noticing: a
+    disallowed name called this way must still be rejected, and an allowed
+    one must still validate.
+    """
+    assert not is_safe_query("SELECT ('/etc/passwd').pg_read_file()", engine=engine_with_table_t)
+    assert is_safe_query("SELECT ('a,b,c').split_part(',', 1)", engine=engine_with_table_t)
+
+
+# Task 4, Bypass 2: a cast to a PostgreSQL object-identifier ("OID") type -
+# `regclass`, `regrole`, `regproc`, `regnamespace`, `regtype`, `regoper`,
+# `regoperator`, `regconfig`, `regdictionary`, `regcollation`,
+# `regprocedure` - resolves a string or integer against exactly the
+# catalogue (`pg_class`, `pg_authid`, `pg_proc`, `pg_namespace`, ...) the
+# `pg_` internals rule exists to block, with no function call and no table
+# reference for the pre-fix validator to see. Reproduced live (2026-09-26):
+# `SELECT g::regclass AS rel FROM generate_series(16380, 16400) AS g`
+# executed and returned real relation names - `is_safe_query` said yes.
+# Every one of the eleven type names is probed under both the `::` and
+# `CAST(... AS ...)` spellings.
+_OID_CAST_TYPES: tuple[str, ...] = (
+    "regclass",
+    "regrole",
+    "regproc",
+    "regnamespace",
+    "regtype",
+    "regoper",
+    "regoperator",
+    "regconfig",
+    "regdictionary",
+    "regcollation",
+    "regprocedure",
+)
+_OID_CAST_BYPASS_PROBES: list[tuple[str, str]] = (
+    [(f"{type_name}_coloncolon", f"SELECT 'x'::{type_name}") for type_name in _OID_CAST_TYPES]
+    + [(f"{type_name}_cast", f"SELECT CAST('x' AS {type_name})") for type_name in _OID_CAST_TYPES]
+    + [
+        (
+            "regclass_generate_series_loop",
+            "SELECT g::regclass AS rel FROM generate_series(16380, 16400) AS g",
+        ),
+        (
+            "regrole_generate_series_loop",
+            "SELECT CAST(g AS regrole) AS rel FROM generate_series(1, 20) AS g",
+        ),
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "label,sql", _OID_CAST_BYPASS_PROBES, ids=[label for label, _ in _OID_CAST_BYPASS_PROBES]
+)
+def test_oid_cast_bypass_is_rejected(engine_with_table_t, label: str, sql: str) -> None:
+    """Every variant of Bypass 2 must be refused post-fix - each one passed
+    `is_safe_query` at BASE (commit 20dd3e9), before `safety._casts_to_
+    object_identifier_type` existed.
+    """
+    assert not is_safe_query(sql, engine=engine_with_table_t), f"should have rejected: {sql!r}"
+
+
+def test_ordinary_casts_still_validate(engine_with_table_t) -> None:
+    """The Bypass 2 fix must not reject an everyday cast to a real SQL type -
+    only `exp.ObjectIdentifier` targets (PostgreSQL's OID types) are
+    checked; `exp.DataType` targets (`text`, `integer`, ...) are untouched.
+    """
+    assert is_safe_query("SELECT CAST(a AS TEXT) FROM t", engine=engine_with_table_t)
+    assert is_safe_query("SELECT a::TEXT FROM t", engine=engine_with_table_t)
+
+
+# Task 4, Bypass 3: PostgreSQL's function-call sugar does not need
+# parentheses at all. `alias.name`, where `name` is not a column of `alias`,
+# resolves as `name(alias)` - and sqlglot parses that into
+# `exp.Column(this=Identifier(name), table=Identifier(alias))`: not an
+# `exp.Func`, not an `exp.Dot`, not an `exp.Table`, so it was invisible to
+# every gate in `safety.py`, including the `pg_` internals rule. Reproduced
+# live as `aipa_ro` (2026-09-26), `is_safe_query` returning True for each:
+#
+#   SELECT g.pg_relation_filepath FROM generate_series(16384,16400) g
+#       -> 'base/16384/16387'
+#   SELECT g.pg_get_indexdef FROM generate_series(16384,16500) g
+#       -> 'CREATE UNIQUE INDEX customers_pkey ON public...'
+#   SELECT c.pg_column_size FROM customers c   -> 34, 32
+#   SELECT g.pg_sleep FROM generate_series(1,2) g -> executed, 3.0s elapsed
+#
+# and `SELECT g.pg_terminate_backend FROM generate_series(<pid>,<pid>) g`,
+# which the reviewer proved killed a live backend. That last one is
+# deliberately *not* in the list below and deliberately never re-run: it is
+# proven and disruptive. Its shape is covered by `pg_sleep`, which reaches
+# the same `integer`-argument surface.
+#
+# The five positional variants after the four proven cases are the ones the
+# reviewer confirmed also work today: select list, `WHERE`, `ORDER BY`,
+# inside a CTE, and across a `UNION ALL`.
+_COLUMN_CALL_BYPASS_PROBES: list[tuple[str, str]] = [
+    # The four reproduced cases.
+    (
+        "pg_relation_filepath",
+        "SELECT g.pg_relation_filepath FROM generate_series(16384,16400) g",
+    ),
+    ("pg_get_indexdef", "SELECT g.pg_get_indexdef FROM generate_series(16384,16500) g"),
+    ("pg_column_size", "SELECT c.pg_column_size FROM customers c"),
+    ("pg_sleep", "SELECT g.pg_sleep FROM generate_series(1,2) g"),
+    # The five positional variants.
+    ("select_list", "SELECT c.customer_id, c.pg_column_size FROM customers c"),
+    ("in_where", "SELECT * FROM customers c WHERE c.pg_column_size > 0"),
+    ("in_order_by", "SELECT c.customer_id FROM customers c ORDER BY c.pg_column_size"),
+    (
+        "inside_cte",
+        "WITH x AS (SELECT c.pg_column_size AS v FROM customers c) SELECT * FROM x",
+    ),
+    (
+        "across_union_all",
+        "SELECT c.customer_id FROM customers c "
+        "UNION ALL SELECT g.pg_column_size FROM generate_series(1,2) g",
+    ),
+    # Part 2's own reach, beyond what the `pg_` name rule covers: `lo_get`
+    # reads a large object by OID and carries no `pg_` prefix, so only the
+    # default-deny column resolution refuses it.
+    ("lo_get_no_pg_prefix", "SELECT g.lo_get FROM generate_series(16384,16400) g"),
+    ("quoted_identifier", 'SELECT c."pg_column_size" FROM customers c'),
+]
+
+
+@pytest.mark.parametrize(
+    "label,sql", _COLUMN_CALL_BYPASS_PROBES, ids=[label for label, _ in _COLUMN_CALL_BYPASS_PROBES]
+)
+def test_column_call_bypass_is_rejected(engine_with_table_t, label: str, sql: str) -> None:
+    """Every variant of Bypass 3 must be refused post-fix - each one passed
+    `is_safe_query` at BASE (commit 30baa70), before `safety._references_
+    internal_column_name` and `safety._references_unresolvable_qualified_
+    column` existed.
+    """
+    assert not is_safe_query(sql, engine=engine_with_table_t), f"should have rejected: {sql!r}"
+
+
+# The Bypass 3 fix is default-deny over *qualified* column references, so the
+# thing it must not do is reject ordinary analytics SQL that qualifies its
+# columns - which is most real SQL. Beyond `ANALYTICS_CORPUS` below (35
+# queries, all of which both validate and execute), these are the shapes
+# where a qualifier resolves to something other than a plain base table:
+# derived tables, explicit CTE column alias lists, `LATERAL`, self-joins,
+# qualified stars, and a function scan's own output column - each checked
+# because each is a place a naive implementation of this rule would break.
+_LEGITIMATE_QUALIFIED_COLUMN_QUERIES: list[tuple[str, str]] = [
+    ("base_table", "SELECT c.name FROM customers c"),
+    ("derived_table_alias", "SELECT t.total FROM (SELECT SUM(amount) AS total FROM sales) t"),
+    (
+        "derived_table_in_where",
+        "SELECT t.n FROM (SELECT COUNT(*) AS n FROM sales) AS t WHERE t.n > 0",
+    ),
+    ("qualified_star", "SELECT d.* FROM (SELECT * FROM sales) d"),
+    (
+        "cte_column_alias_list",
+        "WITH t(x, y) AS (SELECT category, SUM(amount) FROM sales GROUP BY category) "
+        "SELECT t.x, t.y FROM t",
+    ),
+    ("function_scan_alias_list", "SELECT g.n FROM generate_series(1,5) AS g(n)"),
+    ("function_scan_default_column", "SELECT g.generate_series FROM generate_series(1,5) g"),
+    (
+        "self_join",
+        "SELECT a.name, b.name FROM customers a JOIN customers b ON a.customer_id <> b.customer_id",
+    ),
+    (
+        "uncorrelated_in_subquery",
+        "SELECT s.amount FROM sales s WHERE s.customer_id IN "
+        "(SELECT c.customer_id FROM customers c)",
+    ),
+    (
+        "correlated_scalar_subquery",
+        "SELECT s.amount, (SELECT c.name FROM customers c WHERE c.customer_id = s.customer_id) "
+        "AS who FROM sales s",
+    ),
+    (
+        "lateral",
+        "SELECT c.name FROM customers AS c JOIN LATERAL "
+        "(SELECT s.amount FROM sales s WHERE s.customer_id = c.customer_id) l ON TRUE",
+    ),
+    # `... WHERE EXISTS (SELECT 1 FROM sales s ...)` used to be excluded from
+    # this list, for reasons that had nothing to do with Bypass 3: `exp.
+    # Exists` is an `exp.Func` subclass, and before the 2026-09-26
+    # false-rejection fix (`safety._PURE_SYNTAX_FUNC_TYPES`), the
+    # default-deny function-name gate rejected it outright since `"exists"`
+    # is not - and structurally cannot be - an entry in
+    # `PostgresEngine.allowed_functions`. Included here now that it
+    # correctly validates.
+    (
+        "exists_subquery",
+        "SELECT c.name FROM customers c WHERE EXISTS "
+        "(SELECT 1 FROM sales s WHERE s.customer_id = c.customer_id)",
+    ),
+]
+# One shape deliberately left out of the list above, because it is already
+# refused at BASE (commit 30baa70) for reasons that have nothing to do with
+# Bypass 3, and listing it here would misattribute a pre-existing limitation
+# to this fix:
+#   - `SELECT public.customers.name FROM public.customers` -
+#     `_references_unknown_table` still hardcodes `"main"` as the only
+#     acceptable schema qualifier; PostgreSQL's is `"public"`
+#     (`PostgresEngine.default_schema`). Phase 3b Task 6 is where
+#     `default_schema` gets wired through that check.
+# Re-confirmed False at BASE on 2026-09-26 before being excluded.
+
+
+@pytest.mark.parametrize(
+    "label,sql",
+    _LEGITIMATE_QUALIFIED_COLUMN_QUERIES,
+    ids=[label for label, _ in _LEGITIMATE_QUALIFIED_COLUMN_QUERIES],
+)
+def test_legitimate_qualified_columns_still_validate(
+    postgres_dsn: str, label: str, sql: str
+) -> None:
+    """The other half of Bypass 3's fix: a false rejection costs a user an
+    unanswerable question, so every one of these must still validate. Uses
+    the real `customers`/`sales` tables rather than the `t` fixture so the
+    column names being resolved are the ones a real question would use.
+    """
+    engine = open_engine(postgres_dsn)
+    assert is_safe_query(sql, engine=engine), f"wrongly rejected: {sql!r}"
+
+
+def test_dot_call_dialects_pins_the_postgres_engines_own_dialect() -> None:
+    """`safety._DOT_CALL_DIALECTS` gates all three of PostgreSQL's dotted-
+    notation rules (`_references_disallowed_dot_call`,
+    `_references_internal_column_name`,
+    `_references_unresolvable_qualified_column`). Nothing else connects that
+    hardcoded string to the engine, so renaming `PostgresEngine.
+    sqlglot_dialect` would turn all three into silent no-ops with every
+    other test in this file still green - the rules would simply never run.
+    This is the test that fails instead.
+    """
+    assert PostgresEngine.sqlglot_dialect in _safety._DOT_CALL_DIALECTS
+
+
+# Regression, 2026-09-26 (second round). Bypass 3's default-deny column check
+# originally resolved `alias.name` against `Engine.column_names()`, a flat
+# union of every advertised column. Phase 3b Task 6 then widened every engine
+# from one schema to every schema the role may read, which silently widened
+# that union to "every column in every readable schema" - and a table named
+# after a single-argument catalogue function, in any of them, re-armed the
+# payload. Reproduced before the fix with the fixture below:
+#
+#   lo_get in the advertised column universe:                        True
+#   is_safe_query("SELECT g.lo_get FROM generate_series(o, o) g"):   True
+#
+# where PostgreSQL then either refuses execution on privileges or, with a
+# readable large object, returns that object's bytes. Proven a regression
+# rather than a pre-existing hole: at the pre-Task-6 commit `a87e8be`, with
+# the same table present, the name was outside the universe and the payload
+# was refused.
+#
+# The fix scopes resolution to the tables the *statement* references, per
+# qualifier - see `safety._references_unresolvable_qualified_column`. The
+# fixture is created by the test itself because the payload is only armed
+# while a column with that name exists somewhere the role can read.
+_HOSTILE_COLUMN_SCHEMA = "ext_hostile_column"
+_HOSTILE_COLUMN_PAYLOADS: list[tuple[str, str]] = [
+    ("aliased_function_scan", "SELECT g.lo_get FROM generate_series(16384,16400) g"),
+    ("unaliased_function_scan", "SELECT generate_series.lo_get FROM generate_series(16384,16400)"),
+    (
+        "function_scan_beside_the_hostile_table",
+        f"SELECT g.lo_get FROM {_HOSTILE_COLUMN_SCHEMA}.audit a, generate_series(16384,16400) g",
+    ),
+    (
+        "lateral_function_scan",
+        "SELECT g.lo_get FROM customers c JOIN LATERAL generate_series(16384,16400) g ON TRUE",
+    ),
+    (
+        "function_scan_inside_a_cte",
+        "WITH t AS (SELECT g.lo_get AS leaked FROM generate_series(16384,16400) g) "
+        "SELECT t.leaked FROM t",
+    ),
+]
+
+
+def test_a_hostile_column_name_elsewhere_cannot_re_arm_the_column_call_bypass(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A column named after a catalogue function, in a schema the role may
+    read *and has opted into*, must not make `alias.name` resolve for a
+    qualifier that cannot supply it. See the comment above for the
+    regression this pins.
+
+    Schema scope became opt-in after this regression was first fixed (owner
+    decision, 2026-09-26): the schema must be named in `AIPA_EXTRA_SCHEMAS`
+    or it is invisible regardless of grants, which would make the payload
+    refused for the wrong reason (never advertised at all) rather than the
+    reason this test exists to pin (advertised, but still refused by
+    per-table column resolution). The `monkeypatch.setenv` below keeps the
+    fixture armed the way it was before the opt-in decision.
+
+    The same fixture also pins the other direction, which is what stops the
+    fix from being a blunt name ban: `ext.audit`'s own `lo_get` column is a
+    real column, and reading it through its own table's alias still validates
+    *and* executes.
+    """
+    schema = _HOSTILE_COLUMN_SCHEMA
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        conn.execute(f"CREATE SCHEMA {schema}")
+        conn.execute(f"GRANT USAGE ON SCHEMA {schema} TO aipa_ro")
+        conn.execute(f"CREATE TABLE {schema}.audit (lo_get INTEGER, note TEXT)")
+        conn.execute(f"INSERT INTO {schema}.audit VALUES (42, 'ok')")
+        conn.execute(f"GRANT SELECT ON {schema}.audit TO aipa_ro")
+    try:
+        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", schema)
+        engine = open_engine(postgres_dsn)
+        # The fixture is armed: the hostile name really is an advertised
+        # column of a readable table outside `public`. Without this the
+        # payload assertions below would pass for the wrong reason.
+        assert engine.table_columns()[f"{schema}.audit"] == frozenset({"lo_get", "note"})
+
+        for label, sql in _HOSTILE_COLUMN_PAYLOADS:
+            assert not is_safe_query(sql, engine=engine), f"wrongly accepted ({label}): {sql!r}"
+
+        # Not a name ban: the real column, read through its own table.
+        real = f"SELECT a.lo_get FROM {schema}.audit a"
+        assert is_safe_query(real, engine=engine)
+        assert engine.execute(real, max_rows=10, work_limit=0).rows == [(42,)]
+        # And Task 6's multi-schema identity is untouched.
+        assert is_safe_query(f"SELECT note FROM {schema}.audit", engine=engine)
+    finally:
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+def test_postgres_table_columns_reports_each_table_separately(postgres_dsn: str) -> None:
+    """`Engine.table_columns()` is what `_references_unresolvable_qualified_
+    column` resolves against, so an empty or wrong answer here would turn
+    Part 2 of the Bypass 3 fix into either a no-op or a blanket refusal
+    without any other test necessarily noticing.
+
+    The *separation* is the part with teeth (2026-09-26): this used to be
+    `column_names()`, one flat union over every table, and Task 6's widening
+    to every readable schema turned that union into "every column in the
+    database", which re-armed the `alias.name` bypass. Each spelling must
+    therefore carry its own table's columns and nobody else's.
+    """
+    engine = open_engine(postgres_dsn)
+    columns = engine.table_columns()
+    assert columns["customers"] == frozenset({"customer_id", "name"})
+    assert columns["public.customers"] == columns["customers"]
+    assert {"amount", "sale_date", "category"} <= columns["sales"]
+    # No union: `sales`-only columns must not appear under `customers`.
+    assert "amount" not in columns["customers"]
+    assert "pg_column_size" not in set().union(*columns.values())
+
+
+def test_collate_is_allowed(postgres_dsn: str) -> None:
+    """`COLLATE` is ordinary SQL grammar, not a `pg_proc` call, but sqlglot's
+    `exp.Collate` is an `exp.Func` subclass, so it went through default-deny
+    the same as a real function name and was wrongly rejected before
+    `"collate"` was added to `PostgresEngine.allowed_functions`. Validated
+    and executed against the real `customers` table, matching the exact
+    query the task brief flagged.
+    """
+    engine = open_engine(postgres_dsn)
+    sql = 'SELECT name COLLATE "C" FROM customers'
+    assert is_safe_query(sql, engine=engine), f"wrongly rejected: {sql!r}"
+    result = engine.execute(sql, max_rows=10, work_limit=0)
+    assert result.ok, f"{sql!r} failed to execute: {result.error}"
+
+
+# Final whole-phase review, 2026-09-26. `safety._relation_binding` recognised
+# only two function-scan spellings and resolved every other relation kind
+# permissively, so `FROM unnest(...) g` and `FROM ROWS FROM (...) g` re-armed
+# the `alias.name` -> `name(alias)` bypass. Reproduced live at BASE (commit
+# 50742db) with `"unnest"` added to `PostgresEngine.allowed_functions`:
+#
+#   is_safe_query("SELECT g.to_regclass, 1 AS to_regclass
+#                  FROM unnest('{customers}'::text[]) g")   -> True
+#   engine.execute(same)                                    -> [('customers', 1)]
+#
+# i.e. a completed `pg_class` lookup - the `::regclass` catalogue enumeration
+# this phase already closed, reached through a different node class. The
+# server-free sweep over every relation kind lives in `tests/test_safety.py`;
+# this is the live half, and it is the half that proves the role does not
+# refuse the payload on its own.
+_FUNCTION_SCAN_SPELLING_PAYLOAD = (
+    "SELECT g.to_regclass, 1 AS to_regclass FROM unnest('{customers}'::text[]) g"
+)
+
+
+def test_function_scan_spellings_are_refused_with_unnest_allowlisted(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`unnest` is off `PostgresEngine.allowed_functions` only because nothing
+    in the demo schema has an array column - a taste call, and one any
+    deployment that does have one has to reverse. The pin must not depend on
+    it, so this puts `unnest` back for the duration and proves the validator
+    still refuses every function-scan spelling.
+
+    Also proves the payload is real rather than theoretical: run through
+    `engine.execute` directly, bypassing the validator, PostgreSQL happily
+    resolves `customers` against `pg_class` for the `aipa_ro` role. Nothing
+    below the validator refuses it.
+    """
+    assert PostgresEngine.allowed_functions is not None
+    monkeypatch.setattr(
+        PostgresEngine,
+        "allowed_functions",
+        PostgresEngine.allowed_functions | {"unnest", "list_value"},
+    )
+    engine = open_engine(postgres_dsn)
+
+    # Armed: `unnest` really is allowlisted now, so the refusals below are the
+    # relation-kind rule's doing and not the function-name rule's.
+    assert is_safe_query("SELECT g.unnest FROM unnest('{a}'::text[]) g", engine=engine)
+
+    for label, sql in [
+        ("unnest_aliased", _FUNCTION_SCAN_SPELLING_PAYLOAD),
+        (
+            "unnest_unaliased",
+            "SELECT unnest.to_regclass, 1 AS to_regclass FROM unnest('{customers}'::text[])",
+        ),
+        (
+            "lateral_unnest",
+            "SELECT g.to_regclass, 1 AS to_regclass FROM customers c "
+            "JOIN LATERAL unnest('{customers}'::text[]) g ON TRUE",
+        ),
+        (
+            "rows_from",
+            "SELECT g.to_regclass, 1 AS to_regclass FROM ROWS FROM (generate_series(1,2)) g",
+        ),
+    ]:
+        assert not is_safe_query(sql, engine=engine), f"wrongly accepted ({label}): {sql!r}"
+
+    # The payload is genuinely dangerous: the validator is the only refusal.
+    # Since the 2026-09-27 search-path pin, `engine.execute` resolves
+    # `to_regclass('customers')` against `pg_catalog` alone, so the payload's
+    # bare-name form now comes back NULL - the pin blunts it incidentally.
+    # A schema-qualified name inside the string is not affected by the pin,
+    # so that form is what proves the catalogue lookup still completes and
+    # the validator is still the refusal that matters.
+    assert engine.execute(_FUNCTION_SCAN_SPELLING_PAYLOAD, max_rows=10, work_limit=0).rows == [
+        (None, 1)
+    ]
+    armed = _FUNCTION_SCAN_SPELLING_PAYLOAD.replace("{customers}", "{public.customers}")
+    leaked = engine.execute(armed, max_rows=10, work_limit=0)
+    assert leaked.rows == [("public.customers", 1)], leaked.error
+
+
+# The task brief's Step 5: PostgreSQL's internals surface (`pg_*`,
+# `information_schema`) must be refused whether it is named as a bare table
+# source or as a schema qualifier in front of an otherwise-innocent-looking
+# table name (`pg_catalog.pg_tables`, `information_schema.tables`) - both
+# forms are checked for both surfaces, per the brief.
+_INTERNAL_TABLE_PROBES: list[tuple[str, str]] = [
+    ("pg_settings_bare", "SELECT * FROM pg_settings"),
+    ("pg_settings_schema_qualified", "SELECT * FROM pg_catalog.pg_settings"),
+    ("pg_tables_bare", "SELECT * FROM pg_tables"),
+    ("pg_tables_schema_qualified", "SELECT * FROM pg_catalog.pg_tables"),
+    ("information_schema_tables", "SELECT * FROM information_schema.tables"),
+    ("information_schema_columns", "SELECT * FROM information_schema.columns"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,sql", _INTERNAL_TABLE_PROBES, ids=[label for label, _ in _INTERNAL_TABLE_PROBES]
+)
+def test_internal_catalogue_tables_are_rejected(engine_with_table_t, label: str, sql: str) -> None:
+    """`pg_catalog.pg_tables` and `information_schema.tables` must be
+    refused both as a bare `pg_`-prefixed/`information_schema`-named table
+    source and as a schema-qualified reference - Task 3 proved `SELECT *
+    FROM pg_settings` executes successfully as `aipa_ro` (privileges do not
+    block it), so this validator-level check is the only refusal for any of
+    these.
+    """
+    assert not is_safe_query(sql, engine=engine_with_table_t), f"should have rejected: {sql!r}"
+
+
+# Step 4's acceptance corpus: at least 20 analytics queries a user would
+# plausibly ask of `customers`/`sales` - aggregates, GROUP BY, JOIN, CASE,
+# date functions, window functions, CTEs, and ILIKE text matching - each
+# proven to both pass `is_safe_query` and actually execute against the live
+# database. `sales` carries `sale_date`/`amount`/`category`/`status`/`region`
+# for exactly this purpose - see `docker/postgres-init.sql`'s comment on why
+# those columns live on `sales` rather than `customers`.
+ANALYTICS_CORPUS: list[str] = [
+    # Aggregates
+    "SELECT COUNT(*) FROM sales",
+    "SELECT SUM(amount) FROM sales WHERE status = 'completed'",
+    "SELECT AVG(amount) FROM sales WHERE amount IS NOT NULL",
+    "SELECT MIN(amount), MAX(amount) FROM sales WHERE amount IS NOT NULL",
+    # GROUP BY
+    "SELECT category, SUM(amount) AS total FROM sales GROUP BY category ORDER BY total DESC",
+    "SELECT region, COUNT(*) AS n FROM sales GROUP BY region",
+    (
+        "SELECT status, MODE() WITHIN GROUP (ORDER BY status) AS most_common "
+        "FROM sales GROUP BY status"
+    ),
+    # JOIN
+    (
+        "SELECT c.name, SUM(s.amount) AS total FROM sales s "
+        "JOIN customers c ON c.customer_id = s.customer_id "
+        "GROUP BY c.name ORDER BY total DESC"
+    ),
+    # CASE
+    (
+        "SELECT sale_id, "
+        "CASE WHEN amount IS NULL THEN 'unknown' "
+        "WHEN amount > 200 THEN 'large' ELSE 'small' END AS size_bucket FROM sales"
+    ),
+    (
+        "SELECT category, SUM(CASE WHEN status = 'completed' THEN amount ELSE 0 END) "
+        "AS completed_total FROM sales GROUP BY category"
+    ),
+    # Date functions
+    (
+        "SELECT date_trunc('month', sale_date) AS month, SUM(amount) FROM sales "
+        "GROUP BY month ORDER BY month"
+    ),
+    "SELECT EXTRACT(year FROM sale_date) AS yr, COUNT(*) FROM sales GROUP BY yr",
+    "SELECT EXTRACT(quarter FROM sale_date) AS q, SUM(amount) FROM sales GROUP BY q",
+    "SELECT sale_id, AGE(CURRENT_DATE, sale_date) AS days_since FROM sales",
+    "SELECT make_date(2024, 1, 1) AS d",
+    # Window functions
+    (
+        "SELECT sale_id, amount, "
+        "ROW_NUMBER() OVER (PARTITION BY category ORDER BY amount DESC) AS rnk FROM sales"
+    ),
+    (
+        "SELECT sale_id, sale_date, amount, "
+        "SUM(amount) OVER (ORDER BY sale_date) AS running_total FROM sales"
+    ),
+    (
+        "SELECT sale_id, customer_id, sale_date, "
+        "LAG(sale_date) OVER (PARTITION BY customer_id ORDER BY sale_date) AS prev_sale FROM sales"
+    ),
+    (
+        "SELECT sale_id, amount, NTILE(4) OVER (ORDER BY amount) AS quartile "
+        "FROM sales WHERE amount IS NOT NULL"
+    ),
+    # CTEs
+    (
+        "WITH totals AS (SELECT category, SUM(amount) AS total FROM sales GROUP BY category) "
+        "SELECT * FROM totals WHERE total > 100"
+    ),
+    (
+        "WITH ranked AS ("
+        "SELECT sale_id, category, amount, "
+        "ROW_NUMBER() OVER (PARTITION BY category ORDER BY amount DESC) AS rnk FROM sales"
+        ") SELECT * FROM ranked WHERE rnk = 1"
+    ),
+    # ILIKE text matching
+    "SELECT * FROM customers WHERE name ILIKE '%al%'",
+    "SELECT * FROM sales WHERE category ILIKE 'widget%'",
+    # String cleaning / numeric helpers
+    "SELECT UPPER(TRIM(name)) AS clean_name FROM customers",
+    "SELECT customer_id, LENGTH(TRIM(name)) AS name_length FROM customers",
+    "SELECT initcap(lower(name)) AS pretty_name FROM customers",
+    "SELECT sale_id, COALESCE(amount, 0) AS amount_or_zero FROM sales",
+    "SELECT sale_id, GREATEST(amount, 100) AS floor_amount FROM sales WHERE amount IS NOT NULL",
+    "SELECT sale_id, ROUND(amount, 0) AS rounded FROM sales WHERE amount IS NOT NULL",
+    "SELECT customer_id, NULLIF(region, 'south') AS not_south FROM sales",
+    # Table function
+    "SELECT * FROM generate_series(1, 5)",
+    # Combined, closer to a realistic multi-clause business question
+    (
+        "SELECT s.region, date_trunc('month', s.sale_date) AS month, "
+        "COUNT(*) AS n_sales, SUM(s.amount) AS total, AVG(s.amount) AS avg_amount "
+        "FROM sales s JOIN customers c ON c.customer_id = s.customer_id "
+        "WHERE s.status = 'completed' "
+        "GROUP BY s.region, month ORDER BY month, s.region"
+    ),
+    # False-rejection fix (2026-09-26 review round): sqlglot parses `AND`,
+    # `OR` and `EXISTS` as `exp.Func` subclasses, which the default-deny
+    # function-name gate previously rejected outright since `"and"`/`"or"`/
+    # `"exists"` are not - and structurally cannot be - entries in
+    # `allowed_functions`. These shapes are what the corpus missed before
+    # this fix, and exactly the "EXISTS" case the comment above
+    # `_LEGITIMATE_QUALIFIED_COLUMN_QUERIES` used to carve out as a known,
+    # pre-existing limitation. See `safety._PURE_SYNTAX_FUNC_TYPES` for the
+    # structural fix and why it is not a three-name addition to this file's
+    # own allowlist instead.
+    "SELECT sale_id FROM sales WHERE amount > 50 AND status = 'completed'",
+    "SELECT sale_id FROM sales WHERE status = 'refunded' OR status = 'pending'",
+    (
+        "SELECT c.name FROM customers c WHERE EXISTS "
+        "(SELECT 1 FROM sales s WHERE s.customer_id = c.customer_id)"
+    ),
+]
+
+
+def test_analytics_corpus_size_is_at_least_twenty() -> None:
+    """Guards the corpus itself, not just what it proves - a corpus that
+    silently shrank below the brief's stated floor would make every other
+    assertion about it in the task report false.
+    """
+    assert len(ANALYTICS_CORPUS) >= 20
+
+
+@pytest.mark.parametrize("sql", ANALYTICS_CORPUS)
+def test_analytics_corpus_passes_validation_and_executes(postgres_dsn: str, sql: str) -> None:
+    """Step 4: every query in `ANALYTICS_CORPUS` must both pass
+    `is_safe_query` and actually execute against the live PostgreSQL
+    database - the two are checked separately so a failure names which side
+    broke. A query that only passed the first half would mean the allowlist
+    describes a PostgreSQL that does not exist.
+    """
+    engine = open_engine(postgres_dsn)
+    assert is_safe_query(sql, engine=engine), f"wrongly rejected: {sql!r}"
+    result = engine.execute(sql, max_rows=1000, work_limit=0)
+    assert result.ok, f"{sql!r} failed to execute: {result.error}"
+
+
+# --- 2026-09-27: fidelity of the pinned, engine-qualified execution ----------
+#
+# `PostgresEngine.execute` now runs every statement under `SET LOCAL
+# search_path = pg_catalog` and schema-qualifies each bare table reference
+# first (`safety.qualify_bare_table_references`). A rewrite that subtly
+# changed a query's meaning would be a correctness bug in every PostgreSQL
+# answer, so every legitimate query this file already carries is run both
+# ways and must return byte-identical results: the original text through a
+# plain `aipa_ro` connection on its stock search path (the server resolving
+# every name itself), and the engine's rewritten text under the pin.
+#
+# Codex's 2026-09-27 Finding 2 added `_CTE_SCOPE_QUERIES`: a CTE anywhere in
+# the statement used to suppress qualification of every same-spelled table,
+# ignoring lexical scope and quoted identity, so the real table was left bare
+# and vanished under the pin (`UndefinedTable`). Each entry carries the exact
+# text the engine must execute, so the test pins not only equal rows but that
+# only the real base-table reference gained `"public".` - never a CTE
+# reference.
+_CTE_SCOPE_QUERIES: list[tuple[str, str, str]] = [
+    (
+        # Codex's first probe: the inner CTE cannot shadow the outer table.
+        "inner_cte_does_not_shadow_outer_table",
+        "SELECT name FROM customers WHERE EXISTS "
+        "(WITH customers AS (SELECT 1 AS x) SELECT x FROM customers)",
+        'SELECT name FROM "public".customers WHERE EXISTS '
+        "(WITH customers AS (SELECT 1 AS x) SELECT x FROM customers)",
+    ),
+    (
+        # Codex's second probe: quoted `"CUSTOMERS"` is not bare `customers`.
+        "quoted_uppercase_cte_is_not_the_bare_table",
+        'WITH "CUSTOMERS" AS (SELECT 1) SELECT name FROM customers',
+        'WITH "CUSTOMERS" AS (SELECT 1) SELECT name FROM "public".customers',
+    ),
+    (
+        # A quoted mixed-case CTE referenced by its own quoted name stays a CTE.
+        "quoted_mixed_case_cte_reference",
+        'WITH "Top" AS (SELECT customer_id FROM customers WHERE customer_id = 1) '
+        'SELECT count(*) FROM "Top"',
+        'WITH "Top" AS (SELECT customer_id FROM "public".customers WHERE customer_id = 1) '
+        'SELECT count(*) FROM "Top"',
+    ),
+    (
+        # `WITH RECURSIVE`: the first CTE's `customers` is its *later* sibling,
+        # so it stays bare; only `sales` is a base table.
+        "recursive_forward_reference_to_a_later_sibling",
+        "WITH RECURSIVE firsts AS (SELECT name FROM customers), "
+        "customers AS (SELECT 'x'::text AS name) "
+        "SELECT (SELECT count(*) FROM sales) AS n, name FROM firsts",
+        "WITH RECURSIVE firsts AS (SELECT name FROM customers), "
+        "customers AS (SELECT 'x'::text AS name) "
+        'SELECT (SELECT count(*) FROM "public".sales) AS n, name FROM firsts',
+    ),
+    (
+        # `WITH RECURSIVE` self-reference stays bare too.
+        "recursive_self_reference",
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) "
+        "SELECT n, (SELECT count(*) FROM customers) AS c FROM t ORDER BY n",
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3) "
+        'SELECT n, (SELECT count(*) FROM "public".customers) AS c FROM t ORDER BY n',
+    ),
+    (
+        # Without RECURSIVE a CTE cannot see itself: its body's `customers`
+        # is the real table, while the main query's is the CTE.
+        "non_recursive_cte_body_sees_the_real_table",
+        "WITH customers AS (SELECT * FROM customers WHERE customer_id = 1) "
+        "SELECT name FROM customers",
+        'WITH customers AS (SELECT * FROM "public".customers WHERE customer_id = 1) '
+        "SELECT name FROM customers",
+    ),
+]
+
+_FIDELITY_CORPUS: list[tuple[str, str]] = [
+    *((f"analytics_{i:02d}", sql) for i, sql in enumerate(ANALYTICS_CORPUS)),
+    *((f"qualified_column_{label}", sql) for label, sql in _LEGITIMATE_QUALIFIED_COLUMN_QUERIES),
+    *((f"cte_scope_{label}", sql) for label, sql, _ in _CTE_SCOPE_QUERIES),
+]
+
+
+def test_fidelity_corpus_covers_every_source_corpus() -> None:
+    """The proof is only as strong as its coverage - pin the count it reports."""
+    assert len(_FIDELITY_CORPUS) == len(ANALYTICS_CORPUS) + len(
+        _LEGITIMATE_QUALIFIED_COLUMN_QUERIES
+    ) + len(_CTE_SCOPE_QUERIES)
+
+
+@pytest.mark.parametrize(
+    "label,sql,expected",
+    _CTE_SCOPE_QUERIES,
+    ids=[label for label, _, _ in _CTE_SCOPE_QUERIES],
+)
+def test_cte_scope_queries_validate_and_qualify_only_the_base_table(
+    postgres_dsn: str, label: str, sql: str, expected: str
+) -> None:
+    """Exactly the real base-table references gain `"public".`; CTE references do not."""
+    engine = open_engine(postgres_dsn)
+    assert is_safe_query(sql, engine=engine), f"wrongly rejected: {sql!r}"
+    result = engine.execute(sql, max_rows=10_000, work_limit=0)
+    assert result.error is None, result.error
+    assert result.sql == expected
+
+
+@pytest.mark.parametrize(
+    "label,sql", _FIDELITY_CORPUS, ids=[label for label, _ in _FIDELITY_CORPUS]
+)
+def test_pinned_qualified_execution_matches_the_server_unpinned(
+    postgres_dsn: str, label: str, sql: str
+) -> None:
+    """Original SQL on the stock path and rewritten SQL under the pin: identical results.
+
+    Also pins what the rewrite is allowed to change: removing every inserted
+    `"public".` must give back the original text exactly, so the only edit
+    is a schema qualifier in front of a table - never a function, operator,
+    cast, alias or comment the validator inspected.
+
+    "Identical" includes failing identically. One entry,
+    `qualified_column_function_scan_default_column` (`SELECT g.generate_series
+    FROM generate_series(1,5) g`), was only ever checked against the
+    validator, and PostgreSQL 16 itself refuses it on the stock path - an
+    aliased scalar function scan names its column after the alias, not the
+    function (observed 2026-09-27: `UndefinedColumn`). The rewrite must then
+    refuse it with the same SQLSTATE, not answer it.
+    """
+    engine = open_engine(postgres_dsn)
+    with psycopg.connect(postgres_dsn, connect_timeout=5) as conn:
+        conn.read_only = True
+        try:
+            cur = conn.execute(sql)
+        except psycopg.Error as server_error:
+            with pytest.raises(psycopg.Error) as pinned_error:
+                engine.execute(sql, max_rows=10_000, work_limit=0)
+            assert pinned_error.value.sqlstate == server_error.sqlstate
+            return
+        expected_columns = [d.name for d in cur.description or []]
+        expected_rows = [tuple(row) for row in cur.fetchall()]
+
+    result = engine.execute(sql, max_rows=10_000, work_limit=0)
+
+    assert result.error is None, result.error
+    assert result.columns == expected_columns
+    assert result.rows == expected_rows
+    assert result.sql is not None
+    assert result.sql.replace('"public".', "") == sql
+
+
+# --- Task 5: harden the schema layer ----------------------------------------
+#
+# Task 2 wrote the straightforward version of raw_schema()/schema_chunks()/
+# schema_fingerprint() - enough for test_engine_conformance.py's generic,
+# per-engine assertions. These tests prove the conditions that suite cannot
+# reach: DDL that reads like DDL (PK/FK present), a fingerprint that tracks
+# DDL and ignores row data, and - the exact defect the 2026-09-25 DuckDB fix
+# (`duckdb.py`'s module docstring, `docs/3_decisions.md`) found the hard way
+# - that keying by bare table name, not `(schema, table)`, is what crashes or
+# corrupts schema-building the moment two schemas share a table name.
+#
+# `docs/3_decisions.md`'s 2026-09-25 entry scoped DuckDB to its `main` schema
+# alone specifically so a table outside it is never advertised by `raw_
+# schema()`/`schema_chunks()` only to be rejected by `safety.py`'s validator
+# (which still only accepts `main`/`public`, Task 6's job to widen) - the
+# same "advertised then blocked" inversion that entry closed for DuckDB would
+# reopen for PostgreSQL if `schema_chunks()` read beyond `public` today. So
+# `PostgresEngine`'s exposed surface stays `public`-only here; what Task 5
+# hardens is the *mechanism* (`_fetch_columns`/`_fetch_primary_keys`/`_fetch_
+# foreign_keys`, all keyed by `(schema, table)`) that Task 6 will lean on
+# once it widens the one-element `[default_schema]` list these methods pass
+# today.
+
+
+def test_raw_schema_includes_primary_key_and_foreign_key(postgres_dsn: str) -> None:
+    """`raw_schema()`'s synthesised DDL must carry PK/FK, not just column
+    types - the LLM prompt shows this text directly (task brief Step 1), and
+    Task 2's version had neither.
+    """
+    engine = open_engine(postgres_dsn)
+    schema = engine.raw_schema()
+    assert "PRIMARY KEY" in schema
+    assert "FOREIGN KEY" in schema
+    assert "REFERENCES" in schema
+    assert '"customer_id"' in schema
+    assert "NOT NULL" in schema  # sale_id/customer_id (customers) are NOT NULL
+
+
+def test_schema_chunks_value_hints_stay_low_cardinality_only(postgres_dsn: str) -> None:
+    """`sales.category`/`status`/`region` are the realistic hint candidates
+    (task brief context); `sale_id`/`amount`/`sale_date`/`customer_id` are
+    not low-cardinality text columns and must carry none - the standard's
+    §4 row-data rule is what `DEFAULT_VALUE_HINT_MAX_CARDINALITY` enforces,
+    this just proves it held after Task 5's rewrite.
+    """
+    engine = open_engine(postgres_dsn)
+    chunks = {c.table_name: c for c in engine.schema_chunks()}
+    hints = chunks["sales"].value_hints or {}
+    assert set(hints) == {"category", "status", "region"}
+    for values in hints.values():
+        assert len(values) <= DEFAULT_VALUE_HINT_LIMIT
+
+
+def test_schema_extraction_uses_the_read_only_connection(postgres_dsn: str) -> None:
+    """`raw_schema()`/`schema_chunks()`/`schema_fingerprint()` must route
+    through `_connect_read_only`, the same connection `execute()` uses - not
+    a plain `psycopg.connect`, which is what Task 2's version did. The
+    module's own docstring says "neither alone is enough"; a schema-reading
+    method holding a connection with a wider guarantee than the one that
+    runs real queries contradicts that, even though only fixed catalogue SQL
+    runs here today.
+    """
+    from text_to_sql_agent.engines import postgres as postgres_module
+
+    engine = open_engine(postgres_dsn)
+    with patch(
+        "text_to_sql_agent.engines.postgres._connect_read_only",
+        wraps=postgres_module._connect_read_only,
+    ) as spy:
+        engine.raw_schema()
+        engine.schema_chunks()
+        engine.schema_fingerprint()
+    assert spy.call_count == 3
+
+
+def test_the_fingerprint_changes_on_ddl_but_not_on_insert(postgres_dsn: str) -> None:
+    """The task brief's "one test with teeth": a fingerprint built over row
+    data would invalidate `schema.py`'s cache on every write. Proves both
+    directions against the live database, DDL via the superuser connection -
+    `aipa_ro` holds no DDL grant.
+    """
+    engine = open_engine(postgres_dsn)
+    before = engine.schema_fingerprint()
+
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        conn.execute("CREATE TABLE task5_fingerprint_probe (x INTEGER)")
+    try:
+        after_ddl = engine.schema_fingerprint()
+        assert after_ddl != before, "must change when a table is created"
+
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            conn.execute(
+                "INSERT INTO sales "
+                "(sale_id, customer_id, sale_date, amount, category, status, region) "
+                "VALUES (90001, 1, '2024-06-01', 42.0, 'widgets', 'completed', 'north')"
+            )
+        try:
+            after_insert = engine.schema_fingerprint()
+            assert after_insert == after_ddl, "must NOT change when only a row is inserted"
+        finally:
+            with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+                conn.execute("DELETE FROM sales WHERE sale_id = 90001")
+    finally:
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            conn.execute("DROP TABLE IF EXISTS task5_fingerprint_probe")
+
+
+def test_fetch_columns_keys_by_schema_and_table_not_bare_name(postgres_dsn: str) -> None:
+    """The mechanism-level proof: `_fetch_columns` (and, by the same
+    construction, `_fetch_primary_keys`/`_fetch_foreign_keys`) must not merge
+    two schemas' columns for a same-named table - the exact defect the
+    2026-09-25 DuckDB fix found (`duckdb.py`'s module docstring), one engine
+    over. Calls the private helper directly with two schema names, since
+    `PostgresEngine.schema_chunks()` itself deliberately never queries beyond
+    `public` (see the section docstring above) - this is what proves the
+    keying fix Task 6 will rely on when it widens that one-element list.
+    """
+    from text_to_sql_agent.engines.postgres import _connect_read_only, _fetch_columns
+
+    schema = "task5_other_schema"
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        conn.execute(f"CREATE SCHEMA {schema}")
+        conn.execute(f"GRANT USAGE ON SCHEMA {schema} TO aipa_ro")
+        conn.execute(
+            f"CREATE TABLE {schema}.customers "
+            "(widget_id INTEGER PRIMARY KEY, widget_name TEXT, extra_col TEXT)"
+        )
+        conn.execute(f"GRANT SELECT ON {schema}.customers TO aipa_ro")
+    try:
+        with _connect_read_only(postgres_dsn) as conn:
+            columns_by_table = _fetch_columns(conn, ["public", schema])
+
+        public_columns = [c for c, _, _ in columns_by_table[("public", "customers")]]
+        other_columns = [c for c, _, _ in columns_by_table[(schema, "customers")]]
+        assert public_columns == ["customer_id", "name"]
+        assert other_columns == ["widget_id", "widget_name", "extra_col"]
+        # No cross-contamination in either direction.
+        assert "widget_id" not in public_columns
+        assert "customer_id" not in other_columns
+    finally:
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+def test_a_table_outside_public_is_advertised_and_queryable_only_once_opted_in(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task 5's scoping test, updated twice now rather than deleted.
+
+    At Task 5 this asserted `only_here` in neither `raw_schema()` nor
+    `table_names()` - `safety.py` accepted no qualifier but `main`, and
+    advertising a table the validator would reject is the
+    `docs/3_decisions.md` 2026-09-25 inversion. Task 6 removed that
+    constraint at its source and pinned the opposite answer: granted alone
+    was enough to be advertised, accepted qualified, and executable. A
+    2026-09-26 owner decision narrowed that again - schema scope is opt-in,
+    not "every schema the role can read" - so this now pins *both* halves in
+    one place: granted but not opted in stays invisible and refused (the
+    safe default, and what a deployment that granted `aipa_ro` a schema for
+    unrelated tooling needs to be true), and granted *and* opted in via
+    `AIPA_EXTRA_SCHEMAS` is advertised, accepted qualified, refused bare, and
+    actually executable, same as Task 6 pinned.
+    """
+    schema = "task5_only_schema"
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        conn.execute(f"CREATE SCHEMA {schema}")
+        conn.execute(f"GRANT USAGE ON SCHEMA {schema} TO aipa_ro")
+        conn.execute(f"CREATE TABLE {schema}.only_here (a INTEGER)")
+        conn.execute(f"INSERT INTO {schema}.only_here VALUES (7)")
+        conn.execute(f"GRANT SELECT ON {schema}.only_here TO aipa_ro")
+    try:
+        # Granted but not opted in: invisible everywhere, query refused.
+        monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+        not_opted_in = open_engine(postgres_dsn)
+        assert "only_here" not in not_opted_in.raw_schema()
+        assert f"{schema}.only_here" not in not_opted_in.table_names()
+        assert not is_safe_query(f"SELECT a FROM {schema}.only_here", engine=not_opted_in)
+
+        # Opted in via AIPA_EXTRA_SCHEMAS: advertised, accepted qualified,
+        # refused bare, executes.
+        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", schema)
+        engine = open_engine(postgres_dsn)
+        assert "only_here" in engine.raw_schema()
+        assert f"{schema}.only_here" in engine.table_names()
+        assert "only_here" not in engine.table_names()
+        assert is_safe_query(f"SELECT a FROM {schema}.only_here", engine=engine)
+        assert not is_safe_query("SELECT a FROM only_here", engine=engine)
+        result = engine.execute(f"SELECT a FROM {schema}.only_here", max_rows=10, work_limit=0)
+        assert result.rows == [(7,)]
+    finally:
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+def test_a_schema_the_role_cannot_use_is_not_advertised_even_when_opted_in(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opt-in and privilege are both required, independently.
+
+    `_user_schema_names` filters `AIPA_EXTRA_SCHEMAS`'s candidates on
+    `has_schema_privilege`, so a schema with no `USAGE` grant to `aipa_ro` is
+    neither read nor advertised even once named in the opt-in list -
+    otherwise the model would be shown a table every query against which is
+    refused by PostgreSQL itself, which is the same advertised-then-blocked
+    inversion one layer down. Opting in is necessary, not sufficient.
+    """
+    schema = "task6_ungranted_schema"
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        conn.execute(f"CREATE SCHEMA {schema}")
+        conn.execute(f"CREATE TABLE {schema}.secret_ledger (a INTEGER)")
+    try:
+        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", schema)
+        engine = open_engine(postgres_dsn)
+        assert "secret_ledger" not in engine.raw_schema()
+        assert f"{schema}.secret_ledger" not in engine.table_names()
+        assert not is_safe_query(f"SELECT a FROM {schema}.secret_ledger", engine=engine)
+    finally:
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+def test_extra_schemas_env_var_is_comma_separated_and_trims_whitespace(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`AIPA_EXTRA_SCHEMAS` accepts more than one schema, and tolerates the
+    spacing a human is likely to type around the commas.
+    """
+    schema_a = "task6_multi_a"
+    schema_b = "task6_multi_b"
+    with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+        for schema in (schema_a, schema_b):
+            conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            conn.execute(f"CREATE SCHEMA {schema}")
+            conn.execute(f"GRANT USAGE ON SCHEMA {schema} TO aipa_ro")
+            conn.execute(f"CREATE TABLE {schema}.t (a INTEGER)")
+            conn.execute(f"GRANT SELECT ON {schema}.t TO aipa_ro")
+    try:
+        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", f" {schema_a} ,{schema_b},")
+        engine = open_engine(postgres_dsn)
+        names = engine.table_names()
+        assert f"{schema_a}.t" in names
+        assert f"{schema_b}.t" in names
+    finally:
+        with psycopg.connect(_as_postgres_superuser(postgres_dsn), connect_timeout=5) as conn:
+            for schema in (schema_a, schema_b):
+                conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+def test_schema_fingerprint_changes_when_the_opted_in_set_changes(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale `schema.py` cache would serve the wrong schema across a config
+    change, so the fingerprint must reflect the opt-in set itself, not only
+    its visible effect - see `PostgresEngine.schema_fingerprint`'s docstring
+    for why the raw config, not just the resulting table list, is hashed.
+    """
+    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    before = open_engine(postgres_dsn).schema_fingerprint()
+
+    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "some_schema_nobody_granted")
+    after = open_engine(postgres_dsn).schema_fingerprint()
+
+    assert after != before
+
+
+# --- Task 5: the work-limit unit fix ----------------------------------------
+#
+# `config.DEFAULT_MAX_VM_STEPS` (100_000) is a SQLite VM-instruction count.
+# `execution.execute_query` used to pass it verbatim as `work_limit` to
+# whichever engine a DSN resolves to, so PostgreSQL (and DuckDB) got a
+# ~100-second `statement_timeout` instead of the design's intended 5 seconds.
+# The fix is `Engine.default_work_limit`, read by `execute_query` only when
+# its own caller passes no explicit `max_vm_steps`.
+
+
+def test_postgres_default_work_limit_is_5000_ms() -> None:
+    assert PostgresEngine.default_work_limit == 5000
+
+
+def test_a_slow_postgres_query_aborts_near_5_seconds_not_100(postgres_dsn: str) -> None:
+    """`execute_query`'s caller-omitted default must resolve to `Postgres
+    Engine.default_work_limit` (5000 ms) - proven end-to-end, through the
+    same public entry point `pipeline.py`/`evaluation.py` call, not just
+    `engine.execute` directly. `pg_sleep` is refused by `is_safe_query` (see
+    `_DANGEROUS_FUNCTION_PROBES` above) but not by the connection or the
+    `aipa_ro` role's own grants, so calling `execute_query` - which, like
+    `engine.execute`, bypasses `is_safe_query` - reaches PostgreSQL for real,
+    the same bypass every other conformance-style probe in this file relies
+    on.
+    """
+    start = time.monotonic()
+    result = execute_query(postgres_dsn, "SELECT pg_sleep(20)")
+    elapsed = time.monotonic() - start
+
+    assert result.error == "QUERY_ABORTED_AFTER_5000_MS"
+    assert elapsed < 15, f"aborted after {elapsed:.1f}s - too slow for a 5s statement_timeout"
+
+
+def test_sqlite_default_work_limit_is_unchanged() -> None:
+    """The other half of the fix: a SQLite database must still resolve
+    `execute_query`'s default to 100_000 VM steps, not PostgreSQL's
+    millisecond figure - `tests/test_execution.py::
+    test_execute_query_returns_typed_error_when_aborted` already pins the
+    exact error code end-to-end; this is the narrower, engine-attribute-level
+    check that explains why that test still passes unchanged.
+    """
+    from text_to_sql_agent.engines.sqlite import SQLiteEngine
+
+    assert SQLiteEngine.default_work_limit == 100_000
+
+
+# Finding 1 (Codex review of the Phase 3b closeout, 2026-09-26): `allowed_
+# functions` pinned a call's *spelling*, never its resolved `pg_proc`
+# identity. Reproduced by the review exactly as re-verified here: a
+# `SECURITY DEFINER public.upper(integer)` overload sharing the allowlisted
+# name `upper`, reachable both as `public.upper(x)` and as the bare `upper
+# (x)` - PostgreSQL's own overload resolution picks the exact `integer` match
+# over `pg_catalog.upper(text)` plus an implicit cast regardless of
+# `search_path` order (re-verified below: putting `pg_catalog` first does not
+# change which one wins) - let the function read a row from a schema
+# `aipa_ro` was never granted `USAGE` on. A read-only transaction does not
+# stop a read a `SECURITY DEFINER` function makes on the connecting role's
+# behalf.
+#
+# The fix is two independent checks in `safety.py`
+# (`_references_non_catalog_qualified_function` and `_references_shadowed_
+# function`) plus `Engine.shadowed_function_names()`, which this test proves
+# from the outside: both overload kinds (`SECURITY DEFINER` and plain - the
+# fix is identity-based, not a `SECURITY DEFINER` special case) are refused
+# under both spellings, and an unrelated, unshadowed name stays usable so the
+# refusal is scoped by name rather than blanket.
+_SHADOW_SECRET_SCHEMA = "ext_shadow_secret"
+_SHADOW_FUNCTION = "public.upper(integer)"
+
+
+def test_a_same_name_overload_no_longer_shadows_the_allowlisted_function_identity(
+    postgres_dsn: str,
+) -> None:
+    """Live regression for Finding 1. See the module comment above.
+
+    Every object this test creates is dropped in a `finally`, including when
+    an assertion fails partway through, so a failure never leaves a probe
+    function or schema behind for a later test run.
+    """
+    su_dsn = _as_postgres_superuser(postgres_dsn)
+    try:
+        with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {_SHADOW_SECRET_SCHEMA} CASCADE")
+            conn.execute(f"CREATE SCHEMA {_SHADOW_SECRET_SCHEMA}")
+            conn.execute(f"CREATE TABLE {_SHADOW_SECRET_SCHEMA}.secret (marker TEXT)")
+            conn.execute(f"INSERT INTO {_SHADOW_SECRET_SCHEMA}.secret VALUES ('PROBE_SECRET')")
+            # Deliberately no GRANT USAGE for aipa_ro - the whole point of the
+            # reproduction is that the overload reaches data the role cannot
+            # reach directly.
+
+        engine = open_engine(postgres_dsn)
+        # Sanity: aipa_ro really cannot read the hidden table directly, and
+        # reordering search_path to put pg_catalog first does not change
+        # which overload PostgreSQL's own resolution picks (fact re-verified
+        # live for the review, not assumed) - both are preconditions for the
+        # rest of this test to mean what it claims.
+        direct = f"SELECT marker FROM {_SHADOW_SECRET_SCHEMA}.secret"
+        assert not is_safe_query(direct, engine=engine)
+        with (
+            psycopg.connect(postgres_dsn, connect_timeout=5) as conn,
+            pytest.raises(psycopg.errors.InsufficientPrivilege),
+        ):
+            conn.execute(direct)
+
+        for security_definer in (True, False):
+            with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+                conn.execute(f"DROP FUNCTION IF EXISTS {_SHADOW_FUNCTION}")
+                security = "SECURITY DEFINER" if security_definer else ""
+                conn.execute(
+                    f"CREATE FUNCTION {_SHADOW_FUNCTION} RETURNS text {security} "
+                    f"LANGUAGE sql AS $$ SELECT marker FROM "
+                    f"{_SHADOW_SECRET_SCHEMA}.secret LIMIT 1 $$"
+                )
+            try:
+                engine = open_engine(postgres_dsn)  # fresh instance: no stale cache
+                for sql in (
+                    "SELECT public.upper(customer_id) FROM customers LIMIT 1",
+                    "SELECT upper(customer_id) FROM customers LIMIT 1",
+                ):
+                    assert not is_safe_query(sql, engine=engine), (
+                        f"{sql!r} should be refused while {_SHADOW_FUNCTION} exists "
+                        f"(security_definer={security_definer})"
+                    )
+            finally:
+                with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+                    conn.execute(f"DROP FUNCTION IF EXISTS {_SHADOW_FUNCTION}")
+
+        # Scoping proof: recreate one overload (plain is enough - the
+        # privilege escalation itself is already proven above) so an
+        # unrelated, unshadowed name is checked "while the overload exists",
+        # as the brief requires, then the outer `finally` drops it either
+        # way. `upper` is shadowed; `lower` is not, and reading a genuine
+        # text column through it must still both validate and execute.
+        with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+            conn.execute(
+                f"CREATE FUNCTION {_SHADOW_FUNCTION} RETURNS text "
+                f"LANGUAGE sql AS $$ SELECT marker FROM "
+                f"{_SHADOW_SECRET_SCHEMA}.secret LIMIT 1 $$"
+            )
+        try:
+            engine = open_engine(postgres_dsn)
+            unrelated = "SELECT lower(name) FROM customers ORDER BY customer_id"
+            assert is_safe_query(unrelated, engine=engine), (
+                "an unrelated, unshadowed function name must still validate "
+                "while a different name is shadowed"
+            )
+            result = engine.execute(unrelated, max_rows=10, work_limit=0)
+            assert result.error is None
+            assert sorted(result.rows) == [("alice",), ("bob",)]
+        finally:
+            with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+                conn.execute(f"DROP FUNCTION IF EXISTS {_SHADOW_FUNCTION}")
+    finally:
+        with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+            conn.execute(f"DROP SCHEMA IF EXISTS {_SHADOW_SECRET_SCHEMA} CASCADE")
+
+
+def test_search_path_reordering_does_not_avoid_the_shadow(postgres_dsn: str) -> None:
+    """Re-verifies the fact the fix's design rests on, independent of the
+    `is_safe_query` proof above: putting `pg_catalog` first in `search_path`
+    does not change which overload an *unqualified* call resolves to, so a
+    fix that only reordered `search_path` (rather than checking identity)
+    would not have closed anything. `engine.execute` is used directly here,
+    bypassing `is_safe_query` entirely - the point is to pin PostgreSQL's own
+    resolution behaviour, not the validator.
+    """
+    su_dsn = _as_postgres_superuser(postgres_dsn)
+    try:
+        with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+            conn.execute(f"DROP FUNCTION IF EXISTS {_SHADOW_FUNCTION}")
+            conn.execute(
+                f"CREATE FUNCTION {_SHADOW_FUNCTION} RETURNS text "
+                "LANGUAGE sql AS $$ SELECT 'SHADOWED' $$"
+            )
+        with psycopg.connect(postgres_dsn, connect_timeout=5) as conn:
+            conn.read_only = True
+            conn.execute("SET search_path = pg_catalog, public")
+            row = conn.execute("SELECT upper(customer_id) FROM customers LIMIT 1").fetchone()
+        assert row == ("SHADOWED",), (
+            "pg_catalog-first search_path should not have avoided the shadow, "
+            f"but resolution returned {row!r}"
+        )
+    finally:
+        with psycopg.connect(su_dsn, connect_timeout=5) as conn:
+            conn.execute(f"DROP FUNCTION IF EXISTS {_SHADOW_FUNCTION}")
+
+
+def test_pg_catalog_qualified_rewrite_is_not_a_transparent_fix(postgres_dsn: str) -> None:
+    """Re-verifies the other fact the fix's design rests on: rewriting a call
+    to an explicit `pg_catalog.`-qualified spelling is not a safe alternative
+    to identity checking, because `pg_catalog.upper(integer)` does not exist
+    - the built-in only accepts `text`. A validator that rewrote calls this
+    way would break real queries rather than merely re-route them around a
+    shadow.
+    """
+    with psycopg.connect(postgres_dsn, connect_timeout=5) as conn:
+        conn.read_only = True
+        with pytest.raises(psycopg.errors.UndefinedFunction):
+            conn.execute("SELECT pg_catalog.upper(customer_id) FROM customers LIMIT 1")
+
+
+def test_non_catalog_qualified_function_calls_are_refused_structurally(
+    engine_with_table_t,
+) -> None:
+    """`_references_non_catalog_qualified_function` needs no catalogue read
+    and no live overload to fire: any call explicitly schema-qualified to
+    something other than `pg_catalog` is refused outright, and a genuine
+    `pg_catalog.count(...)` still validates. Uses the `t` fixture (`a
+    INTEGER`), not a live shadow, since this is the structural half of the
+    fix, independent of `Engine.shadowed_function_names()`.
+    """
+    engine = engine_with_table_t
+    assert not is_safe_query("SELECT public.count(a) FROM t", engine=engine)
+    assert not is_safe_query("SELECT t.a.count() FROM t", engine=engine)
+    assert is_safe_query("SELECT pg_catalog.count(a) FROM t", engine=engine)

@@ -12,7 +12,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-import text_to_sql_agent_mvp as agent
+import text_to_sql_agent as agent  # noqa: E402 - import must follow the sys.path insert above
 
 RETRYABLE_ERROR_MARKERS = (
     "429",
@@ -22,31 +22,8 @@ RETRYABLE_ERROR_MARKERS = (
 )
 
 
-def _normalise_rows(rows: list[tuple[Any, ...]]) -> list[list[str]]:
-    return [[str(value) for value in row] for row in rows]
-
-
-def _canonical_value(value: Any) -> str:
-    if isinstance(value, (int, float)):
-        return str(round(float(value), 2))
-    text = str(value).strip()
-    try:
-        return str(round(float(text), 2))
-    except ValueError:
-        return text.lower()
-
-
-def _value_rows_match(generated: list[tuple[Any, ...]], gold: list[tuple[Any, ...]]) -> bool:
-    generated_rows = sorted(tuple(_canonical_value(value) for value in row) for row in generated)
-    gold_rows = sorted(tuple(_canonical_value(value) for value in row) for row in gold)
-    return generated_rows == gold_rows
-
-
 def _run_gold(case: dict[str, Any]) -> tuple[str, agent.QueryResult]:
-    sql = case["gold_sql"]
-    if not agent.is_safe_query(sql):
-        return sql, agent.QueryResult(columns=[], rows=[], sql=sql, error="GOLD_SQL_UNSAFE")
-    return sql, agent.execute_query(case["db_path"], sql)
+    return agent.run_gold(case)
 
 
 def _run_llm(
@@ -73,7 +50,7 @@ def _run_llm(
         retryable = any(marker.lower() in error_text for marker in RETRYABLE_ERROR_MARKERS)
         if not retryable or attempt >= max_retries:
             return sql, result
-        sleep_for = retry_base_seconds * (2 ** attempt)
+        sleep_for = retry_base_seconds * (2**attempt)
         print(f"Retryable LLM error for {case['id']}; sleeping {sleep_for:.0f}s before retry...")
         time.sleep(sleep_for)
         attempt += 1
@@ -107,17 +84,7 @@ def evaluate_case(
         )
 
     latency_ms = round((time.perf_counter() - started) * 1000, 2)
-    generated_rows = _normalise_rows(result.rows)
-    gold_rows = _normalise_rows(gold_result.rows)
-    rows_match = result.error is None and gold_result.error is None and generated_rows == gold_rows
-    value_match = (
-        result.error is None
-        and gold_result.error is None
-        and _value_rows_match(result.rows, gold_result.rows)
-    )
-    exact_result_match = (
-        rows_match and result.columns == gold_result.columns
-    )
+    score = agent.score_case(result, gold_result)
     expected_tables = set(case.get("expected_tables", []))
     retrieved_tables: set[str] = set()
     rag_context = agent.retrieve_schema_context(
@@ -142,18 +109,23 @@ def evaluate_case(
         "model_name": model_name if mode == "llm" else "gold_sql",
         "use_rag": use_rag if mode == "llm" else "",
         "rag_top_k": rag_top_k if mode == "llm" else "",
-        "safe_sql": agent.is_safe_query(generated_sql),
-        "execution_ok": result.error is None,
-        "row_match": rows_match,
-        "value_match": value_match,
-        "exact_result_match": exact_result_match,
+        "safe_sql": agent.is_safe_query(generated_sql, engine=agent.open_engine(case["db_path"])),
+        "execution_ok": score.executed,
+        "row_match": score.row_match,
+        "value_match": score.value_match,
+        "exact_result_match": score.exact_match,
         "schema_table_recall": table_recall,
         "prompt_saved_pct": rag_context.prompt_savings_pct,
         "cache_hit": rag_context.cache_hit,
         "expected_tables": ", ".join(sorted(expected_tables)),
         "retrieved_tables": ", ".join(sorted(retrieved_tables)),
         "latency_ms": latency_ms,
-        "error": result.error or "",
+        # `result.error` may echo the DSN a driver failed to reach, including
+        # its password (Phase 3b, PostgreSQL); this row is written straight
+        # to a CSV under `--out-dir` (default `evaluation/results`, which is
+        # git-tracked), so the value must already be safe to persist by the
+        # time it lands here.
+        "error": agent.redact_dsn(result.error or ""),
         "generated_sql": generated_sql,
         "gold_sql": gold_sql,
     }
@@ -167,9 +139,13 @@ def write_markdown(rows: list[dict[str, Any]], output_path: Path) -> None:
     safe = sum(1 for row in rows if row["safe_sql"])
     executed = sum(1 for row in rows if row["execution_ok"])
     avg_latency = round(sum(float(row["latency_ms"]) for row in rows) / total, 2) if total else 0
-    recall_values = [float(row["schema_table_recall"]) for row in rows if row["schema_table_recall"] != ""]
+    recall_values = [
+        float(row["schema_table_recall"]) for row in rows if row["schema_table_recall"] != ""
+    ]
     avg_recall = round(sum(recall_values) / len(recall_values), 3) if recall_values else 0
-    avg_prompt_saved = round(sum(float(row["prompt_saved_pct"]) for row in rows) / total, 1) if total else 0
+    avg_prompt_saved = (
+        round(sum(float(row["prompt_saved_pct"]) for row in rows) / total, 1) if total else 0
+    )
 
     lines = [
         "# Text-to-SQL Evaluation Results",
@@ -184,7 +160,8 @@ def write_markdown(rows: list[dict[str, Any]], output_path: Path) -> None:
         f"- Average prompt schema saved: {avg_prompt_saved}%",
         f"- Average latency: {avg_latency} ms",
         "",
-        "| Case | Dataset | Difficulty | Safe | Executed | Value Match | Row Match | Exact Match | Schema Recall | Prompt Saved | Latency ms |",
+        "| Case | Dataset | Difficulty | Safe | Executed | Value Match | Row Match | "
+        "Exact Match | Schema Recall | Prompt Saved | Latency ms |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
@@ -197,7 +174,9 @@ def write_markdown(rows: list[dict[str, Any]], output_path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate Text-to-SQL generation against gold SQL results.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate Text-to-SQL generation against gold SQL results."
+    )
     parser.add_argument("--cases", default="evaluation/cases.json")
     parser.add_argument("--mode", choices=["gold", "llm"], default="gold")
     parser.add_argument("--provider", choices=["gemini", "ollama"], default=agent.DEFAULT_PROVIDER)
