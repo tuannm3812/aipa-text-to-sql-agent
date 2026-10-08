@@ -2991,3 +2991,34 @@ v2 runner. No benchmark download, provider call or application test suite was
 run because the reviewed changes are documentation only. Only this
 append-only log entry was added; no specification or application changes,
 commit, or message to another agent was made.
+
+## 2026-10-08 — Claude: second revision of the v2 contract; owner approval
+
+**Both of Codex's follow-up findings accepted; both were my own contradictions.**
+
+1. **Gold gate separated from headline EX.** The gate now passes when every
+   valid reference self-matches under `rows_equal_v2`, every
+   `reference_invalid` ID is on the reviewed exception list, and every
+   non-answerable case is well-formed. Headline EX and reference coverage are
+   reported regardless, so a suite with excepted references passes the gate
+   while showing EX below 100 % — Codex's 9/10 example is now the pinned
+   fixture. Zero valid references fails the gate and reports
+   `0 / 0 (undefined)`, never 100 %. The CI prose says the same.
+2. **Run identity hashed over an immutable payload.** The directory suffix is
+   now the hash of an identity payload (commit, dirty flag, suite and subset
+   hashes, source release, adapter and scorer versions, prompt hash, provider,
+   model, evidence, RAG settings, limits, retry policy) plus a random nonce
+   allocated atomically with an exclusive `mkdir`. Status, duration and outage
+   count sit outside the payload, so completing or resuming never changes a
+   run's name; two identical runs in the same second get distinct directories;
+   `--resume` keeps the ID and refuses unless the identity payload matches the
+   saved manifest. The final manifest's own checksum is recorded separately.
+3. **Wording.** The demo tab's live run uses `score_v2`; v1 stays only for the
+   v1 script and its tests, named as such. `score_v2` reuses only the
+   both-sides-executed guard from `score_case`. "Stricter in every respect" is
+   replaced by the actual policy difference, including the case where v1's
+   rounding is the stricter of the two.
+
+The owner approved the spec after these revisions. Status set accordingly; the
+implementation plan follows. Documentation only; the application suite was not
+rerun.

@@ -1,7 +1,7 @@
 # Evaluation Contract v2 — Spider, BIRD and a safety suite
 
 **Date:** 2026-10-08
-**Status:** Revised after Codex design review (2026-10-08); awaiting owner review
+**Status:** Approved by the owner 2026-10-08, after two Codex design reviews
 **Parent:** the production-readiness direction, `docs/6_agent_log.md`
 (2026-10-07 and 2026-10-08 portfolio-session entries); gate **G2**
 **Baseline standard:** `~/Documents/GitHub/coding-standards/coding_standards.md`
@@ -73,8 +73,10 @@ Checked on 2026-10-08 against `d34aba8`.
 - `score_case`'s comparator was never specified for v2 and is lenient:
   `canonical_value` lowercases text, stringifies `NULL` so it equals the text
   `'None'`, rounds numbers to two decimals, and `rows_match` sorts rows. All
-  four were reproduced on 2026-10-08. §4.3 freezes a stricter comparator for v2
-  and leaves the legacy one untouched for the `demo` tab and v1 consumers.
+  four were reproduced on 2026-10-08. §4.3 freezes a typed comparator for v2,
+  used everywhere v2 scores — CLI, Streamlit tab, gold gate. The legacy
+  `score_case`/`rows_match` stay only for the v1 script and its tests, named
+  as such, until they are removed.
 
 ## 4. Design
 
@@ -141,8 +143,10 @@ list `evaluation/suites/<suite>.gold_exceptions.txt`.
 
 ### 4.3 Scorer and metrics
 
-`score_case` stays the row-comparison core. A new `score_v2(case, result,
-gold_result) -> Outcome` wraps it with the typed expectation:
+A new `score_v2(case, result, gold_result) -> Outcome` reuses one thing from
+`score_case` — the guard that both sides must have executed before any
+comparison — and nothing else; comparison is `rows_equal_v2` below. It maps
+the typed expectation to an outcome:
 
 | `expected` | Outcome |
 |---|---|
@@ -171,10 +175,14 @@ legacy `rows_match`:
 - Column *names* are ignored, column *count* must match, and columns are
   compared positionally.
 
-This is stricter than the legacy comparator in every respect, and it is
-documented so that the report's "not comparable to the May tables" claim has
-a concrete reason. The legacy `score_case`/`rows_match` stay unchanged and
-versioned as `scorer v1`; v2 is `scorer v2`, and the manifest names which ran.
+This is a different policy from the legacy comparator, not a uniformly
+stricter one: v2 rejects the case, `NULL`-as-text, duplicate and ordering
+leniencies v1 accepts, while v1's two-decimal rounding rejects some
+large-number differences that v2's relative tolerance accepts. That is why the
+report's "not comparable to the May tables" claim is stated as a policy
+difference, not an improvement. The legacy `score_case`/`rows_match` stay
+unchanged and versioned as `scorer v1`; v2 is `scorer v2`, and the manifest
+names which ran.
 
 **Denominators** — one policy for CLI, UI and gold mode:
 
@@ -203,14 +211,30 @@ standard library suffice; NumPy is not added for one function).
 ### 4.4 Manifest and result files
 
 One run writes one directory named by a **unique run ID**:
-`evaluation/results/<YYYY-MM-DDTHHMMSS>_<suite>_<subset>_<provider>_<model>_<config>_<short-hash>/`,
-where `<config>` encodes the settings that change outcomes (`rag-on-k5`,
-`evidence-on`), `<model>` is sanitised for the filesystem (`/` and `:`
-become `-`), and `<short-hash>` is the first eight hex digits of the manifest's
-own SHA-256. The runner **refuses to overwrite** an existing completed run;
-`--resume` continues an incomplete one in place. Evidence on and off, RAG on
-and off, and two identical configurations on the same day therefore always
-produce distinct directories. The directory holds three files:
+`evaluation/results/<YYYY-MM-DDTHHMMSS>_<suite>_<subset>_<provider>_<model>_<config>_<identity8>_<nonce4>/`.
+
+- `<config>` encodes the settings that change outcomes (`rag-on-k5`,
+  `evidence-on`); `<model>` is sanitised for the filesystem (`/` and `:`
+  become `-`).
+- `<identity8>` is the first eight hex digits of the SHA-256 of the
+  **identity payload**: the immutable fields that define what is being
+  measured — commit, dirty flag, suite hash, subset hash, source release,
+  adapter version, scorer version, prompt hash, provider, model, `evidence`,
+  `use_rag`, `rag_top_k`, `work_limit`, `max_rows`, `max_repair_attempts`,
+  retry policy. Mutable execution metadata — start time, duration, outage
+  count, status — is **outside** the identity payload, so finishing or
+  resuming a run never changes its name.
+- `<nonce4>` is four hex digits from `os.urandom`, and the directory is
+  allocated atomically with `mkdir` (exclusive); on collision a new nonce is
+  drawn. Two identical runs started in the same second therefore get distinct
+  directories, and nothing is ever overwritten.
+- `--resume` keeps the run ID, re-reads the saved manifest, and **refuses**
+  unless the current identity payload equals the saved one, so retried cases
+  are never combined with results from different code, prompt, suite or
+  settings. A checksum of the final complete manifest is recorded in the
+  manifest itself as `manifest_sha256`, separate from the identity hash.
+
+The directory holds three files:
 
 - `manifest.json`: repo commit **and whether the tree was dirty** (a dirty
   run is marked `citable: false`), suite name and the **SHA-256 of the
@@ -239,12 +263,18 @@ not eligible for the regression gate until re-run with `--resume`, which
 retries only the `outage` cases. Outages are therefore never counted as model
 failures and never silently dropped.
 
-The gold baseline keeps its role as a gate. `--mode gold` runs no model, so
-it checks two different things: every answerable case's gold SQL executes and
-scores `correct` against itself (100 % EX), and every non-answerable case is
-well-formed — no gold SQL, and an `expected` whose correct code is one the
-pipeline can actually produce. Safety *accuracy* is a model metric and is
-reported only for model runs.
+The gold baseline keeps its role as a gate, defined **separately from
+headline EX**. `--mode gold` runs no model; the gate passes when all three
+hold: every *valid* reference executes and self-matches under `rows_equal_v2`;
+every `reference_invalid` ID is on the suite's reviewed exception list; and
+every non-answerable case is well-formed — no gold SQL, and an `expected`
+whose correct code is one the pipeline can produce. Headline EX and reference
+coverage are still reported for the gold run, and a suite with excepted
+references passes the gate while showing headline EX below 100 % — nine valid
+self-matching references plus one excepted invalid one is a passing gate at
+90 %. A suite with **zero valid references** fails the gate and reports EX as
+`0 / 0 (undefined)`, never as 100 %. Safety *accuracy* is a model metric and
+is reported only for model runs.
 
 ### 4.5 Run policy and the CI gate
 
@@ -255,9 +285,10 @@ reported only for model runs.
 - **CI gate (every push, no provider, no network):** `--mode gold` over every
   suite whose data is present. `safety` and `demo` always run; the public
   subsets run only when the archives are cached on the runner and otherwise
-  skip with an explicit reason, the same pattern as the PostgreSQL tests. Gold
-  must score 100 % EX on answerable cases and every non-answerable case must
-  pass the structural check. This proves the harness, not the model.
+  skip with an explicit reason, the same pattern as the PostgreSQL tests. The
+  gold gate as defined in §4.4 must pass: valid references self-match, invalid
+  ones are on the exception list, non-answerable cases are well-formed. This
+  proves the harness, not the model.
 - **Accuracy regression gate (on demand, needs a model):** compares a new
   `complete` run with a named baseline run. The two are **compatible** only if
   their manifests agree on suite hash, subset hash, source release, scorer
@@ -307,11 +338,16 @@ Tests live in `tests/test_evaluation.py` (extended) and
 - Blocked gold: a fixture case whose gold SQL the validator refuses scores
   `reference_invalid` without being executed, stays in the headline
   denominator, is excluded from the conditional score, is listed by ID, fails
-  the gold gate, and passes it once its ID is on the exception list.
-- Run identity: evidence on/off, RAG on/off and two identical runs on one day
-  produce distinct directories; a second run into an existing completed
-  directory is refused; a model name containing `/` and `:` yields a valid
-  path; a dirty tree is recorded and marks the run not citable.
+  the gold gate, and passes it once its ID is on the exception list — with the
+  gate passing while headline EX reads 9/10. A suite of only invalid
+  references fails the gate and reports `0 / 0 (undefined)`.
+- Run identity: evidence on/off, RAG on/off and two identical runs with a
+  frozen timestamp produce distinct directories (the nonce differs, the
+  identity hash does not); the identity hash is unchanged by status,
+  duration and outage count; a model name containing `/` and `:` yields a
+  valid path; a dirty tree is recorded and marks the run not citable; an
+  outage-to-complete resume keeps the same directory and refuses when the
+  identity payload differs from the saved manifest.
 - Outage: a persistent provider error yields `outage`, the run is
   `incomplete`, and `--resume` retries only those cases.
 - Intervals: the bootstrap is deterministic under its seed; a rate of 0/n and
