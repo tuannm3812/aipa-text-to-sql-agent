@@ -3022,3 +3022,136 @@ commit, or message to another agent was made.
 The owner approved the spec after these revisions. Status set accordingly; the
 implementation plan follows. Documentation only; the application suite was not
 rerun.
+
+## 2026-10-09 — Codex: review of Claude's second revision and implementation plan
+
+Reviewed `7c3facc` and `8d6876e`, including the complete implementation plan
+`docs/superpowers/plans/2026-10-08-evaluation-contract-v2.md`, against the
+revised spec and the current scorer, pipeline and UI. The tree was clean at
+the start. Both commits change documentation only; v2 is not implemented.
+
+**Previous findings:** the unconditional 100% gold requirement is removed from
+the gate and CI prose, and run identity now excludes mutable execution fields,
+uses an exclusively allocated nonce, and checks identity on resume. Those two
+findings are addressed at the design level. The plan also defines the embedded
+manifest checksum over a manifest with its checksum field blank, avoiding a
+self-referential checksum. The v1/v2 scorer wording is aligned.
+
+**Assessment:** five P2 issues remain in the implementation instructions. These
+are concrete corrections for Claude before implementation, not a request to
+reopen the owner's benchmark or architecture choices.
+
+### 1. P2 — zero valid references conflates a safety-only suite with invalid gold
+
+Spec §4.4 (lines 275–276) says any suite with zero valid references fails the
+gate. Task 6 (plan lines 462–477), however, constructs `safety` entirely from
+non-answerable cases and requires its gold gate to pass. Such a suite has zero
+valid references by design, so following the unconditional rule would make
+the mandatory `demo safety` CI command fail.
+
+The same paragraph and Task 6's all-invalid fixture call EX `0/0`. For ten
+answerable cases whose references are all invalid, the agreed headline is
+actually `0/10 = 0%`; only EX over valid references is `0/0 (undefined)`.
+No-answerable and all-invalid-answerable are different populations.
+
+**For Claude:** apply the zero-valid-reference failure only when answerable
+cases exist. A nonempty safety-only suite can pass its structural gate with
+answerable EX marked not applicable; gold mode must not pretend to measure
+model safety accuracy. Keep `0/N` headline EX and undefined conditional EX
+for the all-invalid-answerable case. Pin separate safety-only, all-invalid,
+and mixed-population fixtures in both spec and plan.
+
+### 2. P2 — repr-sorted rows do not implement tolerant multiset matching
+
+Task 2 (lines 270–275) compares unordered rows by sorting each side by the
+canonical repr of its cells and then comparing cells with numeric tolerance.
+Those sort keys do not define the same equivalence as the tolerance rule.
+For example:
+
+```python
+gold = [(1.0, "b"), (1.0000001, "a")]
+generated = [(1.0, "a"), (1.0000001, "b")]
+```
+
+A one-to-one pairing exists: match each text value to itself, and both numeric
+differences are within tolerance. Repr-sorting orders the smaller number first
+on both sides, pairs different text values, and returns False. Approximate
+numeric equality is also non-transitive; rounding into fixed buckets cannot
+be assumed to implement this policy exactly.
+
+Task 2's supplied test (lines 224–230) additionally asserts that v1 accepts
+an extra duplicate row when `ordered=False`. The current `rows_match`
+retains duplicate multiplicity and returns False, so that assertion fails
+regardless of the v2 implementation. The revised spec also still incorrectly
+describes duplicate handling as a leniency v1 accepts.
+
+**For Claude:** define unordered equality using a one-to-one row match under
+the cell predicate, with an algorithm that handles ambiguous matches rather
+than assuming sorted positions or greedy matching suffice. Add the example
+above and an ambiguous matching fixture. Separate the duplicate rejection
+test from the four demonstrated v1 leniencies; both versions reject extra
+duplicates. Keep the four verified legacy probes unchanged.
+
+### 3. P2 — the claimed crash-resume flow has no initial manifest or pending cases
+
+Task 5 (lines 418–424) says per-case CSV writes make a crash resumable, but
+places the manifest write at completion. Resume then requires that saved
+manifest and retries only `outage` rows. A crash halfway through an otherwise
+healthy run can therefore leave no manifest, and cases never reached have no
+CSV row to retry. The plan does not define how these cases are recovered.
+
+**For Claude:** persist an incomplete manifest before the first case, checkpoint
+completed rows atomically, and distinguish unattempted cases from saved
+terminal results. Resume should execute missing cases as well as outages,
+retain completed terminal rows, validate the selected ID set, and mark the run
+complete only after every selected case has a terminal outcome without an
+outage. Add a simulated interruption after a successful case and prove that
+resume keeps that case and executes the remaining cases once. If crash resume
+is intentionally excluded, remove that promise and explicitly reject partial
+runs rather than allowing a partial denominator to appear complete.
+
+### 4. P2 — the planned manifest drops required benchmark provenance
+
+Task 4 writes `.source.json` with archive hash and licence (lines 352–359).
+Task 5 defines `Manifest` as identity fields plus execution metadata (lines
+381–416), but those fields contain only `source_release` and adapter version;
+archive hash and licence are absent. The spec's §4.2 says the manifest copies
+source metadata and §4.4 explicitly requires archive hash, release and licence.
+A detached result directory would thus lose the provenance the spec requires.
+
+**For Claude:** include the required source metadata in `Manifest`, copy it
+from the selected suite's source file, and verify the round trip in a runner
+fixture that carries distinctive archive hash and licence values. Define the
+representation for locally authored `demo`/`safety` suites, which have no
+download archive. Resolve this in the interface rather than leaving it to an
+implementer to invent extra fields.
+
+### 5. P2 — Task 9 cites subset results where the spec requires full releases
+
+Task 9 (lines 567–575) produces only routine subset200 public runs, then uses
+them as the README's v2 headline tables. The approved spec's §4.5 says full dev
+sets produce the README's dated release results, and §5 explicitly says the
+README cites full-set runs only. Labelling a subset accurately does not satisfy
+that selected publication policy. The plan's own global rule says the spec
+governs when the two differ.
+
+**For Claude:** keep routine subset results as harness verification artifacts
+and add the full dev runs before publishing the public benchmark headline
+tables. If full runs cannot be completed, record the gap and leave publication
+of those tables pending. Any deliberate change to the owner's release policy
+must be stated as a spec change rather than silently introduced by Task 9.
+
+### Verification and scope
+
+Read both documentation commits and the full plan, checked the existing
+`rows_match`, `ask_database_with_sql`, `execute_query` and evaluation UI, and
+confirmed the change range contains no application code. A standalone Python
+probe executed the actual legacy comparator functions extracted from their
+AST: the plan's duplicate assertion evaluated False. A second probe of the
+proposed repr-sort strategy evaluated False for the numeric/text example
+above, while its alternative one-to-one pairing evaluated True. These are
+contract/plan probes, not tests of a v2 implementation. No network, benchmark
+download, provider call or full application suite was needed for this
+documentation review. Only this append-only log entry was changed; no spec or
+plan rewrite, application fix, commit, push or message to another agent was
+made.
