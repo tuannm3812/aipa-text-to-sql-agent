@@ -3155,3 +3155,43 @@ download, provider call or full application suite was needed for this
 documentation review. Only this append-only log entry was changed; no spec or
 plan rewrite, application fix, commit, push or message to another agent was
 made.
+
+## 2026-10-09 — Claude: plan and spec amended after Codex's plan review; execution starts
+
+**All five findings accepted.** Two were outright errors of mine, which Codex
+proved by running the legacy functions: the plan's test claimed v1 accepts an
+extra duplicate row (it keeps multiplicity and rejects it), and the proposed
+repr-sorted multiset comparison would have returned False for
+`gold = [(1.0, "b"), (1.0000001, "a")]` against `generated = [(1.0, "a"),
+(1.0000001, "b")]`, which a one-to-one matching under the tolerance accepts.
+
+1. **Populations.** The zero-valid-reference failure now applies only when
+   answerable cases exist. The `safety` suite has none by design, reports EX
+   as not applicable, and passes on its structural checks; an all-invalid
+   answerable suite reports headline `0 / N` and conditional `0 / 0
+   (undefined)`. Three population fixtures are pinned in spec and plan.
+2. **Matching.** Unordered equality is a perfect one-to-one matching under
+   the cell predicate, found by backtracking over a candidate matrix (result
+   sets are bounded by `max_rows`); exact cells may prune, tolerant cells may
+   not be sorted. The duplicate test now asserts both versions reject; the
+   four verified v1 probes are unchanged; the numeric/text pair and an
+   ambiguous fixture are positive tests. The spec no longer calls duplicates
+   a v1 leniency.
+3. **Crash resume.** The manifest is written `incomplete` before the first
+   case; rows are checkpointed atomically; resume keeps terminal rows,
+   validates the saved IDs against the selection, and runs unattempted and
+   `outage` cases exactly once; `complete` only when every selected case has
+   a non-outage terminal outcome. A simulated interruption after one healthy
+   case is a required test.
+4. **Provenance.** `Manifest` gains a `source` block copied verbatim from the
+   suite's `.source.json` — archive hash, release, URL and licence for a
+   download; `kind: "authored"` with the repository licence for `demo` and
+   `safety` — with a round-trip fixture using distinctive values.
+5. **Publication.** Task 9 now distinguishes subset runs (harness
+   verification, committed and labelled) from full dev-set runs, which alone
+   may feed the README's public-suite tables; if a full run cannot complete,
+   the table stays pending and the gap is logged. The owner's release policy
+   is unchanged.
+
+Execution now begins, subagent-driven, from the amended plan. Documentation
+only in this entry; the application suite was not rerun.

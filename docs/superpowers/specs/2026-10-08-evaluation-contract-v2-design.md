@@ -1,7 +1,7 @@
 # Evaluation Contract v2 — Spider, BIRD and a safety suite
 
 **Date:** 2026-10-08
-**Status:** Approved by the owner 2026-10-08, after two Codex design reviews
+**Status:** Approved by the owner 2026-10-08; amended 2026-10-09 after Codex's plan review (populations, matching, resume, provenance)
 **Parent:** the production-readiness direction, `docs/6_agent_log.md`
 (2026-10-07 and 2026-10-08 portfolio-session entries); gate **G2**
 **Baseline standard:** `~/Documents/GitHub/coding-standards/coding_standards.md`
@@ -169,16 +169,23 @@ legacy `rows_match`:
   `abs(a - b) <= 1e-6 * max(1, abs(a), abs(b))`. An integer-valued float
   equals its integer. Text never equals a number.
 - Rows are a **multiset**: duplicates count. A result with an extra duplicate
-  row is wrong.
+  row is wrong (as it already is under v1, which keeps multiplicity).
+- Unordered equality is a **one-to-one matching** of rows under the cell
+  predicate above — not a sort-then-compare, because a relative tolerance is
+  not a total order and two rows can tie on a numeric cell while differing on
+  a text one. The implementation finds a perfect matching (backtracking over
+  candidate pairs; result sets here are small) and treats an ambiguous
+  candidate set exactly, never greedily.
 - Order matters **iff the gold SQL has a top-level `ORDER BY`** (Spider's
   rule, applied to both suites); otherwise rows are compared unordered.
 - Column *names* are ignored, column *count* must match, and columns are
   compared positionally.
 
 This is a different policy from the legacy comparator, not a uniformly
-stricter one: v2 rejects the case, `NULL`-as-text, duplicate and ordering
-leniencies v1 accepts, while v1's two-decimal rounding rejects some
-large-number differences that v2's relative tolerance accepts. That is why the
+stricter one: v2 rejects the case, `NULL`-as-text, precision and ordering
+leniencies v1 accepts (the four reproduced probes), while v1's two-decimal
+rounding rejects some large-number differences that v2's relative tolerance
+accepts. Both reject an extra duplicate row. That is why the
 report's "not comparable to the May tables" claim is stated as a policy
 difference, not an improvement. The legacy `score_case`/`rows_match` stay
 unchanged and versioned as `scorer v1`; v2 is `scorer v2`, and the manifest
@@ -228,18 +235,29 @@ One run writes one directory named by a **unique run ID**:
   allocated atomically with `mkdir` (exclusive); on collision a new nonce is
   drawn. Two identical runs started in the same second therefore get distinct
   directories, and nothing is ever overwritten.
-- `--resume` keeps the run ID, re-reads the saved manifest, and **refuses**
-  unless the current identity payload equals the saved one, so retried cases
+- The runner writes the manifest with `status: "incomplete"` **before the
+  first case**, appends each case's terminal row to `cases.csv` atomically
+  (write to a temp file, rename), and so can be interrupted at any point. On
+  `--resume` it keeps the run ID, re-reads the saved manifest, **refuses**
+  unless the current identity payload equals the saved one (so retried cases
   are never combined with results from different code, prompt, suite or
-  settings. A checksum of the final complete manifest is recorded in the
-  manifest itself as `manifest_sha256`, separate from the identity hash.
+  settings), validates that the saved rows' IDs are a subset of the selected
+  ID set, keeps every saved terminal row, and runs the cases that are
+  **unattempted or `outage`**. A run becomes `complete` only when every
+  selected case has a terminal outcome and none is `outage`; a partial run
+  can never present a partial denominator as complete. A checksum of the
+  final manifest is recorded as `manifest_sha256`, computed with that field
+  blank, separate from the identity hash.
 
 The directory holds three files:
 
 - `manifest.json`: repo commit **and whether the tree was dirty** (a dirty
   run is marked `citable: false`), suite name and the **SHA-256 of the
   normalised suite file**, subset name and the **SHA-256 of the ID list** (or
-  `full`), the source archive hash, release and licence, **adapter version**,
+  `full`), a **`source` block copied verbatim from the suite's `.source.json`**
+  — for a public suite `kind: "download"`, `release`, `url`, `sha256`,
+  `licence`; for an authored suite `kind: "authored"`, `author`, `licence`
+  (the repository's) — **adapter version**,
   scorer version (a constant in `evaluation.py` bumped on any scoring
   change), prompt hash (SHA-256 of the assembled system prompt for the
   engine), provider, model, `use_rag`, `rag_top_k`, `evidence`, `work_limit`,
@@ -272,9 +290,14 @@ whose correct code is one the pipeline can produce. Headline EX and reference
 coverage are still reported for the gold run, and a suite with excepted
 references passes the gate while showing headline EX below 100 % — nine valid
 self-matching references plus one excepted invalid one is a passing gate at
-90 %. A suite with **zero valid references** fails the gate and reports EX as
-`0 / 0 (undefined)`, never as 100 %. Safety *accuracy* is a model metric and
-is reported only for model runs.
+90 %. Two populations must not be confused: a suite whose answerable cases
+**all** have invalid references reports headline EX `0 / N = 0 %` and
+conditional EX `0 / 0 (undefined)`, and fails the gate unless every one is
+excepted; a suite with **no answerable cases at all** (the `safety` suite is
+one by design) has no EX to report — both are marked *not applicable* — and
+passes the gate on its structural checks alone. The zero-valid-reference
+failure applies only when answerable cases exist. Safety *accuracy* is a
+model metric and is reported only for model runs; gold mode never claims it.
 
 ### 4.5 Run policy and the CI gate
 
@@ -339,8 +362,22 @@ Tests live in `tests/test_evaluation.py` (extended) and
   `reference_invalid` without being executed, stays in the headline
   denominator, is excluded from the conditional score, is listed by ID, fails
   the gold gate, and passes it once its ID is on the exception list — with the
-  gate passing while headline EX reads 9/10. A suite of only invalid
-  references fails the gate and reports `0 / 0 (undefined)`.
+  gate passing while headline EX reads 9/10. Three population fixtures: a
+  safety-only suite passes on structural checks with EX not applicable; an
+  all-invalid answerable suite reports `0 / N` headline and `0 / 0
+  (undefined)` conditional and fails; a mixed suite reports both populations
+  correctly.
+- Comparator matching: the pair `gold = [(1.0, "b"), (1.0000001, "a")]`,
+  `generated = [(1.0, "a"), (1.0000001, "b")]` is equal unordered (a sort by
+  repr would say otherwise); an ambiguous fixture where a greedy first-match
+  fails but a perfect matching exists is equal; the extra-duplicate case is
+  rejected by both v1 and v2.
+- Crash resume: interrupt a run after one successful case; resume keeps that
+  row, runs the remaining cases exactly once, and the run completes with the
+  same directory.
+- Provenance: a runner fixture with distinctive `sha256` and `licence` values
+  in its `.source.json` round-trips them into the manifest; an authored suite
+  yields `kind: "authored"`.
 - Run identity: evidence on/off, RAG on/off and two identical runs with a
   frozen timestamp produce distinct directories (the nonce differs, the
   identity hash does not); the identity hash is unchanged by status,

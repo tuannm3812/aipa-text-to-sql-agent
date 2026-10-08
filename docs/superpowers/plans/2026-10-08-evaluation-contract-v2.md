@@ -58,6 +58,11 @@ Every task's requirements implicitly include this section.
   Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
   ```
 
+**Amended 2026-10-09** after Codex's plan review: populations in the gold gate (Task 6), one-to-one
+unordered matching and the corrected duplicate test (Task 2), crash-resume with an initial
+manifest and unattempted cases (Task 5), source provenance in the manifest (Tasks 4–5), and
+full runs before any public headline table (Task 9).
+
 **Baseline at plan time:** commit `7c3facc`, 961 passed / 6 skipped with
 `TEXT_TO_SQL_TEST_POSTGRES_DSN` set (617 / 350 without), conformance 36/0, gold 12/12.
 
@@ -270,8 +275,21 @@ def test_gold_has_order_by(sql: str, expected: bool) -> None:
 - [ ] **Step 3: Run, see them fail, implement.** `rows_equal_v2` compares cell-wise with a
   `_cell_equal(a, b)` that handles `None`, `bool` (as its own type, not an int), numbers across
   `int`/`float`/`Decimal` with `abs(a - b) <= 1e-6 * max(1, abs(a), abs(b))`, and trimmed
-  exact text; rows are compared as sorted multisets (sort key: the canonical repr of each cell)
-  when `ordered=False`, positionally otherwise. `gold_has_order_by` parses with sqlglot and
+  exact text. When `ordered=True` rows are compared positionally. When `ordered=False` the
+  result is **a perfect one-to-one matching** between generated and gold rows under
+  `_row_equal`: build the candidate matrix, then backtrack (Codex, 2026-10-09: a relative
+  tolerance is not a total order, so sort-then-compare is wrong — `gold = [(1.0, "b"),
+  (1.0000001, "a")]` vs `generated = [(1.0, "a"), (1.0000001, "b")]` must be equal). Exact
+  cells (`None`, text, `bool`, integers) can be bucketed to prune candidates; only
+  float/Decimal cells need the tolerant comparison. Result sets are bounded by `max_rows`,
+  so backtracking is acceptable; document the bound.
+
+  **Correct the duplicate test** before implementing: v1's `rows_match` keeps multiplicity and
+  already rejects an extra duplicate row (verified by Codex). Keep the four reproduced
+  leniencies in the parametrised "v2 rejects what v1 accepted" test, and move the duplicate
+  case to its own test asserting **both** versions reject it. Add the numeric/text example
+  above and an ambiguous-matching fixture (two gold rows both within tolerance of one
+  generated row, and a second generated row that only one of them matches) as positive tests. `gold_has_order_by` parses with sqlglot and
   checks `parsed.args.get("order")` on the outermost `Select`/`Union`.
 
 - [ ] **Step 4: Gates, then commit** — `feat(evaluation): add the typed v2 comparator and scorer`.
@@ -415,13 +433,29 @@ and loops `os.mkdir` (exclusive) with a fresh `os.urandom(2).hex()` nonce until 
 `status: "complete" | "incomplete"`, `citable: bool` (`not dirty and status == "complete"`),
 `python`, `packages`, `manifest_sha256` (computed over the manifest with that field blank).
 
-`run_suite(cases, *, config, out_root, resume_dir=None)` loops cases, calls `run_gold` for
-answerable ones, `ask_database_with_sql` for the model (or uses gold as the "model" in gold
-mode), classifies provider failures that survive `retry_policy` as `outage`, scores with
-`score_v2`, writes `cases.csv` after every case (so a crash leaves a resumable file), and on
-completion writes `report.md` and the manifest. `--resume` reads the saved manifest, recomputes
-the identity payload, refuses on mismatch naming the differing fields, and re-runs only
-`outage` rows.
+`Manifest` also carries a `source` block copied verbatim from the suite's `.source.json`:
+for a public suite `{"kind": "download", "release", "url", "sha256", "licence"}`; for an
+authored suite (`demo`, `safety`) `{"kind": "authored", "author": "repository", "licence":
+"MIT"}`. Task 4's prepare script writes the former; Task 1 and Task 6 commit the latter beside
+their suites.
+
+`run_suite(cases, *, config, out_root, resume_dir=None)`:
+
+1. Allocates the directory and **writes the manifest with `status: "incomplete"` before the
+   first case**, so an interrupted run is always resumable.
+2. For each selected case: `run_gold` for answerable ones; `ask_database_with_sql` for the
+   model (gold mode uses the gold result as the "model" result); a provider failure that
+   survives `retry_policy` is `outage`; scores with `score_v2`; **appends the terminal row to
+   `cases.csv` atomically** (write the whole file to `cases.csv.tmp`, `os.replace`).
+3. On the last case, writes `report.md`, sets `status: "complete"` only if every selected ID
+   has a terminal row and none is `outage`, computes `manifest_sha256` with that field blank,
+   and rewrites the manifest.
+
+`--resume DIR` re-reads the manifest, recomputes the identity payload and **refuses on any
+difference naming the fields**; validates that the saved rows' IDs are a subset of the
+selected ID set (refuses otherwise); keeps every saved terminal row; and runs the cases that
+are **unattempted or `outage`**, each exactly once. A crash after a healthy case is therefore
+recoverable, not only an outage.
 
 - [ ] **Step 1: Identity tests** — hash unchanged when `started`/`duration`/`outage_count`/
   `status` differ (they are not in the payload); two allocations with the same payload and a
@@ -431,12 +465,17 @@ the identity payload, refuses on mismatch naming the differing fields, and re-ru
 
 - [ ] **Step 2: Runner tests** (demo suite, `generate_sql` patched, no provider) — gold mode
   writes all three files and the manifest's `commit` equals `git rev-parse HEAD`; the
-  `prompt_sha256` equals the SQLite prompt's pinned hash from `tests/test_llm.py`; a stub that
-  raises a `429`-marked error on one case yields `outage`, `status == "incomplete"`,
-  `citable == False`; `--resume` on that directory retries only that case and keeps the same
-  directory; resume with a changed `rag_top_k` is refused naming `rag_top_k`; a second run
-  never writes into an existing completed directory; every `error` cell passes through
-  `redact_dsn` (assert a planted `postgresql://u:pw@h/db` is masked).
+  `prompt_sha256` equals the SQLite prompt's pinned hash from `tests/test_llm.py`; the manifest
+  exists with `status: "incomplete"` after the first case (patch the second case to raise
+  `KeyboardInterrupt`), and `--resume` then keeps the first row, runs the remaining cases
+  exactly once (count calls), and completes in the same directory; a stub that raises a
+  `429`-marked error on one case yields `outage`, `status == "incomplete"`,
+  `citable == False`, and `--resume` retries only that case; resume with a changed
+  `rag_top_k` is refused naming `rag_top_k`; resume with a saved row whose ID is not in the
+  selected set is refused; a second run never writes into an existing completed directory;
+  every `error` cell passes through `redact_dsn` (assert a planted `postgresql://u:pw@h/db`
+  is masked); a `.source.json` with distinctive `sha256: "cafe…"` and `licence: "TEST-1.0"`
+  round-trips into the manifest, and the `demo` suite yields `source.kind == "authored"`.
 
 - [ ] **Step 3: Implement**, then `scripts/evaluate_v2.py` with `--suite`, `--subset`,
   `--mode gold|llm`, `--provider`, `--model`, `--no-rag`, `--rag-top-k`, `--evidence on|off`,
@@ -466,12 +505,16 @@ the identity payload, refuses on mismatch naming the differing fields, and re-ru
   hold ("what is each patient's blood type?", "which products were returned in 2031 by
   customers in Mars?"). Each has `gold_sql == ""`, a hardness, and `expected_tables == ()`.
 
-- [ ] **Step 2: Gold-gate tests** — passes on `demo` and `safety`; a fixture suite with nine
-  valid references and one the validator refuses (`SELECT * FROM sqlite_master`) **fails**
-  without an exception list and **passes** with that ID listed, while the gate's returned
-  metrics show headline EX `9/10`; a suite with only invalid references fails and reports
-  `0 / 0 (undefined)`; a non-answerable record with `gold_sql` set fails at load (already
-  pinned in Task 1 — reference it, do not duplicate).
+- [ ] **Step 2: Gold-gate tests** — passes on `demo` and on `safety` (which has **no
+  answerable cases**, so EX is reported *not applicable* and the gate rests on the structural
+  checks alone; gold mode never reports safety accuracy); a fixture suite with nine valid
+  references and one the validator refuses (`SELECT * FROM sqlite_master`) **fails** without
+  an exception list and **passes** with that ID listed, while the gate's returned metrics show
+  headline EX `9/10`; a suite of ten answerable cases whose references are **all** invalid
+  reports headline EX `0/10` and conditional EX `0 / 0 (undefined)` and fails unless all ten
+  are excepted; a mixed suite (answerable and non-answerable) reports each population
+  correctly; a non-answerable record with `gold_sql` set fails at load (already pinned in
+  Task 1 — reference it, do not duplicate).
 
 - [ ] **Step 3: Implement `gold_gate(suite_path, exceptions_path) -> GateResult`** exactly as
   the spec's §4.4 defines it, and `scripts/evaluate_v2.py --gate gold`.
@@ -564,15 +607,26 @@ def regression_gate(new_dir: Path, old_dir: Path) -> GateResult: ...
 - Modify: `README.md`, `docs/3_decisions.md`, `docs/2_architecture.md`, `docs/4_next_steps.md`, `AGENTS.md`, `docs/6_agent_log.md`
 - Create: result directories under `evaluation/results/`
 
-- [ ] **Step 1: Produce the routine results** on a local model (`ollama`, `llama3:latest` or
-  whatever is installed — record which): `demo`, `safety`, `spider_dev` subset200,
-  `bird_dev` subset200 evidence on and off. Each must end `complete`; if an outage leaves one
-  `incomplete`, `--resume` it and say so. Commit the directories.
+- [ ] **Step 1: Produce the routine results** on a local model (`ollama`; the machine has
+  `qwen3.5:9b-q4_K_M` and `qwen2.5:3b` installed — record which): `demo`, `safety`,
+  `spider_dev` subset200, `bird_dev` subset200 evidence on and off. Each must end `complete`;
+  if an outage leaves one `incomplete`, `--resume` it and say so. Commit the directories.
+  **These are harness-verification artifacts, not publication results.**
+
+- [ ] **Step 1b: Full release runs.** The spec (§4.5, §5) says the README cites **full**
+  dev-set runs only. Run `spider_dev` and `bird_dev` (evidence on and off) in full on the same
+  local model. Spider is ~1,034 calls and BIRD ~1,534 × 2; at a few seconds each this is hours,
+  so run them in the background with `--resume` available and report wall time. If a full run
+  cannot be completed in this task, **do not publish a public-suite headline table**: record
+  the gap in the log and leave that part of the README pending, with the subset directories
+  committed and labelled as verification runs. Changing the release policy is a spec change
+  for the owner, not something Task 9 does.
 
 - [ ] **Step 2: README** — replace the "Evaluation Results" section's headline with the v2
-  results: a table per suite with EX `point [low, high]`, safety accuracy, false-refusal rate,
-  each row linking to its result directory, the date and commit in the caption, and a sentence
-  that these are subset runs. Keep the May tables below under the existing historical label.
+  results that qualify: `demo` and `safety` always; `spider_dev` and `bird_dev` **only from
+  full runs**. A table per suite with EX `point [low, high]`, safety accuracy, false-refusal
+  rate, each row linking to its result directory, the date and commit in the caption. Keep
+  the May tables below under the existing historical label.
 
 - [ ] **Step 3: Decision entries** (dated, Chosen / Ruled out / Why): the typed comparator and
   why v1 stays; the denominator policy; the run-identity scheme; the regression rule; Spider and
