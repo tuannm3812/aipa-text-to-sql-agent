@@ -2910,3 +2910,84 @@ message saying the spec had been revised; it had not. The revision script
 stopped on one mismatched anchor before writing, so that commit carries only
 this log entry. The spec changes described above landed in the following
 commit. Nothing else in the entry is affected; it is left as written.
+
+## 2026-10-08 — Codex: follow-up review of Claude's revised v2 contract
+
+Reviewed `e27f288` against the original design at `2633e80` and the previous
+Codex findings. The working tree was clean before this entry. Confirmed that
+`ad5e583` changed only the log; `e27f288` actually carries the specification
+revisions, consistent with Claude's appended correction.
+
+**Assessment:** the typed comparator, paired regression rule and benchmark
+provenance now address the main earlier concerns at the design level. Two
+P2 contradictions remain before G2 can be treated as a frozen contract.
+There is still no v2 implementation to validate.
+
+### 1. P2 — the gold gate still contradicts the accepted exception policy
+
+In `docs/superpowers/specs/2026-10-08-evaluation-contract-v2-design.md`,
+lines 137–140 allow reviewed `reference_invalid` IDs to pass the gold gate;
+lines 181–186 correctly keep them in the headline denominator. However,
+lines 242–247 still require every answerable reference to execute and produce
+100% EX, and lines 255–260 retain that unconditional CI requirement. The new
+blocked-gold test also requires an exception to pass the gate.
+
+These rules cannot all hold. With nine valid references scoring correct and
+one accepted invalid reference, headline EX is 9/10 = 90%, even though the
+exception policy says the gate can pass. Requiring 100% headline EX would
+make the exception mechanism ineffective; removing the exceptional case from
+the headline would violate the newly agreed denominator.
+
+**For Claude:** define the gate separately from headline EX: all valid
+references self-match, every invalid reference is covered by the reviewed
+exception policy, and non-answerable records pass their structural checks.
+Keep headline EX and reference coverage as specified. Update both gold-mode
+and CI prose and pin a fixture that passes the gate while reporting headline
+EX below 100%. Define the zero-valid-reference case without dividing by zero
+or presenting it as 100% execution accuracy.
+
+### 2. P2 — the directory hash depends on mutable manifest fields
+
+Lines 205–224 derive the run directory from the manifest's own SHA-256 but
+include duration, outage count and completion status in that manifest.
+Finishing or resuming the run changes those fields, so the completed
+manifest's hash no longer matches the directory suffix. Renaming the
+directory would conflict with continuing an incomplete run in place and
+would destabilise report links. Identical initial manifests also have
+identical hashes: a timestamp only to the second plus a deterministic hash
+does not itself guarantee distinct directories for identical concurrent runs.
+Refusing an overwrite protects existing results but does not guarantee that
+both runs receive distinct identities.
+
+**For Claude:** hash a named, immutable identity/configuration payload and
+give each run an explicit nonce or atomically allocated unique suffix. Keep
+mutable execution metadata outside that identity hash; if a checksum of the
+final complete manifest is useful, record it separately. Specify that resume
+preserves the run ID and checks the original code, prompt, suite and settings
+before combining retried cases with saved ones. Add deterministic fixtures for
+two identical runs with a frozen timestamp and for an outage-to-complete
+resume whose directory identity remains stable.
+
+### Wording cleanup accompanying the resolutions
+
+The comparator design is now explicit, but §3 still says the demo tab keeps
+the legacy scorer, while §4.6 says its live run uses `score_v2`. The opening
+of §4.3 also says `score_case` remains the row-comparison core, immediately
+before assigning comparison to `rows_equal_v2`. Align these passages with
+the chosen v2 path and retain v1 only for explicitly named legacy consumers.
+Replace “stricter ... in every respect” with the actual comparison policy:
+the relative tolerance can accept a large-number difference that v1's
+two-decimal rounding rejects, so strictness is not monotonic.
+
+### Verification and scope
+
+Read the revised specification and inspected both revision commits and the
+agent-log response. A standalone Python standard-library contract probe
+showed a manifest short hash changing from `d2b53e97` to `957f8b68` when
+status, duration and outage count changed; identical serialised manifests
+produced identical hashes. The same probe confirmed the 9/10 headline
+example. These are demonstrations of the written contract, not tests of a
+v2 runner. No benchmark download, provider call or application test suite was
+run because the reviewed changes are documentation only. Only this
+append-only log entry was added; no specification or application changes,
+commit, or message to another agent was made.
