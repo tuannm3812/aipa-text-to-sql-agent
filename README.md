@@ -2,7 +2,7 @@
 
 An AI-assisted decision support prototype that translates natural-language questions into safe, locally executed SQLite queries.
 
-[![Tests](https://github.com/tuannm3812/aipa-text-to-sql-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/tuannm3812/aipa-text-to-sql-agent/actions/workflows/tests.yml)
+[![Tests](https://github.com/tuannm3812/text-to-sql-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/tuannm3812/text-to-sql-agent/actions/workflows/tests.yml)
 [![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://aipa-text-to-sql-agent.streamlit.app/)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
@@ -162,10 +162,10 @@ because the connecting role happens to be able to read them. On PostgreSQL a
 bare table name means exactly what it would mean in `psql` as that role: the
 first search-path schema holding that name wins, and a table it shadows is
 shown and accepted only under its `schema.table` spelling. To include schemas
-outside the default ones, list them in `AIPA_EXTRA_SCHEMAS`, comma-separated:
+outside the default ones, list them in `TEXT_TO_SQL_EXTRA_SCHEMAS`, comma-separated:
 
 ```bash
-AIPA_EXTRA_SCHEMAS=analytics,reporting
+TEXT_TO_SQL_EXTRA_SCHEMAS=analytics,reporting
 ```
 
 On PostgreSQL this is one of two gates: a named schema is still only read if
@@ -178,10 +178,10 @@ are refused however they are named.
 schema and do not set this, the schema comes back empty and every question
 answers `UNANSWERABLE_WITH_GIVEN_SCHEMA`** — there is nothing wrong with the
 connection, the tables are simply out of scope. That is the symptom to
-recognise: check `AIPA_EXTRA_SCHEMAS` first. Set once per deployment, read
+recognise: check `TEXT_TO_SQL_EXTRA_SCHEMAS` first. Set once per deployment, read
 once per engine instance, and included in the schema cache key, so changing it
 re-reads the catalogue rather than serving a stale scope. See
-`docs/3_decisions.md`'s "schema scope is opt-in, via `AIPA_EXTRA_SCHEMAS`"
+`docs/3_decisions.md`'s "schema scope is opt-in, via `TEXT_TO_SQL_EXTRA_SCHEMAS`"
 entry for what else was considered, and its 2026-09-27 "the search path is
 PostgreSQL's default" entry for why PostgreSQL's default is the whole path.
 
@@ -235,7 +235,7 @@ engine conformance suite, need a real server and are skipped by default:
 
 ```bash
 docker compose -f docker/postgres.yml up -d
-export AIPA_TEST_POSTGRES_DSN=postgresql://aipa_ro:aipa_ro_pw@127.0.0.1:55432/aipa
+export TEXT_TO_SQL_TEST_POSTGRES_DSN=postgresql://aipa_ro:aipa_ro_pw@127.0.0.1:55432/aipa
 uv sync --extra engines
 uv run pytest
 uv run pytest -m conformance -rs   # 36 passed, 0 skipped, with the DSN set
@@ -245,7 +245,7 @@ uv run pytest -m conformance -rs   # 36 passed, 0 skipped, with the DSN set
 write or DDL grants, and the same `customers`/`sales` fixtures the tests
 pin — connect as `aipa_ro`, not the compose file's `postgres` superuser
 account: `PostgresEngine.check_reachable()` deliberately refuses a superuser
-DSN (see `docs/3_decisions.md`). Without `AIPA_TEST_POSTGRES_DSN` set (or
+DSN (see `docs/3_decisions.md`). Without `TEXT_TO_SQL_TEST_POSTGRES_DSN` set (or
 without Docker running), `uv run pytest` still passes; it just skips the
 PostgreSQL-only tests, printing why each one skipped with `-rs`. CI runs
 these tests against a `postgres:16` service container and fails the build if
@@ -426,7 +426,7 @@ For the deployed app, `llama3:latest` is the safer local default. For experiment
 
 For hosted deployment, use:
 
-- Repository: `tuannm3812/aipa-text-to-sql-agent`
+- Repository: `tuannm3812/text-to-sql-agent`
 - Branch: `tuannm3812/main-refinement`
 - Main file path: `app.py`
 - Secrets: add `GEMINI_API_KEY`

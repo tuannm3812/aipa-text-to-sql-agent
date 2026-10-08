@@ -37,7 +37,7 @@ jobs:
       # suite must connect the same least-privilege way a real deployment
       # would, or every PostgreSQL test and the conformance suite's
       # PostgreSQL third would fail closed here too.
-      AIPA_TEST_POSTGRES_DSN: postgresql://aipa_ro:aipa_ro_pw@localhost:5432/aipa
+      TEXT_TO_SQL_TEST_POSTGRES_DSN: postgresql://aipa_ro:aipa_ro_pw@localhost:5432/aipa
     steps:
       - uses: actions/checkout@v4
 
@@ -65,7 +65,7 @@ jobs:
         # test silently skip and this job would go green having tested
         # nothing - the same failure mode the `engines` extra above exists to
         # prevent. Phase 3b's PostgreSQL third can skip the same way if
-        # `AIPA_TEST_POSTGRES_DSN` above ever stops resolving (a broken
+        # `TEXT_TO_SQL_TEST_POSTGRES_DSN` above ever stops resolving (a broken
         # service container, an unapplied init script, a role the engine
         # refuses) - `postgres_dsn` (tests/conftest.py) skips rather than
         # erroring in that case, so this guard is what turns that skip back

@@ -17,7 +17,9 @@
       ]
     }
   },
-  "updateContentCommand": "pip3 install --user uv && uv sync && echo '✅ Environment ready'",
+  // `--extra engines` installs duckdb and psycopg. Without it the engine conformance
+  // suite silently skips two of its three engines and the PostgreSQL tests never run.
+  "updateContentCommand": "pip3 install --user uv && uv sync --extra engines && echo '✅ Environment ready'",
   "postAttachCommand": {
     "server": "uv run streamlit run app.py --server.enableCORS false --server.enableXsrfProtection false"
   },

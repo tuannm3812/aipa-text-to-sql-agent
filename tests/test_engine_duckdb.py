@@ -1381,11 +1381,11 @@ def cross_schema_duplicate_name_db(tmp_path, monkeypatch):
 
     Schema scope became opt-in after this fixture was written (owner
     decision, 2026-09-26): DuckDB has no privilege model to fall back on, so
-    `AIPA_EXTRA_SCHEMAS` is the only gate on `analytics` being read at all.
+    `TEXT_TO_SQL_EXTRA_SCHEMAS` is the only gate on `analytics` being read at all.
     `monkeypatch.setenv` here opts it in so the fixture still reproduces the
     scenario it was built for, rather than the schema simply being invisible.
     """
-    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "analytics")
+    monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", "analytics")
     db = tmp_path / "dup.duckdb"
     con = duckdb.connect(str(db))
     con.execute("CREATE TABLE main.shared (main_only INTEGER)")
@@ -1447,10 +1447,10 @@ def non_main_schema_only_db(tmp_path, monkeypatch):
     the model should have needed and, after wrongly approving the unqualified
     form, the query failed against the real database anyway.
 
-    Opts `analytics` in via `AIPA_EXTRA_SCHEMAS` - see `cross_schema_
+    Opts `analytics` in via `TEXT_TO_SQL_EXTRA_SCHEMAS` - see `cross_schema_
     duplicate_name_db`'s docstring for why, now that schema scope is opt-in.
     """
-    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "analytics")
+    monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", "analytics")
     db = tmp_path / "nonmain.duckdb"
     con = duckdb.connect(str(db))
     con.execute("CREATE SCHEMA analytics")
@@ -1497,7 +1497,7 @@ def test_table_outside_main_is_advertised_and_accepted_only_when_qualified(
 #
 # DuckDB has no privilege model the way PostgreSQL does (`_user_schema_names`,
 # `has_schema_privilege`) - opening the file grants access to every schema in
-# it - so `AIPA_EXTRA_SCHEMAS` is the *only* gate here, not a second one
+# it - so `TEXT_TO_SQL_EXTRA_SCHEMAS` is the *only* gate here, not a second one
 # alongside a grant check. `non_main_schema_only_db`/
 # `cross_schema_duplicate_name_db` above already prove the opted-in case
 # (they opt `analytics` in via `monkeypatch.setenv`); these prove the default
@@ -1510,7 +1510,7 @@ def test_a_schema_outside_main_is_not_advertised_without_opting_in(tmp_path, mon
     DuckDB itself would stop the read - unlike PostgreSQL, there is no grant
     for a deployment to have forgotten; the opt-in is the whole guard.
     """
-    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    monkeypatch.delenv("TEXT_TO_SQL_EXTRA_SCHEMAS", raising=False)
     db = tmp_path / "not_opted_in.duckdb"
     con = duckdb.connect(str(db))
     con.execute("CREATE SCHEMA analytics")
@@ -1526,14 +1526,14 @@ def test_a_schema_outside_main_is_not_advertised_without_opting_in(tmp_path, mon
 
 
 def test_duckdb_schema_fingerprint_changes_when_the_opted_in_set_changes(tmp_path, monkeypatch):
-    """`AIPA_EXTRA_SCHEMAS` is process configuration the DuckDB file itself
+    """`TEXT_TO_SQL_EXTRA_SCHEMAS` is process configuration the DuckDB file itself
     never records, so neither its mtime nor its size changes when the opt-in
     set does - see `DuckDBEngine.schema_fingerprint`'s docstring for why the
     config is hashed in directly rather than relying on the file to reflect
     it. Without this, `schema.py`'s cache would keep serving the pre-change
     schema to a process whose opt-in set had already changed.
     """
-    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    monkeypatch.delenv("TEXT_TO_SQL_EXTRA_SCHEMAS", raising=False)
     db = tmp_path / "fingerprint_opt_in.duckdb"
     con = duckdb.connect(str(db))
     con.execute("CREATE SCHEMA analytics")
@@ -1541,7 +1541,7 @@ def test_duckdb_schema_fingerprint_changes_when_the_opted_in_set_changes(tmp_pat
     con.close()
 
     before = open_engine(f"duckdb://{db}").schema_fingerprint()
-    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "analytics")
+    monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", "analytics")
     after = open_engine(f"duckdb://{db}").schema_fingerprint()
 
     assert after != before
@@ -1557,7 +1557,7 @@ def test_internal_schema_filter_arity_tracks_internal_schemas_length(tmp_path, m
     else exercises a three-entry `_INTERNAL_SCHEMAS`. This monkeypatches it
     to three and proves both call sites still run.
     """
-    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    monkeypatch.delenv("TEXT_TO_SQL_EXTRA_SCHEMAS", raising=False)
     db = tmp_path / "arity.duckdb"
     con = duckdb.connect(str(db))
     con.execute("CREATE TABLE customers (id INTEGER)")

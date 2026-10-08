@@ -42,7 +42,7 @@ whatever `search_path` finds first.
 
 A 2026-09-26 owner decision narrowed Task 6's "every schema this role can
 read" to an opt-in: `_user_schema_names` now reads `default_schema` plus only
-what `engines/base.py`'s `extra_schemas_from_env()` (`AIPA_EXTRA_SCHEMAS`)
+what `engines/base.py`'s `extra_schemas_from_env()` (`TEXT_TO_SQL_EXTRA_SCHEMAS`)
 names, still gated by `has_schema_privilege` - see that function's own
 docstring. The same owner decision added `_refuse_if_role_is_overprivileged`,
 called from `check_reachable()`: PostgreSQL's defence against reading host
@@ -105,7 +105,7 @@ and is the single answer used both to decide which chunks are spelled bare
 schema-qualify each bare table in the SQL `execute()` runs
 (`safety.qualify_bare_table_references`). Scope widened with it: every
 schema on the path is read (`_scope_schema_names`, which replaced
-`_user_schema_names`), and `AIPA_EXTRA_SCHEMAS` now means schemas outside
+`_user_schema_names`), and `TEXT_TO_SQL_EXTRA_SCHEMAS` now means schemas outside
 the path. `shadowed_function_names()` is kept as defence in depth. See
 `docs/3_decisions.md`'s 2026-09-27 entries.
 """
@@ -352,12 +352,12 @@ def _scope_schema_names(
 
     Decision (2026-09-27), refining the 2026-09-26 opt-in decision. That
     decision read only `default_schema` (`current_schema()`, the *first*
-    path entry) plus `AIPA_EXTRA_SCHEMAS`. But the search path *is*
+    path entry) plus `TEXT_TO_SQL_EXTRA_SCHEMAS`. But the search path *is*
     PostgreSQL's meaning of "default": every schema on it can supply a bare
     table name, and Codex's Finding 2 showed the server answering a bare
     `customers` from `public` while this engine, reading only `aipa_ro`,
     refused it. So every schema on the role's effective path is now in
-    scope, and `AIPA_EXTRA_SCHEMAS` keeps its meaning for schemas **outside**
+    scope, and `TEXT_TO_SQL_EXTRA_SCHEMAS` keeps its meaning for schemas **outside**
     the path. What stays true of the 2026-09-26 decision: a schema the role
     can merely *read* is still never advertised unless it is on the path or
     opted in - a deployment's staging or PII schema granted for some other
@@ -374,7 +374,7 @@ def _scope_schema_names(
     Args:
         conn: A connection already pinned by `_pin_search_path`.
         search_path: That connection's effective path, in order.
-        extra_schemas: The engine's `AIPA_EXTRA_SCHEMAS` opt-in set.
+        extra_schemas: The engine's `TEXT_TO_SQL_EXTRA_SCHEMAS` opt-in set.
         internal_prefixes: `Engine.internal_prefixes`.
         internal_names: `Engine.internal_names`.
 
@@ -598,7 +598,7 @@ def _fetch_columns(
     moment a query result spans two schemas holding a same-named table:
     their columns land in the same list, silently merged. Every caller in
     this module now passes every search-path schema plus every opted-in
-    `AIPA_EXTRA_SCHEMAS` entry (`_scope_schema_names`), so `schema_names` is
+    `TEXT_TO_SQL_EXTRA_SCHEMAS` entry (`_scope_schema_names`), so `schema_names` is
     routinely more than one element - the keying holds regardless of how
     many schemas are asked for, proven directly, with more than one, by
     `tests/test_engine_postgres.py::
@@ -1305,7 +1305,7 @@ POSTGRESQL DIALECT (must follow):
         """Extract synthesised `CREATE TABLE` statements for every readable table.
 
         Every schema on the role's search path plus whatever is opted into
-        via `AIPA_EXTRA_SCHEMAS` - see `_scope_schema_names`. A table is
+        via `TEXT_TO_SQL_EXTRA_SCHEMAS` - see `_scope_schema_names`. A table is
         written bare when its bare name resolves to it and schema-qualified
         otherwise (`_display_table`), which is both how a query must spell it
         and how `table_names()` advertises it, so nothing is shown here that
@@ -1340,7 +1340,7 @@ POSTGRESQL DIALECT (must follow):
         """Build table-level schema chunks for retrieval without reading row data.
 
         Covers every schema on the role's search path plus whatever is opted
-        into via `AIPA_EXTRA_SCHEMAS` - see `_scope_schema_names`.
+        into via `TEXT_TO_SQL_EXTRA_SCHEMAS` - see `_scope_schema_names`.
         `_fetch_columns`/`_fetch_primary_keys`/`_fetch_foreign_keys` key
         everything by `(schema, table)` rather than bare `table_name`, which
         is what makes more than one schema safe: two schemas sharing a table

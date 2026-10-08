@@ -1,4 +1,4 @@
-# aipa-text-to-sql-agent
+# text-to-sql-agent
 
 A Streamlit decision-support agent that translates natural-language questions
 into safe, read-only SQLite queries, grounding the LLM with a local hybrid schema
@@ -49,7 +49,7 @@ Project-specific rules and deliberate overrides: @docs/0_coding_standards.md
   optional extra.
 - 2026-09-26: Phase 3b (PostgreSQL as the third engine, schema-qualified
   table identity carried through all three) complete. `750` tests pass with
-  `uv run pytest` (`uv sync --extra engines` first, `AIPA_TEST_POSTGRES_DSN`
+  `uv run pytest` (`uv sync --extra engines` first, `TEXT_TO_SQL_TEST_POSTGRES_DSN`
   set against a live `docker compose -f docker/postgres.yml up -d`
   container); the 6 skips left even with the DSN set are a deliberate SQLite
   exemption (`ATTACH` is denied), not a gap. Without the DSN, the same

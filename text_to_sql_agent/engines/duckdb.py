@@ -60,7 +60,7 @@ _DEFAULT_SCHEMA = "main"
 # Decision (2026-09-26): reading "every schema of the opened database" (Task
 # 6's first shape, recorded in the comment above) is not what this engine
 # does - scope is `_DEFAULT_SCHEMA` plus whatever `engines/base.py`'s
-# `extra_schemas_from_env()` opts into (`AIPA_EXTRA_SCHEMAS`), resolved by
+# `extra_schemas_from_env()` opts into (`TEXT_TO_SQL_EXTRA_SCHEMAS`), resolved by
 # `_allowed_schemas()` and read by every catalogue query below. Unlike
 # PostgreSQL, DuckDB has no privilege model to fall back on: opening the file
 # grants access to every schema in it, so the opt-in is the *only* gate here,
@@ -119,7 +119,7 @@ def _quote_qualified(schema_name: str, table_name: str) -> str:
     (`main` by default), which is exactly how a value-hint query for one
     `main`-schema table silently read a same-named table in another schema -
     see `_DEFAULT_SCHEMA`'s comment. Since a second schema can be opted into
-    (`AIPA_EXTRA_SCHEMAS`), this is no longer belt-and-braces alongside a
+    (`TEXT_TO_SQL_EXTRA_SCHEMAS`), this is no longer belt-and-braces alongside a
     `main`-only filter: it is the whole guard. A value-hint query for
     `analytics.shared` must read exactly that table, never `main.shared`,
     whichever the search path would have found.
@@ -576,7 +576,7 @@ DUCKDB DIALECT (must follow):
 
         Review finding 1 (2026-09-26, see `engines/base.py::
         is_internal_schema_name`'s own docstring for the full story):
-        `AIPA_EXTRA_SCHEMAS` is operator-supplied text, and nothing used to
+        `TEXT_TO_SQL_EXTRA_SCHEMAS` is operator-supplied text, and nothing used to
         stop an operator from opting into a schema spelled `PG_evil` or
         `Information_Schema` - `safety._references_internals` would then
         refuse every reference into it anyway (it lowercases before
@@ -678,7 +678,7 @@ DUCKDB DIALECT (must follow):
         what the 2026-09-25 narrowing achieved by showing less instead.
 
         Scoped to `_allowed_schemas()` - `default_schema` plus whatever
-        `AIPA_EXTRA_SCHEMAS` opted into (2026-09-26 decision, see the
+        `TEXT_TO_SQL_EXTRA_SCHEMAS` opted into (2026-09-26 decision, see the
         module-level comment above `_INTERNAL_SCHEMAS`) - not every schema
         of the opened database.
 
@@ -706,7 +706,7 @@ DUCKDB DIALECT (must follow):
         """Build table-level schema chunks for retrieval without reading row data.
 
         Every catalogue query reads `_allowed_schemas()` - `default_schema`
-        plus whatever `AIPA_EXTRA_SCHEMAS` opted into - and every intermediate
+        plus whatever `TEXT_TO_SQL_EXTRA_SCHEMAS` opted into - and every intermediate
         map is keyed by `(schema_name, table_name)` rather than by bare
         `table_name`. That keying is what the 2026-09-25 review
         finding was really about: with a bare-name key, `main.shared` and
@@ -805,7 +805,7 @@ DUCKDB DIALECT (must follow):
 
         The first three match `SQLiteEngine`'s filesystem-metadata
         fingerprint unchanged - a DuckDB database is a file too. The fourth
-        is new (2026-09-26): `AIPA_EXTRA_SCHEMAS` is process configuration,
+        is new (2026-09-26): `TEXT_TO_SQL_EXTRA_SCHEMAS` is process configuration,
         not something the DuckDB file itself records, so a config change
         that opts a schema in or out changes neither the file's mtime nor
         its size. Without this, `schema.py`'s fingerprint-keyed cache would

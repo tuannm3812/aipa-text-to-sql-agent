@@ -54,7 +54,7 @@ def engine(request, tmp_path: Path):
         con.close()
         return open_engine(f"duckdb://{db}")
     if request.param == "postgres":
-        # `postgres_dsn` (tests/conftest.py) already reads AIPA_TEST_POSTGRES_DSN,
+        # `postgres_dsn` (tests/conftest.py) already reads TEXT_TO_SQL_TEST_POSTGRES_DSN,
         # skips with an explicit reason when it is unset or unreachable, and
         # importorskips psycopg - reusing it here keeps that one skip path
         # rather than growing a second copy of the same checks.

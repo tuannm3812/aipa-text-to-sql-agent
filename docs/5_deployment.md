@@ -4,7 +4,7 @@ Use this checklist to deploy the current Streamlit app from the project reposito
 
 ## Repository Settings
 
-- Repository: `tuannm3812/aipa-text-to-sql-agent`
+- Repository: `tuannm3812/text-to-sql-agent`
 - Branch: `tuannm3812/main-refinement`
 - Main file path: `app.py`
 - Python version: choose Python 3.12 in Streamlit Community Cloud advanced settings

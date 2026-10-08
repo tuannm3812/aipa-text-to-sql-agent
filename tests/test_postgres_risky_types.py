@@ -76,9 +76,9 @@ def _through_the_pipeline(dsn: str, sql: str) -> tuple[str, agent.QueryResult]:
 
 @pytest.fixture
 def probe_schema(postgres_dsn: str, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
-    """A fresh, uniquely named schema, opted in via `AIPA_EXTRA_SCHEMAS`, dropped after."""
+    """A fresh, uniquely named schema, opted in via `TEXT_TO_SQL_EXTRA_SCHEMAS`, dropped after."""
     schema = f"aipa_risky_{uuid.uuid4().hex[:10]}"
-    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", schema)
+    monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", schema)
     try:
         _admin(
             postgres_dsn,

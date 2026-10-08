@@ -972,7 +972,7 @@ def test_a_hostile_column_name_elsewhere_cannot_re_arm_the_column_call_bypass(
     regression this pins.
 
     Schema scope became opt-in after this regression was first fixed (owner
-    decision, 2026-09-26): the schema must be named in `AIPA_EXTRA_SCHEMAS`
+    decision, 2026-09-26): the schema must be named in `TEXT_TO_SQL_EXTRA_SCHEMAS`
     or it is invisible regardless of grants, which would make the payload
     refused for the wrong reason (never advertised at all) rather than the
     reason this test exists to pin (advertised, but still refused by
@@ -993,7 +993,7 @@ def test_a_hostile_column_name_elsewhere_cannot_re_arm_the_column_call_bypass(
         conn.execute(f"INSERT INTO {schema}.audit VALUES (42, 'ok')")
         conn.execute(f"GRANT SELECT ON {schema}.audit TO aipa_ro")
     try:
-        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", schema)
+        monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", schema)
         engine = open_engine(postgres_dsn)
         # The fixture is armed: the hostile name really is an advertised
         # column of a readable table outside `public`. Without this the
@@ -1599,7 +1599,7 @@ def test_a_table_outside_public_is_advertised_and_queryable_only_once_opted_in(
     one place: granted but not opted in stays invisible and refused (the
     safe default, and what a deployment that granted `aipa_ro` a schema for
     unrelated tooling needs to be true), and granted *and* opted in via
-    `AIPA_EXTRA_SCHEMAS` is advertised, accepted qualified, refused bare, and
+    `TEXT_TO_SQL_EXTRA_SCHEMAS` is advertised, accepted qualified, refused bare, and
     actually executable, same as Task 6 pinned.
     """
     schema = "task5_only_schema"
@@ -1612,15 +1612,15 @@ def test_a_table_outside_public_is_advertised_and_queryable_only_once_opted_in(
         conn.execute(f"GRANT SELECT ON {schema}.only_here TO aipa_ro")
     try:
         # Granted but not opted in: invisible everywhere, query refused.
-        monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+        monkeypatch.delenv("TEXT_TO_SQL_EXTRA_SCHEMAS", raising=False)
         not_opted_in = open_engine(postgres_dsn)
         assert "only_here" not in not_opted_in.raw_schema()
         assert f"{schema}.only_here" not in not_opted_in.table_names()
         assert not is_safe_query(f"SELECT a FROM {schema}.only_here", engine=not_opted_in)
 
-        # Opted in via AIPA_EXTRA_SCHEMAS: advertised, accepted qualified,
+        # Opted in via TEXT_TO_SQL_EXTRA_SCHEMAS: advertised, accepted qualified,
         # refused bare, executes.
-        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", schema)
+        monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", schema)
         engine = open_engine(postgres_dsn)
         assert "only_here" in engine.raw_schema()
         assert f"{schema}.only_here" in engine.table_names()
@@ -1639,7 +1639,7 @@ def test_a_schema_the_role_cannot_use_is_not_advertised_even_when_opted_in(
 ) -> None:
     """Opt-in and privilege are both required, independently.
 
-    `_user_schema_names` filters `AIPA_EXTRA_SCHEMAS`'s candidates on
+    `_user_schema_names` filters `TEXT_TO_SQL_EXTRA_SCHEMAS`'s candidates on
     `has_schema_privilege`, so a schema with no `USAGE` grant to `aipa_ro` is
     neither read nor advertised even once named in the opt-in list -
     otherwise the model would be shown a table every query against which is
@@ -1652,7 +1652,7 @@ def test_a_schema_the_role_cannot_use_is_not_advertised_even_when_opted_in(
         conn.execute(f"CREATE SCHEMA {schema}")
         conn.execute(f"CREATE TABLE {schema}.secret_ledger (a INTEGER)")
     try:
-        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", schema)
+        monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", schema)
         engine = open_engine(postgres_dsn)
         assert "secret_ledger" not in engine.raw_schema()
         assert f"{schema}.secret_ledger" not in engine.table_names()
@@ -1665,7 +1665,7 @@ def test_a_schema_the_role_cannot_use_is_not_advertised_even_when_opted_in(
 def test_extra_schemas_env_var_is_comma_separated_and_trims_whitespace(
     postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`AIPA_EXTRA_SCHEMAS` accepts more than one schema, and tolerates the
+    """`TEXT_TO_SQL_EXTRA_SCHEMAS` accepts more than one schema, and tolerates the
     spacing a human is likely to type around the commas.
     """
     schema_a = "task6_multi_a"
@@ -1678,7 +1678,7 @@ def test_extra_schemas_env_var_is_comma_separated_and_trims_whitespace(
             conn.execute(f"CREATE TABLE {schema}.t (a INTEGER)")
             conn.execute(f"GRANT SELECT ON {schema}.t TO aipa_ro")
     try:
-        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", f" {schema_a} ,{schema_b},")
+        monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", f" {schema_a} ,{schema_b},")
         engine = open_engine(postgres_dsn)
         names = engine.table_names()
         assert f"{schema_a}.t" in names
@@ -1697,10 +1697,10 @@ def test_schema_fingerprint_changes_when_the_opted_in_set_changes(
     its visible effect - see `PostgresEngine.schema_fingerprint`'s docstring
     for why the raw config, not just the resulting table list, is hashed.
     """
-    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    monkeypatch.delenv("TEXT_TO_SQL_EXTRA_SCHEMAS", raising=False)
     before = open_engine(postgres_dsn).schema_fingerprint()
 
-    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "some_schema_nobody_granted")
+    monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", "some_schema_nobody_granted")
     after = open_engine(postgres_dsn).schema_fingerprint()
 
     assert after != before

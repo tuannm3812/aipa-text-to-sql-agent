@@ -15,7 +15,7 @@ from ..types import QueryResult, SchemaChunk
 # provider. A deployment may have granted its read-only role `USAGE` on a
 # staging or PII schema for some unrelated tool, and that must not silently
 # become LLM-visible just because this agent happened to widen its own
-# catalogue read. `AIPA_EXTRA_SCHEMAS` is the opt-in: a comma-separated list
+# catalogue read. `TEXT_TO_SQL_EXTRA_SCHEMAS` is the opt-in: a comma-separated list
 # of schema names to read *in addition to* the engine's own default schema.
 # (For PostgreSQL, since 2026-09-27, "its own default" means every schema on
 # the role's effective search path - see `postgres.py::_scope_schema_names` -
@@ -34,13 +34,13 @@ from ..types import QueryResult, SchemaChunk
 # string everywhere in this codebase (`ui/uploads.py`, `dsn.py`), and folding
 # scope configuration into it would mean redaction, logging and the "Using
 # `<dsn>`" sidebar caption all need to start parsing it apart again.
-_EXTRA_SCHEMAS_ENV_VAR = "AIPA_EXTRA_SCHEMAS"
+_EXTRA_SCHEMAS_ENV_VAR = "TEXT_TO_SQL_EXTRA_SCHEMAS"
 
 
 def extra_schemas_from_env() -> frozenset[str]:
     """Schema names opted into beyond an engine's own default schema.
 
-    Reads `AIPA_EXTRA_SCHEMAS` fresh on every call (not cached at import
+    Reads `TEXT_TO_SQL_EXTRA_SCHEMAS` fresh on every call (not cached at import
     time) so a test can set it with `monkeypatch.setenv` and a redeployment
     can change it without restarting a long-lived process; each engine reads
     it once, in its own `__init__`, so one engine instance's scope stays
@@ -324,7 +324,7 @@ def is_internal_schema_name(
     strings `"information_schema"`/`"pg_catalog"` (or, for PostgreSQL,
     nothing at all beyond the operator-supplied candidate list). A schema
     genuinely named `PG_evil` or `Information_Schema` - whether it exists in
-    the target database or was merely opted into via `AIPA_EXTRA_SCHEMAS` -
+    the target database or was merely opted into via `TEXT_TO_SQL_EXTRA_SCHEMAS` -
     was therefore read into `raw_schema()` and `table_names()` and then
     permanently rejected by `safety.py`'s case-insensitive check: advertised
     to the model, refused by the validator, the exact layer-disagreement
@@ -337,7 +337,7 @@ def is_internal_schema_name(
 
     Args:
         name: A candidate schema name, in whatever case it was spelled -
-            by an operator in `AIPA_EXTRA_SCHEMAS`, or by the database's own
+            by an operator in `TEXT_TO_SQL_EXTRA_SCHEMAS`, or by the database's own
             catalogue.
         internal_prefixes: The engine's `Engine.internal_prefixes`.
         internal_names: The engine's `Engine.internal_names`.
@@ -434,7 +434,7 @@ class Engine(Protocol):
 
         Must not read row data beyond low-cardinality value hints.
 
-        Scope is `default_schema` plus whatever `AIPA_EXTRA_SCHEMAS` opts
+        Scope is `default_schema` plus whatever `TEXT_TO_SQL_EXTRA_SCHEMAS` opts
         into (`extra_schemas_from_env()` above), and nothing else - an
         engine must not read a schema simply because it is able to. On a
         deployment that sets nothing, that is one schema. A chunk for a
@@ -501,7 +501,7 @@ class Engine(Protocol):
         that union to every column in the database and re-armed the bypass -
         a table named after a single-argument catalogue function in any
         readable schema was enough. (That widening was itself narrowed to the
-        `AIPA_EXTRA_SCHEMAS` opt-in later the same day, but the per-table
+        `TEXT_TO_SQL_EXTRA_SCHEMAS` opt-in later the same day, but the per-table
         keying stands on its own: an opted-in schema can carry exactly the
         same hostile column name.) The validator now resolves each qualifier
         against the one table it names, so a function scan (which has no table

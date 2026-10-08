@@ -86,7 +86,7 @@ def case(
     For every engine whose DSN model admits one, it also holds
     `analytics.thing`, a table that exists *only* outside the default schema.
     Schema scope became opt-in after this fixture was written (owner
-    decision, 2026-09-26), so `monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", ...)`
+    decision, 2026-09-26), so `monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", ...)`
     opts `analytics` in before either engine is constructed - without it,
     every test below that relies on `analytics.thing` existing would instead
     be proving the opt-in default (invisible), not the identity contract this
@@ -119,7 +119,7 @@ def case(
         con.execute(f"CREATE TABLE {OTHER_SCHEMA}.thing (label VARCHAR, lo_get INTEGER)")
         con.execute(f"INSERT INTO {OTHER_SCHEMA}.thing VALUES ('only-here', 1)")
         con.close()
-        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", OTHER_SCHEMA)
+        monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", OTHER_SCHEMA)
         yield _Case(engine=open_engine(f"duckdb://{db}"), other_schema=OTHER_SCHEMA)
         return
 
@@ -136,7 +136,7 @@ def case(
             conn.execute(f"GRANT USAGE ON SCHEMA {OTHER_SCHEMA} TO aipa_ro")
             conn.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA {OTHER_SCHEMA} TO aipa_ro")
         try:
-            monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", OTHER_SCHEMA)
+            monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", OTHER_SCHEMA)
             yield _Case(engine=open_engine(dsn), other_schema=OTHER_SCHEMA)
         finally:
             # The container outlives the test, unlike tmp_path, so this schema
@@ -345,7 +345,7 @@ def test_an_internal_looking_schema_is_never_advertised_or_readable(
         conn.execute('GRANT USAGE ON SCHEMA "Information_Schema" TO aipa_ro')
         conn.execute('GRANT SELECT ON ALL TABLES IN SCHEMA "Information_Schema" TO aipa_ro')
     try:
-        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "PG_evil,Information_Schema")
+        monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", "PG_evil,Information_Schema")
         engine = open_engine(postgres_dsn)
 
         raw = engine.raw_schema().lower()
@@ -394,7 +394,7 @@ def test_a_case_variant_schema_collision_fails_closed(
         conn.execute('GRANT USAGE ON SCHEMA "Public" TO aipa_ro')
         conn.execute('GRANT SELECT ON ALL TABLES IN SCHEMA "Public" TO aipa_ro')
     try:
-        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "Public")
+        monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", "Public")
         engine = open_engine(postgres_dsn)
 
         with pytest.raises(AmbiguousTableIdentityError):
@@ -438,7 +438,7 @@ def test_default_schema_is_the_servers_answer_not_a_hardcoded_constant(
         # still wants it reachable, under its own qualified spelling, to
         # prove the fix changes what the *bare* name means without taking
         # `public.customers` away.
-        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "public")
+        monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", "public")
         with psycopg.connect(postgres_dsn, connect_timeout=5) as roconn:
             row = roconn.execute("SELECT current_schema()").fetchone()
         assert row is not None
@@ -495,7 +495,7 @@ def test_a_dotted_table_name_colliding_with_a_qualified_spelling_fails_closed(
         conn.execute("GRANT USAGE ON SCHEMA analytics TO aipa_ro")
         conn.execute("GRANT SELECT ON ALL TABLES IN SCHEMA analytics TO aipa_ro")
     try:
-        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "analytics")
+        monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", "analytics")
         engine = open_engine(postgres_dsn)
         with pytest.raises(AmbiguousTableIdentityError):
             engine.table_names()
@@ -544,7 +544,7 @@ def test_layer_agreement_over_a_hostile_multi_schema_database(
         conn.execute("INSERT INTO public.\"weird.dotted\" VALUES (1, 'dotted-row')")
         conn.execute('GRANT SELECT ON public."weird.dotted" TO aipa_ro')
     try:
-        monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "Sales,PG_reports")
+        monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", "Sales,PG_reports")
         engine = open_engine(postgres_dsn)
 
         # No ambiguity in this fixture - the collision check must not fire.

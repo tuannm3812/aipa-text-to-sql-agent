@@ -38,7 +38,7 @@ distro==1.9.0
 google-auth==2.58.0
     # via google-genai
 google-genai==1.75.0
-    # via aipa-text-to-sql-agent
+    # via text-to-sql-agent
 h11==0.16.0
     # via
     #   httpcore
@@ -80,10 +80,10 @@ jsonschema-specifications==2025.9.1
     # via jsonschema
 langchain-core==0.3.86
     # via
-    #   aipa-text-to-sql-agent
     #   langchain-ollama
+    #   text-to-sql-agent
 langchain-ollama==0.2.3
-    # via aipa-text-to-sql-agent
+    # via text-to-sql-agent
 langsmith==0.12.4
     # via langchain-core
 markupsafe==3.0.3
@@ -112,8 +112,8 @@ packaging==25.0
     #   streamlit
 pandas==2.3.3
     # via
-    #   aipa-text-to-sql-agent
     #   streamlit
+    #   text-to-sql-agent
 pillow==12.3.0
     # via streamlit
 protobuf==7.36.1
@@ -139,7 +139,7 @@ pydeck==0.9.3
 python-dateutil==2.9.0.post0
     # via pandas
 python-dotenv==1.2.3
-    # via aipa-text-to-sql-agent
+    # via text-to-sql-agent
 python-multipart==0.0.32
     # via streamlit
 pytz==2026.3.post1
@@ -170,11 +170,11 @@ sniffio==1.3.1
     #   google-genai
     #   langsmith
 sqlglot==27.29.0
-    # via aipa-text-to-sql-agent
+    # via text-to-sql-agent
 starlette==1.6.0
     # via streamlit
 streamlit==1.63.0
-    # via aipa-text-to-sql-agent
+    # via text-to-sql-agent
 tenacity==9.1.4
     # via
     #   google-genai

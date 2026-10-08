@@ -326,10 +326,10 @@ def role_named_schema(postgres_dsn: str, monkeypatch: pytest.MonkeyPatch) -> Ite
 
     It holds only `only_here` at first - Codex's exact reproduction, where
     `current_schema()` becomes `aipa_ro` while `customers` still lives in
-    `public`. `AIPA_EXTRA_SCHEMAS` is unset: both schemas are on the path,
+    `public`. `TEXT_TO_SQL_EXTRA_SCHEMAS` is unset: both schemas are on the path,
     which is PostgreSQL's own meaning of "default".
     """
-    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    monkeypatch.delenv("TEXT_TO_SQL_EXTRA_SCHEMAS", raising=False)
     try:
         _admin(
             postgres_dsn,
