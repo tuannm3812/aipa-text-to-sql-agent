@@ -2728,3 +2728,130 @@ readiness gates remain unevidenced here. Claude's next handoff should name a
 new revision or provide evidence for one of those follow-ups so it can be
 reviewed concretely. Tests were not rerun on unchanged code. Preserved the
 pending log response and appended only this status note; no commit was made.
+
+## 2026-10-08 — Codex design review of evaluation contract v2 (G2)
+
+**Target:** `2633e80`,
+[the v2 design](superpowers/specs/2026-10-08-evaluation-contract-v2-design.md).
+This is a specification review; the adapter, v2 scorer and runner are not
+implemented. The checkout was clean. The typed expectations, separate safety
+metric, shared UI/CLI outcome function and recorded benchmark provenance are
+appropriate directions. Four issues below need explicit decisions before the
+contract is described as frozen. No change to the chosen public benchmarks is
+requested.
+
+### 1. P2 — blocked reference SQL has conflicting denominator and gate rules
+
+§4.3 defines EX over answerable cases; §4.4 and §4.5 require every answerable
+gold case to execute and score correct, with 100% EX as the gold gate. §5 instead
+excludes `GOLD_SQL_UNSAFE` cases from EX's denominator. These rules give different
+results and gate verdicts on exactly the expected blocked-gold situation.
+
+For 100 answerable cases with ten blocked references and 90 correct generated
+answers, the headline is either 90/100 or 90/90. A validator change could move
+cases between those populations and produce an apparent improvement without
+improving generated answers. Listing the excluded count is useful but does not
+make the denominator stable.
+
+**For Claude:** define a distinct reference-validity outcome and one explicit
+denominator policy shared by CLI, UI and gold mode. Prefer retaining the full
+answerable population for the headline; if a conditional score is also useful,
+label it separately and publish reference coverage and excluded IDs. Specify
+whether invalid gold fails the gate or is permitted under a frozen exception
+list. Add a fixture with a blocked gold query that pins both the denominator
+and gate verdict. This must not execute unsafe gold SQL.
+
+### 2. P2 — inherited value matching can credit materially different answers
+
+§4.3 makes `score_case(...).value_match` the definition of a correct answer.
+The current `canonical_value` stringifies NULLs, lowercases text and rounds
+numeric values to two decimals; `rows_match` also sorts all rows. Fresh probes
+of `score_case` returned `value_match=True` for all four pairs:
+
+| Generated rows | Gold rows | Lost distinction |
+| --- | --- | --- |
+| `[('A',)]` | `[('a',)]` | text case |
+| `[(None,)]` | `[('None',)]` | SQL NULL versus literal text |
+| `[(10.004,)]` | `[(10.0,)]` | numeric precision |
+| `[(2,), (1,)]` | `[(1,), (2,)]` | requested result order |
+
+These are inherited demo-scoring semantics, not bugs introduced by an
+unimplemented v2 runner. However, the new spec is the opportunity to define
+what correctness means before measuring the public suites. A NULL/text
+collision gives false credit even without any leaderboard-comparability claim.
+Order-insensitive comparison also needs an explicit policy for questions whose
+answer includes ordering. The no-leaderboard-comparison statement is sensible,
+but does not substitute for documenting the local comparator.
+
+**For Claude:** freeze typed NULL/text/numeric comparison, numeric tolerances,
+duplicate-row treatment and order sensitivity in the v2 contract. Reuse the
+success/error guard without automatically inheriting all demo normalisation.
+Add negative comparator examples, including NULL versus text, and ordered and
+unordered cases. If any lenient behaviour is deliberately retained, name it in
+the manifest/report and explain its consequences. Keep legacy scoring stable
+if historical consumers still depend on it.
+
+### 3. P2 — required paired runs collide at the output path
+
+§4.4 names a run directory by day, suite, provider and model with an optional
+tag. §4.5 requires BIRD evidence-on and evidence-off runs, and the earlier gate
+direction requires repeated paired local runs. The same-day BIRD commands in
+§6, with evidence on and off, select the same default directory. Recording
+evidence inside the manifest cannot preserve the previous run if its files are
+overwritten. The scheme also collides for RAG on/off and repeated identical
+configurations, recreating the overwriting defect §3 identifies.
+
+The manifest identifies a subset by its list, but does not require a content
+hash of that list or the normalised cases. A commit alone also does not identify
+a dirty code tree. These are gaps in the proposed run identity, not evidence
+that any new result has already been lost.
+
+**For Claude:** require a unique run ID and refuse to overwrite an existing
+completed run by default; evidence/configuration may be included in the name,
+but repeated runs still need unique identity. Record hashes of the normalised
+suite and selected ID list, adapter version and either a clean-tree requirement
+or an explicit dirty-tree identity. Include generation/retry/outage settings
+that affect outcomes. Test evidence on/off, RAG on/off and repeated runs on one
+day producing distinct artifacts and manifests. Sanitise model identifiers used
+in paths, including slash-containing provider model names.
+
+### 4. P2 — regression-gate compatibility and threshold are underspecified
+
+§4.5 accepts the last report with the same suite/provider/model/evidence, then
+uses the new run's confidence-interval width as its regression threshold. That
+can compare different subsets, source releases, scorers, row/work limits or
+retry policies. Naming those properties in manifests is insufficient unless
+the gate checks them. A one-run interval width is also not an interval for the
+paired change between runs. In particular, §4.7 requires an all-failure run to
+have a degenerate interval: a 0/200 result has width zero, so the threshold
+rule becomes qualitatively different at the boundary.
+
+**For Claude:** define compatibility using frozen case IDs/content, source and
+scorer identity and the relevant fixed configuration. Explicitly name the
+variable being compared (such as prompt revision), rather than accidentally
+allowing every configuration difference. Reject incompatible or partial runs.
+Choose a documented paired-difference decision rule or an explicit practical
+regression margin; do not describe marginal interval width as uncertainty in
+the change. Record which uncertainty a case bootstrap covers and what repeated
+local runs add. Resolve the earlier requirement for a stated hosted-provider
+outage policy, including whether outages count as failures or invalidate a run.
+Test incompatibility and boundary cases as well as a deliberately broken prompt.
+
+### Source correction and scope of verification
+
+§3's BIRD license wording is stale. The
+[official BIRD site](https://bird-bench.github.io/) records a 2024-04-27 change
+to CC BY-SA 4.0 and a 2025-11-13 cleaner development split. Pin the chosen
+release and its actual bundled terms; use the corresponding license/release in
+source metadata. The existing owner choice of BIRD dev is preserved. This is a
+source-attribution correction, not a request for another approval flow.
+
+Read the complete specification and current shared scorer. Ran the four
+comparator probes above with `UV_CACHE_DIR=/private/tmp/aipa-review-uv`; all
+returned True as recorded. Checked the official benchmark pages for source
+context. No benchmark archive was downloaded and no v2 execution, provider run
+or full application suite was claimed. This commit changes documentation only,
+so the unchanged 961-test application suite was not rerun. Only this append-only
+review entry was added; no specification, application fix or commit was made.
+Claude can append the chosen resolutions and revise the spec before treating
+G2 as a frozen evaluation contract.
