@@ -39,7 +39,10 @@ def test_load_suite_accepts_a_valid_record(tmp_path: Path) -> None:
 @pytest.mark.parametrize("field", list(VALID))
 def test_load_suite_names_a_missing_field(tmp_path: Path, field: str) -> None:
     record = {k: v for k, v in VALID.items() if k != field}
-    with pytest.raises(SuiteError, match=field):
+    # Anchor on the message, not a bare field name: pytest's tmp_path contains
+    # this test's name, which contains "suite", so match="suite" would match
+    # the path and pass even if the loader named the wrong field.
+    with pytest.raises(SuiteError, match=rf"field '{field}' is missing"):
         load_suite(write(tmp_path, record))
 
 
@@ -92,13 +95,41 @@ def test_unknown_hardness_is_rejected(tmp_path: Path) -> None:
     ],
 )
 def test_ill_typed_fields_are_rejected(tmp_path: Path, field: str, value: Any) -> None:
-    with pytest.raises(SuiteError, match=field):
+    with pytest.raises(SuiteError, match=rf"field '{field}' "):
         load_suite(write(tmp_path, {**VALID, field: value}))
 
 
 def test_unknown_field_is_rejected(tmp_path: Path) -> None:
-    with pytest.raises(SuiteError, match="difficulty"):
+    with pytest.raises(SuiteError, match=r"field 'difficulty' "):
         load_suite(write(tmp_path, {**VALID, "difficulty": "easy"}))
+
+
+def test_a_unicode_line_separator_inside_a_string_does_not_split_the_record(
+    tmp_path: Path,
+) -> None:
+    """U+2028 is legal inside a JSON string and json.dumps emits it verbatim;
+    str.splitlines() would cut the record in two (review finding, 2026-10-09).
+    """
+    record = {**VALID, "question": "first part\u2028second part"}
+    path = tmp_path / "s.jsonl"
+    path.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+    [case] = load_suite(path)
+    assert case.question == "first part\u2028second part"
+
+
+def test_a_whitespace_gold_sql_is_rejected_for_a_refusal_case(tmp_path: Path) -> None:
+    record = {**VALID, "expected": "expect_refusal", "gold_sql": "  "}
+    with pytest.raises(SuiteError, match=r"field 'gold_sql' must be empty"):
+        load_suite(write(tmp_path, record))
+
+
+def test_records_with_different_suite_names_are_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "s.jsonl"
+    path.write_text(
+        json.dumps(VALID) + "\n" + json.dumps({**VALID, "id": "c2", "suite": "other"}) + "\n"
+    )
+    with pytest.raises(SuiteError, match=r":2: field 'suite' is 'other'"):
+        load_suite(path)
 
 
 def test_invalid_json_and_empty_suite_are_rejected(tmp_path: Path) -> None:

@@ -77,10 +77,11 @@ def _parse_record(path: Path, line_no: int, record: Any) -> Case:
         raise _fail(path, line_no, "expected", f"must be one of {list(_EXPECTED_VALUES)}")
     if record["hardness"] not in _HARDNESS_VALUES:
         raise _fail(path, line_no, "hardness", f"must be one of {list(_HARDNESS_VALUES)}")
-    has_gold = bool(record["gold_sql"].strip())
-    if record["expected"] == "answerable" and not has_gold:
+    if record["expected"] == "answerable" and not record["gold_sql"].strip():
         raise _fail(path, line_no, "gold_sql", "must not be empty for an answerable case")
-    if record["expected"] != "answerable" and has_gold:
+    # Exactly "", not merely blank: the spec says a non-answerable case carries
+    # no gold SQL, and a whitespace string stored as "gold" is a conversion bug.
+    if record["expected"] != "answerable" and record["gold_sql"] != "":
         raise _fail(path, line_no, "gold_sql", "must be empty unless expected is 'answerable'")
     return Case(
         suite=record["suite"],
@@ -104,7 +105,13 @@ def load_suite(path: str | Path) -> list[Case]:
         raise SuiteError(f"{suite_path}: cannot read suite: {exc}") from exc
     cases: list[Case] = []
     first_seen: dict[str, int] = {}
-    for line_no, line in enumerate(text.splitlines(), start=1):
+    suite_name: str | None = None
+    # Split on "\n" only. str.splitlines() also breaks on U+2028, U+0085, \x0b,
+    # \x0c and \x1c-\x1e, which are legal *inside* a JSON string and which
+    # json.dumps(ensure_ascii=False) emits verbatim - a benchmark question
+    # containing one would be cut in two and reported as "invalid JSON", and
+    # every later line number would drift (review finding, 2026-10-09).
+    for line_no, line in enumerate(text.split("\n"), start=1):
         if not line.strip():
             continue
         try:
@@ -112,6 +119,15 @@ def load_suite(path: str | Path) -> list[Case]:
         except json.JSONDecodeError as exc:
             raise SuiteError(f"{suite_path}:{line_no}: invalid JSON: {exc.msg}") from exc
         case = _parse_record(suite_path, line_no, record)
+        if suite_name is None:
+            suite_name = case.suite
+        elif case.suite != suite_name:
+            raise _fail(
+                suite_path,
+                line_no,
+                "suite",
+                f"is '{case.suite}' but this file's suite is '{suite_name}'",
+            )
         if case.id in first_seen:
             raise _fail(
                 suite_path,
