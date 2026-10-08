@@ -88,15 +88,15 @@ def test_a_missing_postgres_driver_names_the_extra_to_install(monkeypatch) -> No
 
 
 def test_extra_schemas_from_env_is_empty_by_default(monkeypatch) -> None:
-    monkeypatch.delenv("AIPA_EXTRA_SCHEMAS", raising=False)
+    monkeypatch.delenv("TEXT_TO_SQL_EXTRA_SCHEMAS", raising=False)
     assert extra_schemas_from_env() == frozenset()
 
 
 def test_extra_schemas_from_env_is_empty_when_blank(monkeypatch) -> None:
-    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", "   ")
+    monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", "   ")
     assert extra_schemas_from_env() == frozenset()
 
 
 def test_extra_schemas_from_env_splits_on_commas_and_trims_whitespace(monkeypatch) -> None:
-    monkeypatch.setenv("AIPA_EXTRA_SCHEMAS", " analytics ,staging,, reporting")
+    monkeypatch.setenv("TEXT_TO_SQL_EXTRA_SCHEMAS", " analytics ,staging,, reporting")
     assert extra_schemas_from_env() == frozenset({"analytics", "staging", "reporting"})

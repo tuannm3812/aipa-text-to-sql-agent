@@ -2,6 +2,33 @@
 
 Newest first. Each entry states what was chosen and what it ruled out.
 
+## 2026-10-08 — the repository is `text-to-sql-agent`; the `AIPA_` prefix becomes `TEXT_TO_SQL_`
+
+**Chosen:** The GitHub repository was renamed from `aipa-text-to-sql-agent`
+to `tuannm3812/text-to-sql-agent`, matching the Python package
+`text_to_sql_agent`, and the two environment variables were renamed with it:
+`AIPA_EXTRA_SCHEMAS` → `TEXT_TO_SQL_EXTRA_SCHEMAS` and
+`AIPA_TEST_POSTGRES_DSN` → `TEXT_TO_SQL_TEST_POSTGRES_DSN`. The `project.name`
+in `pyproject.toml` follows, so `uv.lock` and the generated `requirements.txt`
+changed in that one field only.
+
+**Ruled out:** Renaming the PostgreSQL test fixtures too (`aipa_ro` role,
+`aipa` database). They are local fixtures referenced by the compose file,
+the init SQL, CI's service-container step and dozens of tests; renaming them
+buys nothing a user sees and risks a broken test run. Also ruled out:
+rewriting dated history. Entries in this log, `docs/6_agent_log.md`, the
+phase specs and plans, and the academic deliverable keep the old name;
+GitHub redirects the old URLs, and an append-only record that silently
+changes is no longer a record.
+
+**Why:** "aipa" is the name of the university subject the project was first
+submitted for, not a description of the project. The owner wants the
+repository to read as a deliverable in its own right (the 2026-10-07
+production-readiness direction in `docs/6_agent_log.md`), and a name that
+needs a footnote works against that. The live Streamlit demo keeps its
+`aipa-text-to-sql-agent.streamlit.app` address until it is redeployed, because
+that subdomain belongs to the deployment, not to the repository.
+
 ## 2026-09-27 — refuse queries that touch a column type with its own casts or operators
 
 **Owner's decision ("refuse risky types only").** Resolves Codex's P1 of

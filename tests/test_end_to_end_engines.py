@@ -46,7 +46,7 @@ def engine_dsn(request: pytest.FixtureRequest, tmp_path: Path) -> str:
         return f"duckdb://{db}"
     if request.param == "postgres":
         # `postgres_dsn` (`tests/conftest.py`) skips with an explicit reason
-        # when `AIPA_TEST_POSTGRES_DSN` is unset or the server is
+        # when `TEXT_TO_SQL_TEST_POSTGRES_DSN` is unset or the server is
         # unreachable - reused here via `getfixturevalue` rather than
         # duplicating that skip logic. Its `customers` table already holds
         # exactly (1, 'Alice'), (2, 'Bob') - see `docker/postgres-init.sql` -

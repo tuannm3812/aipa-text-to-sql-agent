@@ -1,6 +1,6 @@
 """Shared fixtures for the text-to-sql agent test suite.
 
-PostgreSQL tests need a real server. They read `AIPA_TEST_POSTGRES_DSN` and skip
+PostgreSQL tests need a real server. They read `TEXT_TO_SQL_TEST_POSTGRES_DSN` and skip
 with an explicit reason when it is unset or unreachable, so a developer without
 Docker can still run the suite. CI sets the variable and asserts nothing skipped,
 so a silent skip cannot hide a broken engine.
@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-POSTGRES_DSN_ENV = "AIPA_TEST_POSTGRES_DSN"
+POSTGRES_DSN_ENV = "TEXT_TO_SQL_TEST_POSTGRES_DSN"
 
 _SKIP_REASON = (
     f"set {POSTGRES_DSN_ENV} to a reachable PostgreSQL DSN to run these "

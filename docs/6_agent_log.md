@@ -2559,3 +2559,56 @@ package-release gate (GP: immutable tag on a named commit, clean-venv install
 and import, conformance suite run on that commit), which itself follows
 publishing the current state (G1a). G7 does not wait on Vertex, the RAG
 ablation or any deployment. Start with G0. Nothing was run in this session.
+
+
+## 2026-10-08 — Claude: merged to `main`; repository renamed to `text-to-sql-agent`
+
+**G1 closed.** `tuannm3812/main-refinement` was merged into `main` with a
+merge commit (`796cbae`) from a separate worktree. The one commit `main` had
+beyond this branch was the PR #1 merge itself, whose second parent is an
+ancestor of this branch, so nothing was lost; the dry run reported no
+conflicts and the merged tree differs from this branch by 0 lines. CI on
+`main`: four jobs green (run 37722740556). The owner's uncommitted
+`.devcontainer/devcontainer.json` edit was discarded at their request; the one
+real fix in it - `uv sync --extra engines` - was re-applied and committed on
+its own (`222cc98`).
+
+**Rename.** Owner decision, recorded in `docs/3_decisions.md` (2026-10-08):
+the repository is now `tuannm3812/text-to-sql-agent`, renamed on GitHub with
+`gh repo rename` (the remote updated itself), and the environment variables
+are `TEXT_TO_SQL_EXTRA_SCHEMAS` and `TEXT_TO_SQL_TEST_POSTGRES_DSN`. Twenty-one
+current files changed - README, AGENTS.md, three docs, CI, the compose file,
+the package and the tests - plus `pyproject.toml`'s `project.name` and the two
+generated files. Dated history was left as written. The Streamlit badge and
+demo link still point at `aipa-text-to-sql-agent.streamlit.app`, which is the
+deployment's own subdomain and changes only on redeploy.
+
+**Verification**, each from a command run for this entry, with the live
+compose PostgreSQL and the **new** variable name:
+
+```
+$ TEXT_TO_SQL_TEST_POSTGRES_DSN=<local compose DSN> uv run pytest
+961 passed, 6 skipped in 23.03s
+
+$ uv run pytest            # DSN unset
+617 passed, 350 skipped in 8.25s
+
+$ TEXT_TO_SQL_TEST_POSTGRES_DSN=<local compose DSN> uv run pytest -m conformance
+36 passed, 931 deselected in 0.76s
+
+$ uv run ruff check . / ruff format --check . / mypy
+All checks passed! / 81 files already formatted / no issues in 32 source files
+
+$ uv run pytest tests/test_packaging.py      # requirements.txt drift guard
+3 passed
+
+$ uv run python scripts/evaluate_text_to_sql.py --mode gold
+Evaluated 12 cases. Exact result match: 12/12
+```
+
+`evaluation/results/` restored with `git checkout` afterwards. Not done: the
+local folder is still `aipa-text-to-sql-agent` (owner's machine; renaming it
+moves this session's working directory), and the Streamlit deployment still
+targets `tuannm3812/main-refinement` under the old repository name - GitHub
+redirects, but the owner should confirm the next deploy picks it up. Next:
+G0, date-stamping the README's May evaluation tables.

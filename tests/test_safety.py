@@ -464,7 +464,7 @@ class _FakePostgresEngine:
     `is_safe_query` reads seven attributes off an engine, so the qualified-column
     resolution model can be pinned without a live PostgreSQL: the live proof
     lives in `tests/test_engine_postgres.py`, which skips wherever
-    `AIPA_TEST_POSTGRES_DSN` is unset, and this is what keeps the model itself
+    `TEXT_TO_SQL_TEST_POSTGRES_DSN` is unset, and this is what keeps the model itself
     covered everywhere else.
 
     `other.audit` is the shape that caused the 2026-09-26 regression: a table

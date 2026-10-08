@@ -1,5 +1,5 @@
 [project]
-name = "aipa-text-to-sql-agent"
+name = "text-to-sql-agent"
 version = "0.1.0"
 description = "Enterprise Text-to-SQL agent: natural language to safe, read-only SQLite queries."
 readme = "README.md"

@@ -2,7 +2,7 @@
 # both create the same aipa_ro role via postgres-init.sql.
 #
 #   docker compose -f docker/postgres.yml up -d
-#   export AIPA_TEST_POSTGRES_DSN=postgresql://aipa_ro:aipa_ro_pw@127.0.0.1:55432/aipa
+#   export TEXT_TO_SQL_TEST_POSTGRES_DSN=postgresql://aipa_ro:aipa_ro_pw@127.0.0.1:55432/aipa
 #   uv run pytest
 #
 # Credentials here are local-only test values and are deliberately committed;

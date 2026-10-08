@@ -1,4 +1,4 @@
-# Project Coding Standards — aipa-text-to-sql-agent
+# Project Coding Standards — text-to-sql-agent
 
 The shared baseline is the master standard at
 `~/Documents/GitHub/coding-standards/coding_standards.md`. This file records
