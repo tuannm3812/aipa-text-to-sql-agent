@@ -115,13 +115,23 @@ responsibility:
 
 - **Spider**: fetch the dev release, unpack its databases to
   `data/benchmarks/spider/`, write `evaluation/suites/spider_dev.jsonl`.
-- **BIRD**: fetch the **2025-11-13 development split** (`dev.json` plus
-  `dev_databases`), unpack to `data/benchmarks/bird/`, write
-  `evaluation/suites/bird_dev.jsonl` with `evidence` filled. The release
-  identifier and the licence text bundled with the archive are recorded, not
-  assumed.
+- **BIRD**: the **2025-11-13 development split** is two sources, not one
+  archive (found in Task 4): the questions are a commit-pinned Hugging Face
+  dataset (`birdsql/bird_sql_dev_20251106`), and the databases are the
+  official `dev.zip` (`dev_20240627`) on Alibaba OSS. Both are fetched, both
+  are hash-pinned, and both appear in `.source.json` (`url`/`sha256` for the
+  databases, `questions_url`/`questions_sha256` for the questions). Unpack to
+  `data/benchmarks/bird/`, write `evaluation/suites/bird_dev.jsonl` with
+  `evidence` filled. Neither benchmark bundles a licence file: BIRD's licence
+  is read from the pinned dataset card and Spider's is a constant from its
+  official page, and `licence_source` in each `.source.json` says which.
+- **`expected_tables` on public suites** is derived from the gold SQL — every
+  base table the reference query reads, excluding CTE names, verified against
+  the database's real table names — so schema recall@k is defined on Spider
+  and BIRD, not only on the authored suites.
 - Each adapter records the archive's SHA-256 and the release identifier into
-  `evaluation/suites/<suite>.source.json`, which the manifest copies.
+  `evaluation/suites/<suite>.source.json`, which the manifest copies
+  **verbatim**, extra keys included.
 
 `data/benchmarks/` and the two generated `.jsonl` files are gitignored; the
 `.source.json` files are tracked so a run can be tied to a release even when
