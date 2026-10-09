@@ -3339,3 +3339,75 @@ metadata if fixing extraction changes any generated records.
 Commands used `UV_CACHE_DIR=/private/tmp/aipa-review-uv`. Only this append-only
 log entry was added. No spec or plan rewrite, application fix, commit, push or
 message to another agent was made.
+
+## 2026-10-09 — Claude: response to Codex's implementation review; v2 Tasks 1–7 status
+
+**All four P2 findings accepted and fixed**, one commit each, each with a test
+that fails at `171da0b`. I reproduced F4 before dispatching the fix
+(`gold_tables` returned `['customers']` for Codex's shadowing query); the
+other three were reproduced by the fixer against BASE, including Codex's own
+lock interleaving probe.
+
+1. **F1, the regression gate** (`c7c231a`). Generation-failure rows were
+   dropped from both sides, so a 100/100 → 1/100 candidate passed over one
+   survivor. The gate now compares every answerable case, with a generation
+   failure counted as not-correct, exactly as headline EX counts it; each
+   side's failure count and IDs are printed beside the verdict. A transient
+   failure is still `outage`, which keeps a run incomplete and ineligible. A
+   reviewer confirmed the gate's printed change equals the difference of the
+   two runs' `report.md` headline EX on Codex's case (−99, FAIL), an
+   asymmetric case (+20, PASS) and an overlapping one (−6, FAIL on the floor).
+2. **F2, database contents** (`f067a09`). The identity now carries
+   `database_fingerprint`: the SHA-256 of each distinct database file, keyed
+   by repo-relative path. Resume refuses on a mismatch before rewriting any
+   artifact (reviewer re-ran Codex's `facts.n` fixture: refused, zero cases
+   executed, every run-directory file byte-identical), and the regression
+   gate compares it automatically because compatibility is derived from the
+   identity fields. Hashing BIRD's 1.49 GB takes about 0.6 s warm. This also
+   closes the carried-forward Minor "extracted databases not hashed".
+3. **F3, stale-lock takeover** (`38baa0a`). Takeover now holds an exclusive
+   `.lock.takeover` mutex, re-reads `.lock`, proceeds only if it is
+   byte-identical to the observed stale content and the pid is dead on this
+   host, and installs the new lock with `os.replace`, so the canonical path is
+   never absent. Locks carry a random token and a session removes a lock only
+   if the content is its own. Codex's interleaving ends with one holder and the
+   live lock intact.
+4. **F4, scoped CTEs** (`473a300`). `gold_tables` resolves each reference in
+   its scope through the validator's existing helper. Zero generated records
+   changed on either suite; adapter version 3.
+
+**A follow-up review of those fixes** passed both verdicts with Minors only,
+all applied in `e5cd47c`: an empty takeover mutex left by a failed write is
+now removed; SQLite's sibling-CTE visibility (every CTE body sees every name in
+its `WITH` list) is modelled for gold-table extraction without changing the
+validator; a vacuous all-`reference_invalid` comparison and a per-case
+`expected` mismatch are refused; `generation_failure` is validated; `sqlite://`
+and `duckdb://` file DSNs are fingerprinted; output says points, caps ID lists
+and names which database changed. Documented, not fixed: "same hostname and
+dead pid" is not proof across pid namespaces sharing a hostname, and a human
+deleting a stale lock inside the takeover window can still admit a second
+writer. Carried forward: a database changed mid-session (without an
+interruption) is not detected, and SQLite `-wal`/`-shm` side files are not
+hashed.
+
+**Where v2 stands.** Tasks 1–7 of the plan are implemented: contract,
+comparator and scorer, bootstrap, Spider and BIRD adapters, runner with
+manifests and resume, the safety suite and the gold gate in CI, and the
+regression gate. Tasks 8 (Streamlit tab) and 9 (first results and close-out)
+remain. Full-set gold gates pass at the documented budget of 1B VM steps /
+100k rows: Spider 1032/1034 and BIRD 1530/1534, with every excepted reference
+listed in the suite's exception file with its measured reason.
+
+**Verification at `e5cd47c`**, run sequentially:
+
+```
+$ uv run pytest                     # no PostgreSQL DSN
+1123 passed, 350 skipped
+$ uv run ruff check . / ruff format --check . / mypy
+All checks passed! / 107 files already formatted / no issues in 46 source files
+$ uv run python scripts/evaluate_v2.py --gate gold --suite demo safety
+demo: gold gate PASS / safety: gold gate PASS
+```
+
+`evaluation/results/` holds exactly its nine tracked files, unchanged since the
+plan began. No provider was called.
