@@ -10,12 +10,13 @@ root (for example ``data/benchmarks/spider/database``), so a generated suite fil
 same database on every machine. ``load_suite`` does not check that the file exists, by
 design: a suite can be validated, hashed and subset without the data present.
 
-``expected_tables`` is derived from the gold SQL: every base table the query reads, CTE names
-excluded, lowercased, deduplicated and sorted, and each one checked against the database's
-real table names. A gold query that reads a table the database does not have, or that does
-not parse, is a conversion error naming the case - never a silently shorter list. Names are
-lowercased because SQLite table names are case-insensitive and Spider's gold SQL spells them
-freely (``CAR_MAKERS`` for ``car_makers``); whoever compares them must lowercase too.
+``expected_tables`` is derived from the gold SQL: every base table the query reads, CTE
+references excluded scope by scope, lowercased, deduplicated and sorted, and each one checked
+against the database's real table names. A gold query that reads a table the database does
+not have, or that does not parse, is a conversion error naming the case - never a silently
+shorter list. Names are lowercased because SQLite table names are case-insensitive and
+Spider's gold SQL spells them freely (``CAR_MAKERS`` for ``car_makers``); whoever compares
+them must lowercase too.
 """
 
 from __future__ import annotations
@@ -30,11 +31,14 @@ from sqlglot import exp
 from sqlglot.errors import SqlglotError
 
 from text_to_sql_agent.evaluation_v2.contract import Case, Hardness, SuiteError, _parse_record
+from text_to_sql_agent.safety import _names_visible_cte
 
 # Bump when a change here would alter any generated record; the run manifest records it via
 # each suite's .source.json, so results from different conversions are never compared blind.
 # 2: expected_tables derived from the gold SQL (was always empty in 1).
-ADAPTER_VERSION = "2"
+# 3: CTE names resolved per scope, so a nested CTE no longer hides an outer real table that
+#    shares its name, and a CTE body reading the table it shadows keeps that table.
+ADAPTER_VERSION = "3"
 
 SPIDER_SUITE = "spider_dev"
 BIRD_SUITE = "bird_dev"
@@ -67,7 +71,12 @@ def database_path(db_root: Path, db_id: str, *, suite: str) -> str:
 
 
 def gold_tables(sql: str) -> list[str]:
-    """Base tables ``sql`` reads: CTE names excluded, lowercased, deduplicated, sorted.
+    """Base tables ``sql`` reads: CTE references excluded, lowercased, deduplicated, sorted.
+
+    Whether a reference names a CTE or a real table is decided at that reference's own
+    position by ``safety._names_visible_cte`` - the scope rules the validator and the
+    PostgreSQL qualification already use - never by a global set of CTE names: a nested CTE
+    must not hide an outer real table of the same name.
 
     Raises ``ValueError`` when ``sql`` is not exactly one parseable statement.
     """
@@ -77,10 +86,12 @@ def gold_tables(sql: str) -> list[str]:
         raise ValueError(f"gold SQL does not parse: {exc}") from exc
     if len(statements) != 1:
         raise ValueError(f"gold SQL must be one statement, found {len(statements)}")
-    tree = statements[0]
-    ctes = {str(cte.alias_or_name).lower() for cte in tree.find_all(exp.CTE)}
-    names = {str(table.name).lower() for table in tree.find_all(exp.Table)}
-    return sorted(name for name in names if name and name not in ctes)
+    names = {
+        str(table.name).lower()
+        for table in statements[0].find_all(exp.Table)
+        if not _names_visible_cte(table, dialect="sqlite")
+    }
+    return sorted(name for name in names if name)
 
 
 def _expected_tables(

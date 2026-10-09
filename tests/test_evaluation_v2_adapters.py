@@ -268,6 +268,39 @@ def test_gold_tables_on_its_own() -> None:
     assert gold_tables("SELECT * FROM `Card Games` AS c") == ["card games"]
 
 
+def test_a_nested_cte_does_not_hide_an_outer_real_table_of_the_same_name() -> None:
+    # Codex's fixture: the inner `orders` CTE is visible only inside its own subquery, so the
+    # outer `orders` is the physical table and must be in the expected set.
+    sql = (
+        "SELECT id FROM orders WHERE id IN ("
+        "WITH orders AS (SELECT id FROM customers) SELECT id FROM orders)"
+    )
+    assert gold_tables(sql) == ["customers", "orders"]
+
+
+def test_a_table_read_inside_and_outside_a_cte_appears_once() -> None:
+    sql = (
+        "WITH big AS (SELECT id FROM orders WHERE total > 10) "
+        "SELECT o.id FROM orders AS o JOIN big ON big.id = o.id"
+    )
+    assert gold_tables(sql) == ["orders"]
+
+
+def test_a_cte_body_reading_the_real_table_it_shadows_keeps_it() -> None:
+    # Without RECURSIVE a CTE is not visible in its own body: `customers` there is the table.
+    assert gold_tables("WITH customers AS (SELECT * FROM customers) SELECT * FROM customers") == [
+        "customers"
+    ]
+
+
+def test_a_recursive_ctes_self_reference_is_not_a_table() -> None:
+    sql = (
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) "
+        "SELECT n FROM r"
+    )
+    assert gold_tables(sql) == []
+
+
 # --- Shared source-record validation --------------------------------------------------------
 
 
