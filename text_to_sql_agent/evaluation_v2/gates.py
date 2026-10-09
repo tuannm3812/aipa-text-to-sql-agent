@@ -20,13 +20,24 @@ model metric, so the gate never reports it (``metric_cells(..., gold=True)``).
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 
 from text_to_sql_agent.evaluation_v2.contract import Case
+from text_to_sql_agent.evaluation_v2.identity import IDENTITY_FIELDS
+from text_to_sql_agent.evaluation_v2.manifest import Manifest, read_manifest
 from text_to_sql_agent.evaluation_v2.report import Row, metric_cells
-from text_to_sql_agent.evaluation_v2.runner import RunConfig, run_suite, select_cases
+from text_to_sql_agent.evaluation_v2.runner import (
+    CASES_FILE,
+    MANIFEST_FILE,
+    RunConfig,
+    read_rows,
+    run_suite,
+    select_cases,
+)
 from text_to_sql_agent.evaluation_v2.scoring import REFUSAL_CODES, UNANSWERABLE
+from text_to_sql_agent.evaluation_v2.stats import Interval, paired_bootstrap_ci
 
 _EXPECTED_CODES: dict[str, frozenset[str]] = {
     "expect_refusal": REFUSAL_CODES,
@@ -54,6 +65,8 @@ class GateResult:
     non_answerable: int
     metrics: dict[str, str]
     run_dir: Path
+    # Set by `regression_gate` only; the gold gate leaves it None.
+    regression: RegressionDetail | None = None
 
 
 def load_exceptions(path: Path | None) -> frozenset[str]:
@@ -167,4 +180,219 @@ def gold_gate(
         non_answerable=len(cases) - answerable,
         metrics=metric_cells(rows, gold=True),
         run_dir=result.run_dir,
+    )
+
+
+# --- the regression gate (spec §4.5) -------------------------------------------------------
+
+# What may differ between a baseline and a new run: the code under test (`commit`, `dirty`) and
+# the prompt. Everything else in the identity payload must agree, so a field added to the
+# payload later is compatibility-checked by default rather than silently allowed to differ.
+FREE_TO_DIFFER: frozenset[str] = frozenset({"commit", "dirty", "prompt_sha256"})
+COMPATIBILITY_FIELDS: tuple[str, ...] = tuple(
+    name for name in IDENTITY_FIELDS if name not in FREE_TO_DIFFER
+)
+
+RESAMPLES = 10_000
+SEED = 0
+# A drop of this many percentage points fails regardless of the interval (spec §4.5): it also
+# covers the 0/n and n/n cases, where a one-run interval has zero width.
+FLOOR_POINTS = 5
+
+
+class RegressionRefused(ValueError):
+    """The two runs cannot be compared (incompatible, incomplete, uncitable, ID mismatch).
+
+    ``differences`` holds ``(field, new value, baseline value)`` for each incompatible field.
+    """
+
+    def __init__(self, message: str, differences: tuple[tuple[str, str, str], ...] = ()) -> None:
+        """Keep the message and the per-field ``(field, new, baseline)`` differences."""
+        super().__init__(message)
+        self.differences = differences
+
+
+@dataclass(frozen=True)
+class PairedChange:
+    """One population's paired comparison: ``new - old`` on the correct indicator."""
+
+    interval: Interval
+    new_correct: int
+    old_correct: int
+
+
+@dataclass(frozen=True)
+class RegressionDetail:
+    """What the regression verdict rested on.
+
+    ``ex`` is the answerable-case comparison the verdict rests on; ``safety`` is the same rule
+    over non-answerable cases, reported but never part of the verdict (``None`` when there are
+    none, or both runs are gold runs, which do not score them). ``excluded_*`` count answerable
+    and non-answerable cases dropped from the pairing because a side's row is a
+    ``generation_failure``: ``excluded_new`` / ``excluded_old`` per side, ``excluded_ids`` the
+    union.
+    """
+
+    ex: PairedChange
+    safety: PairedChange | None
+    drop_points: float
+    floor_breached: bool
+    interval_below_zero: bool
+    excluded_new: int
+    excluded_old: int
+    excluded_ids: tuple[str, ...]
+    new_commit: str
+    old_commit: str
+    prompt_changed: bool
+
+
+def compatible(new: Manifest, old: Manifest) -> list[str]:
+    """Names of the identity fields (and ``mode``) on which the two runs disagree.
+
+    Empty when the runs measure the same thing. ``mode`` is checked beside the identity fields:
+    a gold run and a model run can share a provider and model label.
+    """
+    a, b = dataclasses.asdict(new.identity), dataclasses.asdict(old.identity)
+    differing = [name for name in COMPATIBILITY_FIELDS if a[name] != b[name]]
+    if new.mode != old.mode:
+        differing.append("mode")
+    return differing
+
+
+def _field_value(manifest: Manifest, name: str) -> str:
+    if name == "mode":
+        return manifest.mode
+    return str(getattr(manifest.identity, name))
+
+
+def _load_run(directory: Path, label: str) -> tuple[Manifest, dict[str, Row]]:
+    try:
+        manifest = Manifest.from_dict(read_manifest(directory / MANIFEST_FILE))
+        rows = read_rows(directory / CASES_FILE)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise RegressionRefused(f"{label} run {directory}: cannot read it: {exc}") from exc
+    if manifest.status != "complete":
+        raise RegressionRefused(
+            f"{label} run {directory} is {manifest.status}, not complete "
+            "(re-run it with --resume first)"
+        )
+    # A regression verdict is a kind of citation, so the spec's "only a complete, citable run
+    # may be cited" applies to both sides.
+    if not manifest.citable:
+        raise RegressionRefused(
+            f"{label} run {directory} is not citable: {manifest.citable_reason}"
+        )
+    by_id = {row["id"]: row for row in rows}
+    if len(by_id) != len(rows):
+        raise RegressionRefused(f"{label} run {directory}: cases.csv repeats a case id")
+    if len(rows) != manifest.case_count:
+        raise RegressionRefused(
+            f"{label} run {directory}: cases.csv has {len(rows)} rows, "
+            f"the manifest says {manifest.case_count}"
+        )
+    return manifest, by_id
+
+
+def _paired(ids: list[str], new: dict[str, Row], old: dict[str, Row]) -> PairedChange | None:
+    if not ids:
+        return None
+    new_flags = [new[i]["outcome"] == "correct" for i in ids]
+    old_flags = [old[i]["outcome"] == "correct" for i in ids]
+    interval = paired_bootstrap_ci(new_flags, old_flags, resamples=RESAMPLES, seed=SEED)
+    return PairedChange(interval, sum(new_flags), sum(old_flags))
+
+
+def regression_gate(new_dir: Path, old_dir: Path) -> GateResult:
+    """Compare ``new_dir`` against the baseline ``old_dir`` (spec §4.5); fail on a real drop.
+
+    Cases are aligned by ``id``. The verdict rests on EX over *answerable* cases alone:
+    per case ``new - old`` on ``outcome == "correct"``, a paired bootstrap (10,000 resamples,
+    fixed seed), and a **fail** when the 95 % interval lies entirely below zero or the point
+    drop is 5 percentage points or more. Safety accuracy's change is reported separately.
+
+    A case whose row is a ``generation_failure`` in *either* run is excluded from both sides and
+    counted: it is a provider or harness failure, not a model answer, and scoring it as wrong
+    would make an outage-heavy run read as a regression (or hide one in the baseline).
+
+    Raises:
+        RegressionRefused: A run is unreadable, incomplete or uncitable, the pair is
+            incompatible, the case IDs differ, or no answerable case remains to compare.
+    """
+    new_manifest, new_rows = _load_run(new_dir, "new")
+    old_manifest, old_rows = _load_run(old_dir, "baseline")
+
+    differing = compatible(new_manifest, old_manifest)
+    if differing:
+        raise RegressionRefused(
+            "incompatible runs, differing in: " + ", ".join(differing),
+            tuple(
+                (name, _field_value(new_manifest, name), _field_value(old_manifest, name))
+                for name in differing
+            ),
+        )
+    only_new, only_old = (
+        sorted(new_rows.keys() - old_rows.keys()),
+        sorted(old_rows.keys() - new_rows.keys()),
+    )
+    if only_new or only_old:
+        raise RegressionRefused(
+            f"case IDs differ: {len(only_new)} only in the new run {only_new[:5]}, "
+            f"{len(only_old)} only in the baseline {only_old[:5]}"
+        )
+
+    ids = sorted(new_rows)
+    failed_new = {i for i in ids if new_rows[i]["generation_failure"]}
+    failed_old = {i for i in ids if old_rows[i]["generation_failure"]}
+    excluded = failed_new | failed_old
+    kept = [i for i in ids if i not in excluded]
+    answerable = [i for i in kept if new_rows[i]["expected"] == "answerable"]
+    others = [i for i in kept if new_rows[i]["expected"] != "answerable"]
+
+    ex = _paired(answerable, new_rows, old_rows)
+    if ex is None:
+        raise RegressionRefused(
+            "no answerable case left to compare "
+            f"({len(excluded)} excluded as generation failures); the verdict rests on EX"
+        )
+    safety = None if new_manifest.mode == "gold" else _paired(others, new_rows, old_rows)
+
+    # Integer arithmetic: a drop of exactly 5 points must not depend on float rounding.
+    net_drop = ex.old_correct - ex.new_correct
+    floor_breached = net_drop * 100 >= FLOOR_POINTS * ex.interval.n
+    below_zero = ex.interval.high < 0
+    failures = []
+    if below_zero:
+        failures.append(
+            f"the 95% interval for the change in EX lies entirely below zero "
+            f"[{ex.interval.low:+.1%}, {ex.interval.high:+.1%}]"
+        )
+    if floor_breached:
+        failures.append(
+            f"EX dropped {-ex.interval.point:.1%}, at or past the {FLOOR_POINTS}-point floor"
+        )
+
+    detail = RegressionDetail(
+        ex=ex,
+        safety=safety,
+        drop_points=-ex.interval.point * 100,
+        floor_breached=floor_breached,
+        interval_below_zero=below_zero,
+        excluded_new=len(failed_new),
+        excluded_old=len(failed_old),
+        excluded_ids=tuple(sorted(excluded)),
+        new_commit=new_manifest.identity.commit,
+        old_commit=old_manifest.identity.commit,
+        prompt_changed=new_manifest.identity.prompt_sha256 != old_manifest.identity.prompt_sha256,
+    )
+    return GateResult(
+        suite=new_manifest.identity.suite,
+        passed=not failures,
+        failures=tuple(failures),
+        excepted=(),
+        stale_exceptions=(),
+        answerable=len(answerable),
+        non_answerable=len(others),
+        metrics={},
+        run_dir=new_dir,
+        regression=detail,
     )

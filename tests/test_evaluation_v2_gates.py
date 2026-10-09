@@ -16,9 +16,29 @@ import pytest
 
 import scripts.evaluate_v2 as cli
 from text_to_sql_agent.engines import open_engine
+from text_to_sql_agent.evaluation_v2 import runner
 from text_to_sql_agent.evaluation_v2.contract import Case, load_suite
-from text_to_sql_agent.evaluation_v2.gates import gold_gate, load_exceptions
+from text_to_sql_agent.evaluation_v2.gates import (
+    COMPATIBILITY_FIELDS,
+    RegressionRefused,
+    compatible,
+    gold_gate,
+    load_exceptions,
+    regression_gate,
+)
+from text_to_sql_agent.evaluation_v2.identity import IDENTITY_FIELDS, IdentityPayload
+from text_to_sql_agent.evaluation_v2.manifest import Manifest, read_manifest, write_manifest
 from text_to_sql_agent.evaluation_v2.report import NOT_APPLICABLE, UNDEFINED_EMPTY
+from text_to_sql_agent.evaluation_v2.runner import (
+    CASES_FILE,
+    CSV_COLUMNS,
+    MANIFEST_FILE,
+    REPORT_FILE,
+    RunConfig,
+    run_suite,
+    select_cases,
+    write_rows,
+)
 from text_to_sql_agent.evaluation_v2.scoring import REFUSAL_CODES, UNANSWERABLE
 from text_to_sql_agent.safety import query_refusal
 
@@ -314,3 +334,282 @@ def test_the_cli_gate_exit_codes_and_nothing_written_to_results(
     assert cli.main(argv) == 0
     (tmp_path / "gate.gold_exceptions.txt").unlink()
     assert cli.main(argv) == 2
+
+
+# --- the regression gate ---------------------------------------------------------------------
+
+_BASE_IDENTITY: dict[str, Any] = {
+    "commit": "a" * 40,
+    "dirty": False,
+    "suite": "synthetic",
+    "suite_sha256": "1" * 64,
+    "subset": "full",
+    "subset_sha256": "",
+    "source_release": "n/a",
+    "adapter_version": "n/a",
+    "scorer_version": "v2.0",
+    "prompt_sha256": "p" * 64,
+    "provider": "ollama",
+    "model": "m",
+    "evidence": False,
+    "use_rag": True,
+    "rag_top_k": 5,
+    "work_limit": 1000,
+    "max_rows": 100,
+    "max_repair_attempts": 1,
+    "retry_policy": "0x20.0",
+}
+
+
+def _row(case_id: str, expected: str, outcome: str, failure: bool = False) -> dict[str, str]:
+    row = dict.fromkeys(CSV_COLUMNS, "")
+    row.update(suite="synthetic", id=case_id, hardness="easy", expected=expected, outcome=outcome)
+    row["generation_failure"] = "1" if failure else ""
+    return row
+
+
+def make_run(
+    root: Path,
+    name: str,
+    outcomes: dict[str, str],
+    *,
+    expected: dict[str, str] | None = None,
+    failures: frozenset[str] = frozenset(),
+    status: str = "complete",
+    mode: str = "llm",
+    **identity: Any,
+) -> Path:
+    """A run directory written with the runner's own writers (so format drift cannot hide)."""
+    expected = expected or {}
+    rows = [_row(i, expected.get(i, "answerable"), o, i in failures) for i, o in outcomes.items()]
+    directory = root / name
+    directory.mkdir()
+    write_rows(directory / CASES_FILE, rows)
+    manifest = Manifest(
+        identity=IdentityPayload(**{**_BASE_IDENTITY, **identity}),
+        run_id=name,
+        mode=mode,
+        case_count=len(rows),
+        source={"kind": "authored", "author": "t", "licence": "MIT"},
+        started="2026-10-09T00:00:00",
+        duration_s=1.0,
+        outage_count=0,
+        status=status,  # type: ignore[arg-type]
+        generation_failures=len(failures),
+        python="3.11",
+        packages={},
+    )
+    write_manifest(directory / MANIFEST_FILE, manifest)
+    (directory / REPORT_FILE).write_text("# stub\n", encoding="utf-8")
+    return directory
+
+
+def _outcomes(
+    n: int, *, wrong: set[int] = frozenset(), fixed: set[int] = frozenset()
+) -> tuple[dict[str, str], dict[str, str]]:
+    """(old, new) outcomes over n cases: old is all correct except ``fixed``; new is all
+    correct except ``wrong``."""
+    ids = [f"c{i:03d}" for i in range(n)]
+    old = {c: "wrong" if i in fixed else "correct" for i, c in enumerate(ids)}
+    new = {c: "wrong" if i in wrong else "correct" for i, c in enumerate(ids)}
+    return old, new
+
+
+def _gate(tmp_path: Path, old: dict[str, str], new: dict[str, str], **kw: Any):  # type: ignore[no-untyped-def]
+    return regression_gate(
+        make_run(tmp_path, "new", new, **kw), make_run(tmp_path, "old", old, **kw)
+    )
+
+
+def test_compatibility_fields_are_the_identity_minus_the_three_that_may_differ() -> None:
+    assert set(COMPATIBILITY_FIELDS) == set(IDENTITY_FIELDS) - {"commit", "dirty", "prompt_sha256"}
+    assert len(COMPATIBILITY_FIELDS) == len(IDENTITY_FIELDS) - 3 == 16
+
+
+def test_twenty_of_two_hundred_flipping_fails_with_the_interval_below_zero(
+    tmp_path: Path,
+) -> None:
+    old, new = _outcomes(200, wrong=set(range(20)))
+    result = _gate(tmp_path, old, new)
+    detail = result.regression
+    assert detail is not None and not result.passed
+    assert detail.ex.interval.high < 0 and detail.interval_below_zero
+    assert detail.drop_points == pytest.approx(10.0)
+
+
+def test_a_five_point_drop_whose_interval_spans_zero_fails_on_the_floor(tmp_path: Path) -> None:
+    # 18 correct->wrong and 8 wrong->correct over 200: net -10 cases = exactly 5 points.
+    old, new = _outcomes(200, wrong=set(range(18)), fixed=set(range(100, 108)))
+    result = _gate(tmp_path, old, new)
+    detail = result.regression
+    assert detail is not None and not result.passed
+    assert detail.ex.interval.high >= 0 and not detail.interval_below_zero
+    assert detail.floor_breached and detail.drop_points == pytest.approx(5.0)
+
+
+def test_a_one_point_drop_passes(tmp_path: Path) -> None:
+    old, new = _outcomes(200, wrong={0, 1})
+    result = _gate(tmp_path, old, new)
+    assert result.passed and result.regression is not None
+    assert result.regression.drop_points == pytest.approx(1.0)
+
+
+def test_an_improvement_passes(tmp_path: Path) -> None:
+    old, new = _outcomes(200, fixed=set(range(20)))
+    result = _gate(tmp_path, old, new)
+    assert result.passed and result.regression is not None
+    assert result.regression.drop_points == pytest.approx(-10.0)
+
+
+def test_a_commit_and_prompt_difference_is_allowed(tmp_path: Path) -> None:
+    old, new = _outcomes(40)
+    result = regression_gate(
+        make_run(tmp_path, "new", new, commit="b" * 40, prompt_sha256="q" * 64, dirty=False),
+        make_run(tmp_path, "old", old),
+    )
+    assert result.passed and result.regression is not None
+    assert result.regression.prompt_changed and result.regression.new_commit == "b" * 40
+
+
+def test_an_incompatible_pair_is_rejected_naming_every_differing_field(tmp_path: Path) -> None:
+    old, new = _outcomes(20)
+    with pytest.raises(RegressionRefused) as caught:
+        regression_gate(
+            make_run(tmp_path, "new", new, subset_sha256="2" * 64, scorer_version="v2.1"),
+            make_run(tmp_path, "old", old),
+        )
+    assert {name for name, _, _ in caught.value.differences} == {"subset_sha256", "scorer_version"}
+    assert "subset_sha256" in str(caught.value) and "scorer_version" in str(caught.value)
+    assert ("scorer_version", "v2.1", "v2.0") in caught.value.differences
+
+
+def test_a_gold_run_and_a_model_run_are_incompatible_even_with_equal_labels(
+    tmp_path: Path,
+) -> None:
+    old, new = _outcomes(20)
+    manifests = [
+        Manifest.from_dict(read_manifest(make_run(tmp_path, n, new, mode=m) / MANIFEST_FILE))
+        for n, m in (("a", "gold"), ("b", "llm"))
+    ]
+    assert compatible(manifests[0], manifests[1]) == ["mode"]
+
+
+@pytest.mark.parametrize("side", ["new", "old"])
+def test_an_incomplete_run_is_rejected(tmp_path: Path, side: str) -> None:
+    old, new = _outcomes(20)
+    with pytest.raises(RegressionRefused, match="incomplete"):
+        regression_gate(
+            make_run(tmp_path, "new", new, status="incomplete" if side == "new" else "complete"),
+            make_run(tmp_path, "old", old, status="incomplete" if side == "old" else "complete"),
+        )
+
+
+def test_a_dirty_run_is_rejected_as_not_citable(tmp_path: Path) -> None:
+    old, new = _outcomes(20)
+    with pytest.raises(RegressionRefused, match="not citable.*dirty"):
+        regression_gate(make_run(tmp_path, "new", new, dirty=True), make_run(tmp_path, "old", old))
+
+
+def test_differing_id_sets_are_rejected(tmp_path: Path) -> None:
+    old, new = _outcomes(20)
+    new["extra"] = "correct"
+    del new["c000"]
+    with pytest.raises(RegressionRefused, match="case IDs differ"):
+        _gate(tmp_path, old, new)
+
+
+def test_generation_failures_are_excluded_from_both_sides_and_counted(tmp_path: Path) -> None:
+    old, new = _outcomes(100)
+    new["c000"] = new["c001"] = "error"  # failed in the new run only
+    old["c002"] = "error"  # failed in the baseline only
+    new["c050"] = old["c050"] = "error"  # failed in both
+    result = regression_gate(
+        make_run(tmp_path, "new", new, failures=frozenset({"c000", "c001", "c050"})),
+        make_run(tmp_path, "old", old, failures=frozenset({"c002", "c050"})),
+    )
+    detail = result.regression
+    assert detail is not None and result.passed
+    assert (detail.excluded_new, detail.excluded_old) == (3, 2)
+    assert detail.excluded_ids == ("c000", "c001", "c002", "c050")
+    assert detail.ex.interval.n == 96 and result.answerable == 96
+    # Scored as wrong instead, the two dead cases would read as a 2-point regression.
+    assert detail.drop_points == pytest.approx(0.0)
+
+
+def test_safety_is_reported_separately_and_does_not_decide_the_verdict(tmp_path: Path) -> None:
+    ids = [f"a{i:02d}" for i in range(50)] + [f"s{i:02d}" for i in range(20)]
+    expected = {i: "expect_refusal" for i in ids if i.startswith("s")}
+    old = {i: "correct" for i in ids}
+    new = {i: ("wrong" if i.startswith("s") else "correct") for i in ids}
+    result = _gate(tmp_path, old, new, expected=expected)
+    detail = result.regression
+    assert result.passed and detail is not None and detail.safety is not None
+    assert detail.safety.interval.point == -1.0 and detail.safety.interval.n == 20
+    assert result.non_answerable == 20
+
+
+def test_a_run_with_nothing_answerable_is_refused(tmp_path: Path) -> None:
+    ids = [f"s{i}" for i in range(5)]
+    outcomes = dict.fromkeys(ids, "correct")
+    with pytest.raises(RegressionRefused, match="no answerable case"):
+        _gate(tmp_path, outcomes, outcomes, expected=dict.fromkeys(ids, "expect_refusal"))
+
+
+def test_a_missing_run_directory_is_refused_not_a_traceback(tmp_path: Path) -> None:
+    old, _ = _outcomes(10)
+    with pytest.raises(RegressionRefused, match="cannot read"):
+        regression_gate(tmp_path / "nowhere", make_run(tmp_path, "old", old))
+
+
+def test_the_synthetic_run_has_the_files_and_keys_of_a_real_run(tmp_path: Path) -> None:
+    config = RunConfig(
+        suite="demo", suite_path=SUITES / "demo.jsonl", mode="gold", provider="gold", model="gold"
+    )
+    real = run_suite(select_cases(config), config=config, out_root=tmp_path / "real")
+    (tmp_path / "fake").mkdir()
+    old, _ = _outcomes(3)
+    fake = make_run(tmp_path / "fake", "x", old)
+    assert sorted(p.name for p in real.run_dir.iterdir()) == sorted(p.name for p in fake.iterdir())
+    assert list(read_manifest(real.run_dir / MANIFEST_FILE)) == list(
+        read_manifest(fake / MANIFEST_FILE)
+    )
+    header = (real.run_dir / CASES_FILE).read_text().splitlines()[0]
+    assert header == (fake / CASES_FILE).read_text().splitlines()[0]
+
+
+def test_two_real_gold_runs_of_demo_pass_with_no_drop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Citability needs a clean tree; pin it so the test does not depend on the checkout.
+    monkeypatch.setattr(runner, "git_state", lambda: ("a" * 40, False))
+    config = RunConfig(
+        suite="demo", suite_path=SUITES / "demo.jsonl", mode="gold", provider="gold", model="gold"
+    )
+    a = run_suite(select_cases(config), config=config, out_root=tmp_path / "a")
+    b = run_suite(select_cases(config), config=config, out_root=tmp_path / "b")
+    result = regression_gate(a.run_dir, b.run_dir)
+    assert result.passed and result.regression is not None
+    assert result.regression.drop_points == 0.0
+
+
+def test_the_cli_regression_exit_codes_and_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    old, bad = _outcomes(200, wrong=set(range(20)))
+    old_dir = make_run(tmp_path, "old", old)
+    bad_dir = make_run(tmp_path, "bad", bad)
+    ok_dir = make_run(tmp_path, "ok", old, commit="c" * 40)
+    odd_dir = make_run(tmp_path, "odd", old, subset_sha256="2" * 64, scorer_version="v9")
+
+    base = ["--gate", "regression", "--baseline", str(old_dir), "--new"]
+    assert cli.main([*base, str(ok_dir)]) == 0
+    assert "regression gate PASS" in capsys.readouterr().out
+    assert cli.main([*base, str(bad_dir)]) == 1
+    out = capsys.readouterr().out
+    assert "regression gate FAIL" in out and "-10.0 points" in out and "verdict rests on" in out
+    assert cli.main([*base, str(odd_dir)]) == 2
+    err = capsys.readouterr().err
+    assert "subset_sha256" in err and "'v9' vs baseline 'v2.0'" in err
+    with pytest.raises(SystemExit) as usage:  # argparse's own usage error
+        cli.main(["--gate", "regression", "--new", str(ok_dir)])
+    assert usage.value.code == 2

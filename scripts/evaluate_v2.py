@@ -5,10 +5,16 @@
         --mode llm --provider ollama --model llama3:latest
     uv run python scripts/evaluate_v2.py --suite bird_dev --mode llm ... --resume DIR
     uv run python scripts/evaluate_v2.py --gate gold --suite demo safety
+    uv run python scripts/evaluate_v2.py --gate regression --new DIR --baseline DIR
 
 `--gate gold` runs each suite in gold mode into a temporary directory (or `--out-root`) and
 judges it by spec §4.4: valid references self-match, every `reference_invalid` ID is on
 `<suites-dir>/<suite>.gold_exceptions.txt`, non-answerable cases are well-formed.
+
+`--gate regression` compares a new complete, citable run with a baseline run of the same
+suite and settings (spec §4.5) and fails on a real EX drop: a paired 95 % interval entirely
+below zero, or a point drop of 5 points or more. Exit 0 pass, 1 fail, 2 refused (incompatible,
+incomplete, uncitable, case IDs differ).
 
 Each run writes `<out-root>/<run id>/{manifest.json,cases.csv,report.md}`; nothing is ever
 overwritten. `--resume DIR` continues an incomplete run in place and is refused - exit code
@@ -36,7 +42,14 @@ from text_to_sql_agent.config import (  # noqa: E402 - import must follow the sy
 )
 from text_to_sql_agent.dsn import redact_dsn  # noqa: E402
 from text_to_sql_agent.evaluation_v2.contract import SuiteError  # noqa: E402
-from text_to_sql_agent.evaluation_v2.gates import GateResult, gold_gate  # noqa: E402
+from text_to_sql_agent.evaluation_v2.gates import (  # noqa: E402
+    FLOOR_POINTS,
+    GateResult,
+    PairedChange,
+    RegressionRefused,
+    gold_gate,
+    regression_gate,
+)
 from text_to_sql_agent.evaluation_v2.runner import (  # noqa: E402
     ResumeRefused,
     RunConfig,
@@ -49,7 +62,7 @@ DEFAULT_SUITES_DIR = Path("evaluation/suites")
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--suite", nargs="+", required=True, help="suite name(s), e.g. demo")
+    parser.add_argument("--suite", nargs="+", help="suite name(s), e.g. demo")
     parser.add_argument(
         "--subset", default="full", help="'full', or a subset name such as subset200"
     )
@@ -74,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", type=Path, metavar="DIR", default=None)
     parser.add_argument(
         "--gate",
-        choices=["gold"],
+        choices=["gold", "regression"],
         default=None,
         help="judge each suite's gold run instead of recording a result "
         "(output goes to a temporary directory unless --out-root is given)",
@@ -85,6 +98,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="where result directories are written (default: evaluation/results; "
         "with --gate, a temporary directory)",
+    )
+    parser.add_argument("--new", type=Path, metavar="DIR", help="--gate regression: the new run")
+    parser.add_argument(
+        "--baseline", type=Path, metavar="DIR", help="--gate regression: the baseline run"
     )
     parser.add_argument("--suites-dir", type=Path, default=DEFAULT_SUITES_DIR)
     return parser
@@ -151,9 +168,67 @@ def _gate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     return exit_code
 
 
+def _change_line(label: str, change: PairedChange) -> str:
+    i = change.interval
+    return (
+        f"  {label}: {change.old_correct}/{i.n} -> {change.new_correct}/{i.n}, "
+        f"change {i.point * 100:+.1f} points, 95% paired interval "
+        f"[{i.low * 100:+.1f}, {i.high * 100:+.1f}] points"
+    )
+
+
+def _print_regression(result: GateResult) -> None:
+    detail = result.regression
+    assert detail is not None
+    print(f"{result.suite}: regression gate {'PASS' if result.passed else 'FAIL'}")
+    print(
+        f"  new {detail.new_commit[:8]} vs baseline {detail.old_commit[:8]}"
+        f"{' (prompt changed)' if detail.prompt_changed else ''}"
+    )
+    print(_change_line("EX (answerable cases; the verdict rests on this)", detail.ex))
+    print(
+        f"  point drop {detail.drop_points:+.1f} points (floor {FLOOR_POINTS}); "
+        f"interval below zero: {detail.interval_below_zero}; "
+        f"floor breached: {detail.floor_breached}"
+    )
+    if detail.safety is not None:
+        print(
+            _change_line("safety accuracy (reported only, not part of the verdict)", detail.safety)
+        )
+    if detail.excluded_ids:
+        print(
+            f"  excluded {len(detail.excluded_ids)} generation-failure case(s) from both sides "
+            f"(new run: {detail.excluded_new}, baseline: {detail.excluded_old}): "
+            f"{', '.join(detail.excluded_ids)}"
+        )
+    for failure in result.failures:
+        print(f"  FAILURE {failure}")
+
+
+def _regression(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.new is None or args.baseline is None:
+        parser.error("--gate regression needs --new DIR and --baseline DIR")
+    try:
+        result = regression_gate(args.new, args.baseline)
+    except RegressionRefused as exc:
+        print(f"regression gate refused: {redact_dsn(str(exc))}", file=sys.stderr)
+        for name, new_value, old_value in exc.differences:
+            print(
+                f"  {name}: new {redact_dsn(new_value)!r} vs baseline {redact_dsn(old_value)!r}",
+                file=sys.stderr,
+            )
+        return 2
+    _print_regression(result)
+    return 0 if result.passed else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.gate == "regression":
+        return _regression(args, parser)
+    if not args.suite:
+        parser.error("the following arguments are required: --suite")
     if args.resume is not None and len(args.suite) != 1:
         parser.error("--resume continues one run, so it takes exactly one --suite")
     if args.gate is not None:
