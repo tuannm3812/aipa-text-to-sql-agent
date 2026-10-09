@@ -3195,3 +3195,147 @@ repr-sorted multiset comparison would have returned False for
 
 Execution now begins, subagent-driven, from the amended plan. Documentation
 only in this entry; the application suite was not rerun.
+
+## 2026-10-09 — Codex: implementation review through the v2 regression gate
+
+Reviewed the implementation range after `8d6876e` through `404d4f5`, with
+particular attention to the comparator, scoring, adapters, manifest, runner,
+gold/regression gates, CLI and the changes to the existing pipeline's budget
+handling. The working tree was clean before the review and HEAD stayed at
+`404d4f5` during verification. This is now an implementation review, rather
+than another review of the plan alone.
+
+**Earlier review:** the safety-only gold population now passes without claiming
+EX; the comparator uses one-to-one matching instead of assuming sorted rows
+match; the initial incomplete manifest and atomic CSV checkpoints cover
+unattempted cases; manifests carry source provenance; and the publication
+instructions now distinguish routine subsets from full release results. The
+full-public-set publication requirement remains pending Task 9, not verified
+by this review. The comparator's documented large-bucket fallback is a stated
+limitation, not an undocumented replacement for the reviewed matching rule.
+
+**Assessment:** four P2 implementation findings remain. Passing unit tests do
+not cover the failure conditions below. No application fixes were made.
+
+### 1. P2 — the regression gate can pass a 99-point headline regression
+
+`text_to_sql_agent/evaluation_v2/gates.py:344` removes a case from both sides
+when either row has `generation_failure` set. These are terminal errors that
+the runner counts in headline EX, and a partially affected run remains
+`complete` and `citable`. Thus the gate's population can shrink to the one
+case that happened to work, contrary to its stated role comparing headline
+EX over the same answerable cases.
+
+Reproduced using the existing gate test helper and the actual artifact writers:
+a 100-case baseline has 100 correct; the candidate has one correct and 99
+`error` rows flagged as generation failures. Both runs pass the gate's loading
+and eligibility checks. The reports show baseline EX `100/100` and candidate
+EX `1/100`; `regression_gate` nevertheless returns `passed=True`, comparing
+only one case and excluding 99. The existing exclusion test explicitly
+accepts this policy for a smaller number of failures; it does not protect
+against this boundary.
+
+**For Claude:** keep the regression verdict consistent with the headline
+metric, or refuse a comparison affected by provider/harness failures instead
+of returning PASS over the survivors. If a conditional model-only comparison
+is useful, report it separately with coverage and an explicit eligibility
+policy; it must not imply that the headline regression guard passed. Add the
+100-to-1 example as a test that fails or refuses, including asymmetric
+failures in the baseline. This does not change the existing rule that genuine
+transient outages keep a run incomplete and ineligible.
+
+### 2. P2 — resume can combine results from different database contents
+
+`runner.py:261` builds identity from code, suite text and configuration, and
+checks that each database is reachable; it does not bind the actual database
+contents to that identity. The copied source archive hash describes the
+prepared download but does not verify an ignored extracted database at run
+or resume time. The same path can therefore hold different inputs while the
+saved identity still matches.
+
+Reproduced with a temporary SQLite fixture and the real gold runner: execute
+the first of two cases against `facts.n = 1`, interrupt before the second,
+update that file to `facts.n = 2`, then resume. The captured reference results
+are `[1, 2]`, the identity hash is unchanged, and the combined run becomes
+`complete`, `citable=True`. Only temporary files were mutated. Public
+benchmark databases are gitignored, so such a content change also need not
+change the checkout's dirty flag.
+
+**For Claude:** record and validate the identity of the SQLite inputs actually
+used, not just the archive metadata. Bind database fingerprints to run/resume
+and regression compatibility, or verify prepared files against recorded
+fingerprints before execution. Add an interrupted-run fixture where only
+database contents change and resume is refused before rewriting artifacts.
+Preserve the existing read-only query policy; this concerns input identity,
+not permissions for model-generated SQL.
+
+### 3. P2 — stale-lock recovery temporarily removes a live session's lock
+
+`runner.py:569` renames the current `.lock` out of the way before checking
+whether it is still the stale lock observed earlier. If another session has
+replaced it with a live lock, the rename temporarily leaves the canonical
+lock path absent. A third session can acquire that path before recovery
+tries `os.link` to restore the live lock. Restoration then suppresses
+`FileExistsError` and deletes the moved live lock. The original live holder
+and the third session can both continue writing the same run; the original
+holder's unconditional cleanup can also remove the third session's lock.
+
+A deterministic interleaving probe of the actual takeover helper reproduced
+this: supply the previously observed stale text, place a replacement live
+lock at the path, and acquire a new exclusive lock immediately after the
+helper's rename. The helper returns `live`, but the original live lock is
+not restored and the new holder owns the path. Its claim that two takers can
+never both proceed is therefore not established by the rename/check/restore
+sequence. The probe used only a temporary directory and mocked the rename
+boundary; no real agent's lock was touched.
+
+**For Claude:** make recovery preserve exclusive ownership throughout the
+stale-to-live transition, and release only the lock owned by the current
+session. Add a deterministic test where the observed stale lock is replaced
+by a live holder before takeover and another contender arrives during
+recovery. Refusing uncertain recovery is preferable to allowing concurrent
+checkpoint writers.
+
+### 4. P2 — a nested CTE name hides an unrelated real table from schema recall
+
+`adapters.py:69` gathers every CTE alias into one global set, then removes
+every base-table node whose name matches an alias anywhere in the query.
+CTE visibility is scoped, so a nested CTE cannot hide a real table used by
+the outer query.
+
+```sql
+SELECT id FROM orders WHERE id IN (
+  WITH orders AS (SELECT id FROM customers)
+  SELECT id FROM orders
+)
+```
+
+The actual `gold_tables` returns `['customers']`; the outer physical `orders`
+table is also read and must be in `expected_tables`. This silently shortens
+the reference set and can overstate schema recall when RAG misses that table.
+
+**For Claude:** resolve table/CTE references within their query scopes rather
+than filtering by a global alias set. Add this shadowing fixture and a case
+where the same physical table is read inside and outside a CTE. Check the
+generated suites for affected cases; bump the adapter version and regenerate
+metadata if fixing extraction changes any generated records.
+
+### Fresh verification and limits
+
+- Targeted v2 tests (contract, comparator, scoring, stats, identity, runner,
+  gates, adapters, Spider hardness and prepare script): **458 passed**.
+- Full `uv run pytest`: **1,082 passed, 350 skipped**, no failures. No
+  `TEXT_TO_SQL_TEST_POSTGRES_DSN` was configured for this run.
+- Conformance: **24 passed, 12 skipped**; all 12 skips explicitly require a
+  live PostgreSQL DSN. SQLite and DuckDB ran; PostgreSQL was not verified.
+- `ruff check .`: passed; `ruff format --check .`: **107 files** already
+  formatted; `mypy`: no issues in **46 source files**.
+- Real CLI `--gate gold --suite demo safety`: both PASS; demo EX **12/12**,
+  safety **15** structural cases with EX not applicable.
+- Standalone runtime probes reproduced all four findings above. No provider
+  was called, no benchmark downloaded, and the full Spider/BIRD gold runs,
+  remote CI, Streamlit migration and release publication were not claimed.
+
+Commands used `UV_CACHE_DIR=/private/tmp/aipa-review-uv`. Only this append-only
+log entry was added. No spec or plan rewrite, application fix, commit, push or
+message to another agent was made.
