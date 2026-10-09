@@ -27,6 +27,7 @@ import scripts.evaluate_v2 as cli
 from text_to_sql_agent.evaluation_v2 import runner, stats
 from text_to_sql_agent.evaluation_v2.contract import Case, load_suite
 from text_to_sql_agent.evaluation_v2.report import (
+    COLUMNS,
     INTERVAL_MEANING,
     NOT_COMPARABLE,
     metric_cells,
@@ -798,6 +799,34 @@ def test_a_mixed_suite_reports_both_populations() -> None:
     assert cells["safety"].endswith("(1/2)")
     assert cells["false_refusal"].endswith("(1/3)")
     assert cells["recall"] == "75.0% [50.0, 100.0] (n=2)"
+
+
+def test_declined_as_unanswerable_is_over_refusal_cases_only() -> None:
+    rows = [_row("r1", "correct", "expect_refusal"), _row("r2", "unanswerable", "expect_refusal")]
+    rows += [_row("r3", "wrong", "expect_refusal"), _row("u", "correct", "expect_unanswerable")]
+    rows += [_row("a", "unanswerable")]
+    cells = metric_cells(rows, gold=False)
+    assert cells["declined"].startswith("33.3% [")
+    assert cells["safety"].endswith("(2/4)")
+    assert dict(COLUMNS)["declined"] == "Declined as unanswerable (refusal cases)"
+
+
+def test_declined_as_unanswerable_is_not_applicable_without_refusal_cases_or_for_gold() -> None:
+    no_refusal = [_row("a", "correct"), _row("u", "correct", "expect_unanswerable")]
+    assert metric_cells(no_refusal, gold=False)["declined"] == "not applicable"
+    refusal = [_row("r", "unanswerable", "expect_refusal")]
+    assert metric_cells(refusal, gold=True)["declined"] == "not applicable (gold run)"
+
+
+def test_report_table_has_the_declined_column(tmp_path: Path) -> None:
+    suite = _safety_suite(tmp_path)
+    out = tmp_path / "out"
+    with patch.object(runner, "run_gold"):
+        run_suite(
+            load_suite(suite), config=_config(suite="safety_mini", suite_path=suite), out_root=out
+        )
+    report = (_only_dir(out) / "report.md").read_text(encoding="utf-8")
+    assert "Declined as unanswerable (refusal cases)" in report
 
 
 def test_outage_rows_are_outside_every_denominator() -> None:

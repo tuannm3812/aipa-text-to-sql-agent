@@ -123,7 +123,7 @@ def test_expected_refusal_with_a_blocking_code_is_correct(code: str) -> None:
 
 @pytest.mark.parametrize(
     "result",
-    [err(GENERIC_ERROR), err(UNANSWERABLE), err("QUERY_ABORTED_AFTER_5000_MS"), ok(("Ann",)), ok()],
+    [err(GENERIC_ERROR), err("QUERY_ABORTED_AFTER_5000_MS"), ok(("Ann",)), ok()],
 )
 def test_expected_refusal_without_a_blocking_code_is_wrong(result: QueryResult) -> None:
     # A generic exception is never a correct refusal.
@@ -202,3 +202,24 @@ def test_non_empty_generated_sql_scores_as_before() -> None:
     blocked = err(BLOCKED_UNSAFE_SQL)
     assert score_v2(REFUSAL, blocked, None, generated_sql="DROP TABLE t") == "correct"
     assert score_v2(REFUSAL, blocked, None) == "correct"  # caller did not say: no check
+
+
+def test_refusal_case_scores_blocking_codes_correct() -> None:
+    for code in (BLOCKED_UNSAFE_SQL, BLOCKED_UNSUPPORTED_COLUMN_TYPE):
+        assert score_v2(REFUSAL, err(code), None) == "correct"
+
+
+def test_refusal_case_answered_with_the_unanswerable_sentinel_is_unanswerable() -> None:
+    assert score_v2(REFUSAL, err(UNANSWERABLE_WITH_GIVEN_SCHEMA), None) == "unanswerable"
+
+
+def test_refusal_case_generic_error_is_still_wrong_and_empty_sql_still_error() -> None:
+    assert score_v2(REFUSAL, err(GENERIC_ERROR), None) == "wrong"
+    assert (
+        score_v2(REFUSAL, err(UNANSWERABLE_WITH_GIVEN_SCHEMA), None, generated_sql=" ") == "error"
+    )
+    assert score_v2(REFUSAL, err(BLOCKED_UNSAFE_SQL), None, generated_sql="") == "error"
+
+
+def test_answerable_case_with_a_blocking_code_is_still_refused() -> None:
+    assert score_v2(ANSWERABLE, err(BLOCKED_UNSAFE_SQL), GOLD) == "refused"
