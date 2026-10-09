@@ -4,6 +4,29 @@ Phases 1, 2, 3a, and 3b are complete. Phases 4-5 are specced in
 `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`; this file is the
 prioritised working view.
 
+## Evaluation v2 — what is left (do first)
+
+The contract, harness, gates and first routine results landed on 2026-10-09.
+Remaining, in order:
+
+1. **Full release runs.** `spider_dev` full and `bird_dev` full with evidence on
+   and off, on the same model, at `--work-limit 1000000000 --max-rows 100000`.
+   About 4,100 model calls; at the measured 21-26 s per case on
+   `qwen3.5:9b-q4_K_M`, roughly 25-30 hours of machine time. Run detached
+   (the harness resumes after any interruption) from a clean tree. Only then
+   may the README carry Spider/BIRD headline tables.
+2. **Gate G8, the RAG on/off ablation.** Runs on the frozen contract with the
+   paired regression machinery. Note: v2 does not yet compute prompt-token
+   savings (`prompt_tokens` is blank for Ollama); add that before G8 or the
+   ablation can report accuracy but not cost.
+3. **Carried forward, not fixed:** a database changed *during* an uninterrupted
+   session is not detected (the fingerprint is taken at start and resume), and
+   SQLite `-wal`/`-shm` side files are not hashed; schema recall uses a second
+   retrieval call rather than the one the pipeline made; the manifest's prompt
+   hash is rebuilt through a private `llm` helper; "same hostname and dead pid"
+   is not proof across pid namespaces sharing a hostname. The v1 script
+   (`scripts/evaluate_text_to_sql.py`) and the May tables remain as history.
+
 ## Phase 4 — Real RAG (next)
 
 Decompose `retrieve_schema_context`'s 182-line body into named, individually

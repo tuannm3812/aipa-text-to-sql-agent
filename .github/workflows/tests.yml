@@ -60,6 +60,23 @@ jobs:
       - name: Run tests
         run: uv run --python ${{ matrix.python-version }} pytest
 
+      - name: Gold gate (v2 suites)
+        # No provider, no network: runs every reference through the real engine and judges
+        # the run by spec 4.4. demo and safety are tracked and always run. The public suites'
+        # .jsonl files are generated and gitignored (scripts/prepare_benchmarks.py), so on a
+        # fresh checkout they are skipped - loudly, with a ::notice, never silently.
+        run: |
+          uv run --python ${{ matrix.python-version }} python scripts/evaluate_v2.py \
+            --gate gold --suite demo safety
+          for suite in spider_dev bird_dev; do
+            if [ -f "evaluation/suites/${suite}.jsonl" ]; then
+              uv run --python ${{ matrix.python-version }} python scripts/evaluate_v2.py \
+                --gate gold --suite "$suite" --work-limit 1000000000 --max-rows 100000
+            else
+              echo "::notice::gold gate skipped for ${suite}: evaluation/suites/${suite}.jsonl is missing (run scripts/prepare_benchmarks.py)"
+            fi
+          done
+
       - name: Fail if any conformance test was skipped
         # importorskip("duckdb") would otherwise let every DuckDB conformance
         # test silently skip and this job would go green having tested

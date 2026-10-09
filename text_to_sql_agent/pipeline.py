@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
-from .config import DEFAULT_MODEL_NAME, DEFAULT_RAG_TOP_K
+from .config import DEFAULT_MAX_ROWS, DEFAULT_MODEL_NAME, DEFAULT_RAG_TOP_K
 from .engines import Engine, open_engine
 from .execution import execute_query
 from .ingestion import ingest_csvs_to_db
 from .llm import generate_sql
 from .rag import retrieve_relevant_schema
-from .safety import query_refusal
+from .safety import BLOCKED_UNSAFE_SQL, UNANSWERABLE_WITH_GIVEN_SCHEMA, query_refusal
 from .schema import get_schema
 from .types import QueryResult
 
@@ -24,6 +25,8 @@ def ask_database(
     use_rag: bool = True,
     rag_top_k: int = DEFAULT_RAG_TOP_K,
     max_repair_attempts: int = 1,
+    work_limit: int | None = None,
+    max_rows: int | None = None,
 ) -> QueryResult:
     """End-to-end Text-to-SQL wrapper: schema retrieval, generation, safety, execution.
 
@@ -41,6 +44,14 @@ def ask_database(
         rag_top_k: Number of schema chunks to retrieve when `use_rag` is set.
         max_repair_attempts: Number of times to ask the model to repair SQL
             that failed execution. `0` disables repair.
+        work_limit: The execution budget, in the engine's own unit (SQLite VM
+            steps; DuckDB/PostgreSQL milliseconds), passed to `execute_query`
+            as `max_vm_steps`. `None` (the default) is the engine's
+            `default_work_limit`, as the app has always run; the evaluation
+            runner sets it per run so a demo guard cannot decide a
+            benchmark's outcome.
+        max_rows: Row cap passed to `execute_query`; `None` is
+            `DEFAULT_MAX_ROWS`.
 
     Returns:
         A `QueryResult`. `error` is set to `UNANSWERABLE_WITH_GIVEN_SCHEMA` if
@@ -69,13 +80,11 @@ def ask_database(
             question, schema_text, model_name=model_name, provider=provider, engine=engine
         )
 
-        if "UNANSWERABLE_WITH_GIVEN_SCHEMA" in sql:
-            return QueryResult(columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA")
-        refusal = query_refusal(sql, engine=engine)
+        refusal = _sentinel_code(sql) or query_refusal(sql, engine=engine)
         if refusal is not None:
             return QueryResult(columns=[], rows=[], sql=sql, error=refusal)
         try:
-            return execute_query(db_path, sql)
+            return _execute(db_path, sql, work_limit=work_limit, max_rows=max_rows)
         except Exception as e:
             repaired_sql = _repair_sql(
                 question,
@@ -92,10 +101,12 @@ def ask_database(
             # A refused repair is the terminal verdict: report its code with the
             # SQL it is about, the same contract as a refused first attempt. The
             # first attempt's error would read as repairable when nothing can run.
-            repair_refusal = query_refusal(repaired_sql, engine=engine)
+            repair_refusal = _sentinel_code(repaired_sql) or query_refusal(
+                repaired_sql, engine=engine
+            )
             if repair_refusal is not None:
                 return QueryResult(columns=[], rows=[], sql=repaired_sql, error=repair_refusal)
-            return execute_query(db_path, repaired_sql)
+            return _execute(db_path, repaired_sql, work_limit=work_limit, max_rows=max_rows)
     except Exception as e:
         return QueryResult(columns=[], rows=[], error=f"{type(e).__name__}: {e}")
 
@@ -109,6 +120,9 @@ def ask_database_with_sql(
     use_rag: bool = True,
     rag_top_k: int = DEFAULT_RAG_TOP_K,
     max_repair_attempts: int = 1,
+    work_limit: int | None = None,
+    max_rows: int | None = None,
+    on_repair_error: Callable[[Exception], None] | None = None,
 ) -> tuple[str, QueryResult]:
     """Same as `ask_database`, but also returns the generated SQL for UI display.
 
@@ -122,6 +136,14 @@ def ask_database_with_sql(
         rag_top_k: Number of schema chunks to retrieve when `use_rag` is set.
         max_repair_attempts: Number of times to ask the model to repair SQL
             that failed execution. `0` disables repair.
+        work_limit: See `ask_database`.
+        max_rows: See `ask_database`.
+        on_repair_error: Called with the exception when the *repair* call to
+            the model raises. The repair failure is still swallowed - the
+            result is the first attempt's execution error, as always - so
+            this changes nothing for a caller that omits it. The evaluation
+            runner passes it to tell a provider outage during repair (a 429
+            on the second call) from a model that wrote bad SQL.
 
     Returns:
         A `(sql, QueryResult)` tuple. `sql` is `""` if generation itself
@@ -154,16 +176,12 @@ def ask_database_with_sql(
     except Exception as e:
         return "", QueryResult(columns=[], rows=[], error=f"{type(e).__name__}: {e}")
 
-    if "UNANSWERABLE_WITH_GIVEN_SCHEMA" in sql:
-        return sql, QueryResult(
-            columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA"
-        )
-    refusal = query_refusal(sql, engine=engine)
+    refusal = _sentinel_code(sql) or query_refusal(sql, engine=engine)
     if refusal is not None:
         return sql, QueryResult(columns=[], rows=[], sql=sql, error=refusal)
 
     try:
-        result = execute_query(db_path, sql)
+        result = _execute(db_path, sql, work_limit=work_limit, max_rows=max_rows)
         return result.sql or sql, result
     except Exception as e:
         error_text = f"{type(e).__name__}: {e}"
@@ -176,17 +194,22 @@ def ask_database_with_sql(
             provider=provider,
             max_repair_attempts=max_repair_attempts,
             engine=engine,
+            on_repair_error=on_repair_error,
         )
         if repaired_sql:
             # Same contract as `ask_database`: a refused repair is reported as
             # its own refusal, paired with the refused SQL, never executed.
-            repair_refusal = query_refusal(repaired_sql, engine=engine)
+            repair_refusal = _sentinel_code(repaired_sql) or query_refusal(
+                repaired_sql, engine=engine
+            )
             if repair_refusal is not None:
                 return repaired_sql, QueryResult(
                     columns=[], rows=[], sql=repaired_sql, error=repair_refusal
                 )
             try:
-                repaired_result = execute_query(db_path, repaired_sql)
+                repaired_result = _execute(
+                    db_path, repaired_sql, work_limit=work_limit, max_rows=max_rows
+                )
                 return repaired_result.sql or repaired_sql, repaired_result
             except Exception as repaired_error:
                 error_text = f"{type(repaired_error).__name__}: {repaired_error}"
@@ -260,6 +283,40 @@ def ask_from_files(
     raise ValueError(f"Unsupported or mixed file types: {sorted(exts)}")
 
 
+def _sentinel_code(sql: str) -> str | None:
+    """The error code for a sentinel the model itself emitted, else `None`.
+
+    The system prompt tells the model to answer a data-modification request with
+    `SELECT 'BLOCKED_UNSAFE_SQL' AS error;` and an unanswerable question with
+    `SELECT 'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error;`. Both are valid SELECTs, so
+    `query_refusal` passes them; checked first, they are reported as the model's own
+    verdict instead of being executed as a query that returns the sentinel text. A
+    sentinel inside a non-SELECT gets the same `BLOCKED_UNSAFE_SQL` the validator would
+    give, so the order never changes the code for blocked input.
+    """
+    if UNANSWERABLE_WITH_GIVEN_SCHEMA in sql:
+        return UNANSWERABLE_WITH_GIVEN_SCHEMA
+    if BLOCKED_UNSAFE_SQL in sql:
+        return BLOCKED_UNSAFE_SQL
+    return None
+
+
+def _execute(
+    db_path: str, sql: str, *, work_limit: int | None, max_rows: int | None
+) -> QueryResult:
+    """`execute_query` with `None` meaning the default for each budget.
+
+    `max_vm_steps=None` is already the engine's own default; `max_rows=None` maps to
+    `DEFAULT_MAX_ROWS`, so a caller passing neither runs exactly as before.
+    """
+    return execute_query(
+        db_path,
+        sql,
+        max_rows=DEFAULT_MAX_ROWS if max_rows is None else max_rows,
+        max_vm_steps=work_limit,
+    )
+
+
 def _repair_sql(
     question: str,
     schema_text: str,
@@ -270,6 +327,7 @@ def _repair_sql(
     provider: str | None,
     max_repair_attempts: int,
     engine: Engine,
+    on_repair_error: Callable[[Exception], None] | None = None,
 ) -> str | None:
     if max_repair_attempts < 1:
         return None
@@ -292,5 +350,7 @@ Return only one corrected {dialect_name} SELECT query.
         return generate_sql(
             repair_question, schema_text, model_name=model_name, provider=provider, engine=engine
         )
-    except Exception:
+    except Exception as exc:
+        if on_repair_error is not None:
+            on_repair_error(exc)
         return None

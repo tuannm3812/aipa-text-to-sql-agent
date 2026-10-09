@@ -173,7 +173,9 @@ def test_both_harnesses_score_through_the_shared_function() -> None:
     drifted apart in the first place: the UI compared rows with no error guard
     and credited aborted queries that the CLI correctly rejected.
     """
-    for path in (Path("ui/evaluation.py"), Path("scripts/evaluate_text_to_sql.py")):
+    # `ui/evaluation.py` moved to v2 in Task 8 and is guarded by
+    # `tests/test_ui_evaluation.py::test_the_tab_classifies_only_through_the_runner`.
+    for path in (Path("scripts/evaluate_text_to_sql.py"),):
         source = path.read_text(encoding="utf-8")
         assert "score_case(" in source, f"{path} must score through score_case"
         assert "rows_match(" not in source, f"{path} must not compare rows itself"
@@ -204,7 +206,9 @@ def test_both_harnesses_run_gold_through_the_shared_function() -> None:
     safety check the CLI applied, so an unsafe reference query ran in one
     harness and was refused in the other.
     """
-    for path in (Path("ui/evaluation.py"), Path("scripts/evaluate_text_to_sql.py")):
+    # `ui/evaluation.py` moved to v2 in Task 8 and is guarded by
+    # `tests/test_ui_evaluation.py::test_the_tab_classifies_only_through_the_runner`.
+    for path in (Path("scripts/evaluate_text_to_sql.py"),):
         source = path.read_text(encoding="utf-8")
         assert "run_gold(" in source, f"{path} must run reference SQL through run_gold"
         assert "execute_query(" not in source, f"{path} must not execute SQL itself"

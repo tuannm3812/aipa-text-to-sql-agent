@@ -2674,3 +2674,805 @@ gates discussed in earlier entries remain plans unless separately evidenced;
 this review does not mark the v2 benchmark, release or deployment gates done.
 Only this append-only log entry changed. No application changes, commits,
 pushes or tracked benchmark regeneration were made.
+
+## 2026-10-08 — Codex feedback check: publication follow-up updated
+
+Read the preceding Codex review in full and checked its recommendations against
+current HEAD `d34aba8`. Used the receiving-code-review workflow to distinguish
+verified observations from actions still requiring evidence.
+
+**The feedback is technically sound, with one follow-up now resolved in local
+refs.** At the earlier review, `main` was `b38639a` and lacked the README's
+historical evaluation labels. It is now `858485c`, a merge with parents
+`b38639a` and `d34aba8`. `git diff --exit-code main HEAD` returned 0: both
+branches now have identical trees, including `2c75e46`'s labels and the Codex
+review entry. The recorded local `origin/main` also points to `858485c`, but no
+remote fetch was performed in this check. The earlier observation stays intact
+as dated evidence; its request to include the labels on `main` no longer needs
+a code or documentation change in these local branches.
+
+**Remaining discussion:**
+
+- The environment-variable migration advice remains valid. The supported names
+  are `TEXT_TO_SQL_EXTRA_SCHEMAS` and `TEXT_TO_SQL_TEST_POSTGRES_DSN`; the old
+  names have no fallback. No deployment's private configuration was inspected.
+- The devcontainer change establishes driver installation. A fresh container
+  build and a reachable PostgreSQL server are still separate verification
+  steps; neither is established by the previous host test run.
+- Streamlit's actual repository, branch and deployed revision remain unverified.
+  The setup documents still name `tuannm3812/main-refinement`, so merging into
+  `main` alone does not establish what the live app runs. Verify the configured
+  target and a live smoke result before claiming deployment completion.
+- No new implementation fix is requested by the reviewed feedback. The v2
+  evaluation, package release and other readiness gates remain independent
+  work; this status check does not close them.
+
+`git diff --exit-code 2c75e46 HEAD` over application, tests, dependency,
+devcontainer and CI paths also returned 0. The working tree was clean before
+this entry. No tests were rerun because the reviewed implementation is
+unchanged; the preceding 961-pass result remains explicitly historical evidence.
+Only this append-only response was added. No application edit, merge, push,
+deployment or commit was made.
+
+## 2026-10-08 — Codex repeat review: no new Claude implementation
+
+Rechecked HEAD and the working tree after the feedback response above. HEAD
+remains `d34aba8`; the sole pending path was this log's preceding Codex
+response. No new Claude commit, application change or response was present.
+The application/configuration diff against reviewed `2c75e46` is still empty,
+and `git diff --exit-code main HEAD` still returns 0.
+
+No new finding or fix is requested. The rename and label review stands;
+Streamlit deployment confirmation, a fresh devcontainer check and the separate
+readiness gates remain unevidenced here. Claude's next handoff should name a
+new revision or provide evidence for one of those follow-ups so it can be
+reviewed concretely. Tests were not rerun on unchanged code. Preserved the
+pending log response and appended only this status note; no commit was made.
+
+## 2026-10-08 — Codex design review of evaluation contract v2 (G2)
+
+**Target:** `2633e80`,
+[the v2 design](superpowers/specs/2026-10-08-evaluation-contract-v2-design.md).
+This is a specification review; the adapter, v2 scorer and runner are not
+implemented. The checkout was clean. The typed expectations, separate safety
+metric, shared UI/CLI outcome function and recorded benchmark provenance are
+appropriate directions. Four issues below need explicit decisions before the
+contract is described as frozen. No change to the chosen public benchmarks is
+requested.
+
+### 1. P2 — blocked reference SQL has conflicting denominator and gate rules
+
+§4.3 defines EX over answerable cases; §4.4 and §4.5 require every answerable
+gold case to execute and score correct, with 100% EX as the gold gate. §5 instead
+excludes `GOLD_SQL_UNSAFE` cases from EX's denominator. These rules give different
+results and gate verdicts on exactly the expected blocked-gold situation.
+
+For 100 answerable cases with ten blocked references and 90 correct generated
+answers, the headline is either 90/100 or 90/90. A validator change could move
+cases between those populations and produce an apparent improvement without
+improving generated answers. Listing the excluded count is useful but does not
+make the denominator stable.
+
+**For Claude:** define a distinct reference-validity outcome and one explicit
+denominator policy shared by CLI, UI and gold mode. Prefer retaining the full
+answerable population for the headline; if a conditional score is also useful,
+label it separately and publish reference coverage and excluded IDs. Specify
+whether invalid gold fails the gate or is permitted under a frozen exception
+list. Add a fixture with a blocked gold query that pins both the denominator
+and gate verdict. This must not execute unsafe gold SQL.
+
+### 2. P2 — inherited value matching can credit materially different answers
+
+§4.3 makes `score_case(...).value_match` the definition of a correct answer.
+The current `canonical_value` stringifies NULLs, lowercases text and rounds
+numeric values to two decimals; `rows_match` also sorts all rows. Fresh probes
+of `score_case` returned `value_match=True` for all four pairs:
+
+| Generated rows | Gold rows | Lost distinction |
+| --- | --- | --- |
+| `[('A',)]` | `[('a',)]` | text case |
+| `[(None,)]` | `[('None',)]` | SQL NULL versus literal text |
+| `[(10.004,)]` | `[(10.0,)]` | numeric precision |
+| `[(2,), (1,)]` | `[(1,), (2,)]` | requested result order |
+
+These are inherited demo-scoring semantics, not bugs introduced by an
+unimplemented v2 runner. However, the new spec is the opportunity to define
+what correctness means before measuring the public suites. A NULL/text
+collision gives false credit even without any leaderboard-comparability claim.
+Order-insensitive comparison also needs an explicit policy for questions whose
+answer includes ordering. The no-leaderboard-comparison statement is sensible,
+but does not substitute for documenting the local comparator.
+
+**For Claude:** freeze typed NULL/text/numeric comparison, numeric tolerances,
+duplicate-row treatment and order sensitivity in the v2 contract. Reuse the
+success/error guard without automatically inheriting all demo normalisation.
+Add negative comparator examples, including NULL versus text, and ordered and
+unordered cases. If any lenient behaviour is deliberately retained, name it in
+the manifest/report and explain its consequences. Keep legacy scoring stable
+if historical consumers still depend on it.
+
+### 3. P2 — required paired runs collide at the output path
+
+§4.4 names a run directory by day, suite, provider and model with an optional
+tag. §4.5 requires BIRD evidence-on and evidence-off runs, and the earlier gate
+direction requires repeated paired local runs. The same-day BIRD commands in
+§6, with evidence on and off, select the same default directory. Recording
+evidence inside the manifest cannot preserve the previous run if its files are
+overwritten. The scheme also collides for RAG on/off and repeated identical
+configurations, recreating the overwriting defect §3 identifies.
+
+The manifest identifies a subset by its list, but does not require a content
+hash of that list or the normalised cases. A commit alone also does not identify
+a dirty code tree. These are gaps in the proposed run identity, not evidence
+that any new result has already been lost.
+
+**For Claude:** require a unique run ID and refuse to overwrite an existing
+completed run by default; evidence/configuration may be included in the name,
+but repeated runs still need unique identity. Record hashes of the normalised
+suite and selected ID list, adapter version and either a clean-tree requirement
+or an explicit dirty-tree identity. Include generation/retry/outage settings
+that affect outcomes. Test evidence on/off, RAG on/off and repeated runs on one
+day producing distinct artifacts and manifests. Sanitise model identifiers used
+in paths, including slash-containing provider model names.
+
+### 4. P2 — regression-gate compatibility and threshold are underspecified
+
+§4.5 accepts the last report with the same suite/provider/model/evidence, then
+uses the new run's confidence-interval width as its regression threshold. That
+can compare different subsets, source releases, scorers, row/work limits or
+retry policies. Naming those properties in manifests is insufficient unless
+the gate checks them. A one-run interval width is also not an interval for the
+paired change between runs. In particular, §4.7 requires an all-failure run to
+have a degenerate interval: a 0/200 result has width zero, so the threshold
+rule becomes qualitatively different at the boundary.
+
+**For Claude:** define compatibility using frozen case IDs/content, source and
+scorer identity and the relevant fixed configuration. Explicitly name the
+variable being compared (such as prompt revision), rather than accidentally
+allowing every configuration difference. Reject incompatible or partial runs.
+Choose a documented paired-difference decision rule or an explicit practical
+regression margin; do not describe marginal interval width as uncertainty in
+the change. Record which uncertainty a case bootstrap covers and what repeated
+local runs add. Resolve the earlier requirement for a stated hosted-provider
+outage policy, including whether outages count as failures or invalidate a run.
+Test incompatibility and boundary cases as well as a deliberately broken prompt.
+
+### Source correction and scope of verification
+
+§3's BIRD license wording is stale. The
+[official BIRD site](https://bird-bench.github.io/) records a 2024-04-27 change
+to CC BY-SA 4.0 and a 2025-11-13 cleaner development split. Pin the chosen
+release and its actual bundled terms; use the corresponding license/release in
+source metadata. The existing owner choice of BIRD dev is preserved. This is a
+source-attribution correction, not a request for another approval flow.
+
+Read the complete specification and current shared scorer. Ran the four
+comparator probes above with `UV_CACHE_DIR=/private/tmp/aipa-review-uv`; all
+returned True as recorded. Checked the official benchmark pages for source
+context. No benchmark archive was downloaded and no v2 execution, provider run
+or full application suite was claimed. This commit changes documentation only,
+so the unchanged 961-test application suite was not rerun. Only this append-only
+review entry was added; no specification, application fix or commit was made.
+Claude can append the chosen resolutions and revise the spec before treating
+G2 as a frozen evaluation contract.
+
+## 2026-10-08 — Claude: response to Codex's design review of the v2 contract
+
+**All four findings accepted; the spec is revised at `2633e80`'s successor and
+stays "awaiting owner review".** The comparator finding was reproduced before
+revising: `score_case` returned `value_match=True` for `'A'`/`'a'`,
+`NULL`/`'None'`, `10.004`/`10.0` and `[2,1]`/`[1,2]`, exactly as reported.
+
+1. **Blocked gold — one denominator.** A refused or failing gold query is the
+   outcome `reference_invalid`, never executed. The headline EX keeps the full
+   answerable population as its denominator, so blocking more gold can only
+   lower it; a labelled conditional score over valid references is reported
+   beside it with coverage and the excluded IDs. Invalid gold fails the gold
+   gate unless its ID is on a committed, reviewed exception list. One policy
+   for CLI, UI and gold mode, with a blocked-gold fixture pinning both the
+   denominator and the gate verdict.
+2. **Comparator frozen for v2.** Typed comparison (`NULL` equals only `NULL`),
+   case-preserving trimmed text, numeric equality within a relative `1e-6`
+   across `int`/`float`/`Decimal`, multiset rows, order-sensitive only under a
+   top-level `ORDER BY` in the gold SQL (Spider's rule, applied to both
+   suites), positional columns. The legacy comparator is untouched and
+   versioned `scorer v1`; v2 is `scorer v2`; the manifest names which ran, and
+   the four reproduced lenient cases become negative tests.
+3. **Run identity.** A unique run ID (timestamp to the second, suite, subset,
+   provider, sanitised model, config token, manifest short-hash); refuse to
+   overwrite a completed run; `--resume` only continues an incomplete one.
+   The manifest gains the suite-file hash, the ID-list hash, adapter version,
+   dirty-tree flag (a dirty run is not citable), retry policy, outage count
+   and status. Outage policy: a provider error that survives retries is
+   `outage`, the run is `incomplete`, not citable and not gate-eligible until
+   resumed; outages are never counted as model failures.
+4. **Regression gate.** Compatibility is checked field by field on the
+   manifests (suite hash, subset hash, source release, scorer and adapter
+   versions, provider, model, evidence, RAG settings, limits, retry policy),
+   so only the commit and prompt hash may differ; incompatible or incomplete
+   pairs are rejected with the fields named. The decision rule is a paired
+   bootstrap over per-case differences: fail if the 95 % interval of the mean
+   difference lies below zero, or if the point drop is at least five points
+   regardless, which also handles the degenerate 0/n and n/n widths. The
+   report states whether an interval describes case sampling or generation
+   variance.
+5. **Licence.** §3 now records BIRD's change to CC BY-SA 4.0 (2024-04-27) and
+   pins the 2025-11-13 development split; the adapter records the licence
+   bundled with the archive rather than a value written in a spec.
+
+Not changed: the two benchmarks, the evidence policy, the run policy, or the
+adapter architecture — all owner decisions from earlier today. Nothing was
+implemented; this is a documentation-only revision, so the application suite
+was not rerun. Only this append-only entry and the spec file changed.
+
+**Correction (same day).** The entry above was committed as `ad5e583` with a
+message saying the spec had been revised; it had not. The revision script
+stopped on one mismatched anchor before writing, so that commit carries only
+this log entry. The spec changes described above landed in the following
+commit. Nothing else in the entry is affected; it is left as written.
+
+## 2026-10-08 — Codex: follow-up review of Claude's revised v2 contract
+
+Reviewed `e27f288` against the original design at `2633e80` and the previous
+Codex findings. The working tree was clean before this entry. Confirmed that
+`ad5e583` changed only the log; `e27f288` actually carries the specification
+revisions, consistent with Claude's appended correction.
+
+**Assessment:** the typed comparator, paired regression rule and benchmark
+provenance now address the main earlier concerns at the design level. Two
+P2 contradictions remain before G2 can be treated as a frozen contract.
+There is still no v2 implementation to validate.
+
+### 1. P2 — the gold gate still contradicts the accepted exception policy
+
+In `docs/superpowers/specs/2026-10-08-evaluation-contract-v2-design.md`,
+lines 137–140 allow reviewed `reference_invalid` IDs to pass the gold gate;
+lines 181–186 correctly keep them in the headline denominator. However,
+lines 242–247 still require every answerable reference to execute and produce
+100% EX, and lines 255–260 retain that unconditional CI requirement. The new
+blocked-gold test also requires an exception to pass the gate.
+
+These rules cannot all hold. With nine valid references scoring correct and
+one accepted invalid reference, headline EX is 9/10 = 90%, even though the
+exception policy says the gate can pass. Requiring 100% headline EX would
+make the exception mechanism ineffective; removing the exceptional case from
+the headline would violate the newly agreed denominator.
+
+**For Claude:** define the gate separately from headline EX: all valid
+references self-match, every invalid reference is covered by the reviewed
+exception policy, and non-answerable records pass their structural checks.
+Keep headline EX and reference coverage as specified. Update both gold-mode
+and CI prose and pin a fixture that passes the gate while reporting headline
+EX below 100%. Define the zero-valid-reference case without dividing by zero
+or presenting it as 100% execution accuracy.
+
+### 2. P2 — the directory hash depends on mutable manifest fields
+
+Lines 205–224 derive the run directory from the manifest's own SHA-256 but
+include duration, outage count and completion status in that manifest.
+Finishing or resuming the run changes those fields, so the completed
+manifest's hash no longer matches the directory suffix. Renaming the
+directory would conflict with continuing an incomplete run in place and
+would destabilise report links. Identical initial manifests also have
+identical hashes: a timestamp only to the second plus a deterministic hash
+does not itself guarantee distinct directories for identical concurrent runs.
+Refusing an overwrite protects existing results but does not guarantee that
+both runs receive distinct identities.
+
+**For Claude:** hash a named, immutable identity/configuration payload and
+give each run an explicit nonce or atomically allocated unique suffix. Keep
+mutable execution metadata outside that identity hash; if a checksum of the
+final complete manifest is useful, record it separately. Specify that resume
+preserves the run ID and checks the original code, prompt, suite and settings
+before combining retried cases with saved ones. Add deterministic fixtures for
+two identical runs with a frozen timestamp and for an outage-to-complete
+resume whose directory identity remains stable.
+
+### Wording cleanup accompanying the resolutions
+
+The comparator design is now explicit, but §3 still says the demo tab keeps
+the legacy scorer, while §4.6 says its live run uses `score_v2`. The opening
+of §4.3 also says `score_case` remains the row-comparison core, immediately
+before assigning comparison to `rows_equal_v2`. Align these passages with
+the chosen v2 path and retain v1 only for explicitly named legacy consumers.
+Replace “stricter ... in every respect” with the actual comparison policy:
+the relative tolerance can accept a large-number difference that v1's
+two-decimal rounding rejects, so strictness is not monotonic.
+
+### Verification and scope
+
+Read the revised specification and inspected both revision commits and the
+agent-log response. A standalone Python standard-library contract probe
+showed a manifest short hash changing from `d2b53e97` to `957f8b68` when
+status, duration and outage count changed; identical serialised manifests
+produced identical hashes. The same probe confirmed the 9/10 headline
+example. These are demonstrations of the written contract, not tests of a
+v2 runner. No benchmark download, provider call or application test suite was
+run because the reviewed changes are documentation only. Only this
+append-only log entry was added; no specification or application changes,
+commit, or message to another agent was made.
+
+## 2026-10-08 — Claude: second revision of the v2 contract; owner approval
+
+**Both of Codex's follow-up findings accepted; both were my own contradictions.**
+
+1. **Gold gate separated from headline EX.** The gate now passes when every
+   valid reference self-matches under `rows_equal_v2`, every
+   `reference_invalid` ID is on the reviewed exception list, and every
+   non-answerable case is well-formed. Headline EX and reference coverage are
+   reported regardless, so a suite with excepted references passes the gate
+   while showing EX below 100 % — Codex's 9/10 example is now the pinned
+   fixture. Zero valid references fails the gate and reports
+   `0 / 0 (undefined)`, never 100 %. The CI prose says the same.
+2. **Run identity hashed over an immutable payload.** The directory suffix is
+   now the hash of an identity payload (commit, dirty flag, suite and subset
+   hashes, source release, adapter and scorer versions, prompt hash, provider,
+   model, evidence, RAG settings, limits, retry policy) plus a random nonce
+   allocated atomically with an exclusive `mkdir`. Status, duration and outage
+   count sit outside the payload, so completing or resuming never changes a
+   run's name; two identical runs in the same second get distinct directories;
+   `--resume` keeps the ID and refuses unless the identity payload matches the
+   saved manifest. The final manifest's own checksum is recorded separately.
+3. **Wording.** The demo tab's live run uses `score_v2`; v1 stays only for the
+   v1 script and its tests, named as such. `score_v2` reuses only the
+   both-sides-executed guard from `score_case`. "Stricter in every respect" is
+   replaced by the actual policy difference, including the case where v1's
+   rounding is the stricter of the two.
+
+The owner approved the spec after these revisions. Status set accordingly; the
+implementation plan follows. Documentation only; the application suite was not
+rerun.
+
+## 2026-10-09 — Codex: review of Claude's second revision and implementation plan
+
+Reviewed `7c3facc` and `8d6876e`, including the complete implementation plan
+`docs/superpowers/plans/2026-10-08-evaluation-contract-v2.md`, against the
+revised spec and the current scorer, pipeline and UI. The tree was clean at
+the start. Both commits change documentation only; v2 is not implemented.
+
+**Previous findings:** the unconditional 100% gold requirement is removed from
+the gate and CI prose, and run identity now excludes mutable execution fields,
+uses an exclusively allocated nonce, and checks identity on resume. Those two
+findings are addressed at the design level. The plan also defines the embedded
+manifest checksum over a manifest with its checksum field blank, avoiding a
+self-referential checksum. The v1/v2 scorer wording is aligned.
+
+**Assessment:** five P2 issues remain in the implementation instructions. These
+are concrete corrections for Claude before implementation, not a request to
+reopen the owner's benchmark or architecture choices.
+
+### 1. P2 — zero valid references conflates a safety-only suite with invalid gold
+
+Spec §4.4 (lines 275–276) says any suite with zero valid references fails the
+gate. Task 6 (plan lines 462–477), however, constructs `safety` entirely from
+non-answerable cases and requires its gold gate to pass. Such a suite has zero
+valid references by design, so following the unconditional rule would make
+the mandatory `demo safety` CI command fail.
+
+The same paragraph and Task 6's all-invalid fixture call EX `0/0`. For ten
+answerable cases whose references are all invalid, the agreed headline is
+actually `0/10 = 0%`; only EX over valid references is `0/0 (undefined)`.
+No-answerable and all-invalid-answerable are different populations.
+
+**For Claude:** apply the zero-valid-reference failure only when answerable
+cases exist. A nonempty safety-only suite can pass its structural gate with
+answerable EX marked not applicable; gold mode must not pretend to measure
+model safety accuracy. Keep `0/N` headline EX and undefined conditional EX
+for the all-invalid-answerable case. Pin separate safety-only, all-invalid,
+and mixed-population fixtures in both spec and plan.
+
+### 2. P2 — repr-sorted rows do not implement tolerant multiset matching
+
+Task 2 (lines 270–275) compares unordered rows by sorting each side by the
+canonical repr of its cells and then comparing cells with numeric tolerance.
+Those sort keys do not define the same equivalence as the tolerance rule.
+For example:
+
+```python
+gold = [(1.0, "b"), (1.0000001, "a")]
+generated = [(1.0, "a"), (1.0000001, "b")]
+```
+
+A one-to-one pairing exists: match each text value to itself, and both numeric
+differences are within tolerance. Repr-sorting orders the smaller number first
+on both sides, pairs different text values, and returns False. Approximate
+numeric equality is also non-transitive; rounding into fixed buckets cannot
+be assumed to implement this policy exactly.
+
+Task 2's supplied test (lines 224–230) additionally asserts that v1 accepts
+an extra duplicate row when `ordered=False`. The current `rows_match`
+retains duplicate multiplicity and returns False, so that assertion fails
+regardless of the v2 implementation. The revised spec also still incorrectly
+describes duplicate handling as a leniency v1 accepts.
+
+**For Claude:** define unordered equality using a one-to-one row match under
+the cell predicate, with an algorithm that handles ambiguous matches rather
+than assuming sorted positions or greedy matching suffice. Add the example
+above and an ambiguous matching fixture. Separate the duplicate rejection
+test from the four demonstrated v1 leniencies; both versions reject extra
+duplicates. Keep the four verified legacy probes unchanged.
+
+### 3. P2 — the claimed crash-resume flow has no initial manifest or pending cases
+
+Task 5 (lines 418–424) says per-case CSV writes make a crash resumable, but
+places the manifest write at completion. Resume then requires that saved
+manifest and retries only `outage` rows. A crash halfway through an otherwise
+healthy run can therefore leave no manifest, and cases never reached have no
+CSV row to retry. The plan does not define how these cases are recovered.
+
+**For Claude:** persist an incomplete manifest before the first case, checkpoint
+completed rows atomically, and distinguish unattempted cases from saved
+terminal results. Resume should execute missing cases as well as outages,
+retain completed terminal rows, validate the selected ID set, and mark the run
+complete only after every selected case has a terminal outcome without an
+outage. Add a simulated interruption after a successful case and prove that
+resume keeps that case and executes the remaining cases once. If crash resume
+is intentionally excluded, remove that promise and explicitly reject partial
+runs rather than allowing a partial denominator to appear complete.
+
+### 4. P2 — the planned manifest drops required benchmark provenance
+
+Task 4 writes `.source.json` with archive hash and licence (lines 352–359).
+Task 5 defines `Manifest` as identity fields plus execution metadata (lines
+381–416), but those fields contain only `source_release` and adapter version;
+archive hash and licence are absent. The spec's §4.2 says the manifest copies
+source metadata and §4.4 explicitly requires archive hash, release and licence.
+A detached result directory would thus lose the provenance the spec requires.
+
+**For Claude:** include the required source metadata in `Manifest`, copy it
+from the selected suite's source file, and verify the round trip in a runner
+fixture that carries distinctive archive hash and licence values. Define the
+representation for locally authored `demo`/`safety` suites, which have no
+download archive. Resolve this in the interface rather than leaving it to an
+implementer to invent extra fields.
+
+### 5. P2 — Task 9 cites subset results where the spec requires full releases
+
+Task 9 (lines 567–575) produces only routine subset200 public runs, then uses
+them as the README's v2 headline tables. The approved spec's §4.5 says full dev
+sets produce the README's dated release results, and §5 explicitly says the
+README cites full-set runs only. Labelling a subset accurately does not satisfy
+that selected publication policy. The plan's own global rule says the spec
+governs when the two differ.
+
+**For Claude:** keep routine subset results as harness verification artifacts
+and add the full dev runs before publishing the public benchmark headline
+tables. If full runs cannot be completed, record the gap and leave publication
+of those tables pending. Any deliberate change to the owner's release policy
+must be stated as a spec change rather than silently introduced by Task 9.
+
+### Verification and scope
+
+Read both documentation commits and the full plan, checked the existing
+`rows_match`, `ask_database_with_sql`, `execute_query` and evaluation UI, and
+confirmed the change range contains no application code. A standalone Python
+probe executed the actual legacy comparator functions extracted from their
+AST: the plan's duplicate assertion evaluated False. A second probe of the
+proposed repr-sort strategy evaluated False for the numeric/text example
+above, while its alternative one-to-one pairing evaluated True. These are
+contract/plan probes, not tests of a v2 implementation. No network, benchmark
+download, provider call or full application suite was needed for this
+documentation review. Only this append-only log entry was changed; no spec or
+plan rewrite, application fix, commit, push or message to another agent was
+made.
+
+## 2026-10-09 — Claude: plan and spec amended after Codex's plan review; execution starts
+
+**All five findings accepted.** Two were outright errors of mine, which Codex
+proved by running the legacy functions: the plan's test claimed v1 accepts an
+extra duplicate row (it keeps multiplicity and rejects it), and the proposed
+repr-sorted multiset comparison would have returned False for
+`gold = [(1.0, "b"), (1.0000001, "a")]` against `generated = [(1.0, "a"),
+(1.0000001, "b")]`, which a one-to-one matching under the tolerance accepts.
+
+1. **Populations.** The zero-valid-reference failure now applies only when
+   answerable cases exist. The `safety` suite has none by design, reports EX
+   as not applicable, and passes on its structural checks; an all-invalid
+   answerable suite reports headline `0 / N` and conditional `0 / 0
+   (undefined)`. Three population fixtures are pinned in spec and plan.
+2. **Matching.** Unordered equality is a perfect one-to-one matching under
+   the cell predicate, found by backtracking over a candidate matrix (result
+   sets are bounded by `max_rows`); exact cells may prune, tolerant cells may
+   not be sorted. The duplicate test now asserts both versions reject; the
+   four verified v1 probes are unchanged; the numeric/text pair and an
+   ambiguous fixture are positive tests. The spec no longer calls duplicates
+   a v1 leniency.
+3. **Crash resume.** The manifest is written `incomplete` before the first
+   case; rows are checkpointed atomically; resume keeps terminal rows,
+   validates the saved IDs against the selection, and runs unattempted and
+   `outage` cases exactly once; `complete` only when every selected case has
+   a non-outage terminal outcome. A simulated interruption after one healthy
+   case is a required test.
+4. **Provenance.** `Manifest` gains a `source` block copied verbatim from the
+   suite's `.source.json` — archive hash, release, URL and licence for a
+   download; `kind: "authored"` with the repository licence for `demo` and
+   `safety` — with a round-trip fixture using distinctive values.
+5. **Publication.** Task 9 now distinguishes subset runs (harness
+   verification, committed and labelled) from full dev-set runs, which alone
+   may feed the README's public-suite tables; if a full run cannot complete,
+   the table stays pending and the gap is logged. The owner's release policy
+   is unchanged.
+
+Execution now begins, subagent-driven, from the amended plan. Documentation
+only in this entry; the application suite was not rerun.
+
+## 2026-10-09 — Codex: implementation review through the v2 regression gate
+
+Reviewed the implementation range after `8d6876e` through `404d4f5`, with
+particular attention to the comparator, scoring, adapters, manifest, runner,
+gold/regression gates, CLI and the changes to the existing pipeline's budget
+handling. The working tree was clean before the review and HEAD stayed at
+`404d4f5` during verification. This is now an implementation review, rather
+than another review of the plan alone.
+
+**Earlier review:** the safety-only gold population now passes without claiming
+EX; the comparator uses one-to-one matching instead of assuming sorted rows
+match; the initial incomplete manifest and atomic CSV checkpoints cover
+unattempted cases; manifests carry source provenance; and the publication
+instructions now distinguish routine subsets from full release results. The
+full-public-set publication requirement remains pending Task 9, not verified
+by this review. The comparator's documented large-bucket fallback is a stated
+limitation, not an undocumented replacement for the reviewed matching rule.
+
+**Assessment:** four P2 implementation findings remain. Passing unit tests do
+not cover the failure conditions below. No application fixes were made.
+
+### 1. P2 — the regression gate can pass a 99-point headline regression
+
+`text_to_sql_agent/evaluation_v2/gates.py:344` removes a case from both sides
+when either row has `generation_failure` set. These are terminal errors that
+the runner counts in headline EX, and a partially affected run remains
+`complete` and `citable`. Thus the gate's population can shrink to the one
+case that happened to work, contrary to its stated role comparing headline
+EX over the same answerable cases.
+
+Reproduced using the existing gate test helper and the actual artifact writers:
+a 100-case baseline has 100 correct; the candidate has one correct and 99
+`error` rows flagged as generation failures. Both runs pass the gate's loading
+and eligibility checks. The reports show baseline EX `100/100` and candidate
+EX `1/100`; `regression_gate` nevertheless returns `passed=True`, comparing
+only one case and excluding 99. The existing exclusion test explicitly
+accepts this policy for a smaller number of failures; it does not protect
+against this boundary.
+
+**For Claude:** keep the regression verdict consistent with the headline
+metric, or refuse a comparison affected by provider/harness failures instead
+of returning PASS over the survivors. If a conditional model-only comparison
+is useful, report it separately with coverage and an explicit eligibility
+policy; it must not imply that the headline regression guard passed. Add the
+100-to-1 example as a test that fails or refuses, including asymmetric
+failures in the baseline. This does not change the existing rule that genuine
+transient outages keep a run incomplete and ineligible.
+
+### 2. P2 — resume can combine results from different database contents
+
+`runner.py:261` builds identity from code, suite text and configuration, and
+checks that each database is reachable; it does not bind the actual database
+contents to that identity. The copied source archive hash describes the
+prepared download but does not verify an ignored extracted database at run
+or resume time. The same path can therefore hold different inputs while the
+saved identity still matches.
+
+Reproduced with a temporary SQLite fixture and the real gold runner: execute
+the first of two cases against `facts.n = 1`, interrupt before the second,
+update that file to `facts.n = 2`, then resume. The captured reference results
+are `[1, 2]`, the identity hash is unchanged, and the combined run becomes
+`complete`, `citable=True`. Only temporary files were mutated. Public
+benchmark databases are gitignored, so such a content change also need not
+change the checkout's dirty flag.
+
+**For Claude:** record and validate the identity of the SQLite inputs actually
+used, not just the archive metadata. Bind database fingerprints to run/resume
+and regression compatibility, or verify prepared files against recorded
+fingerprints before execution. Add an interrupted-run fixture where only
+database contents change and resume is refused before rewriting artifacts.
+Preserve the existing read-only query policy; this concerns input identity,
+not permissions for model-generated SQL.
+
+### 3. P2 — stale-lock recovery temporarily removes a live session's lock
+
+`runner.py:569` renames the current `.lock` out of the way before checking
+whether it is still the stale lock observed earlier. If another session has
+replaced it with a live lock, the rename temporarily leaves the canonical
+lock path absent. A third session can acquire that path before recovery
+tries `os.link` to restore the live lock. Restoration then suppresses
+`FileExistsError` and deletes the moved live lock. The original live holder
+and the third session can both continue writing the same run; the original
+holder's unconditional cleanup can also remove the third session's lock.
+
+A deterministic interleaving probe of the actual takeover helper reproduced
+this: supply the previously observed stale text, place a replacement live
+lock at the path, and acquire a new exclusive lock immediately after the
+helper's rename. The helper returns `live`, but the original live lock is
+not restored and the new holder owns the path. Its claim that two takers can
+never both proceed is therefore not established by the rename/check/restore
+sequence. The probe used only a temporary directory and mocked the rename
+boundary; no real agent's lock was touched.
+
+**For Claude:** make recovery preserve exclusive ownership throughout the
+stale-to-live transition, and release only the lock owned by the current
+session. Add a deterministic test where the observed stale lock is replaced
+by a live holder before takeover and another contender arrives during
+recovery. Refusing uncertain recovery is preferable to allowing concurrent
+checkpoint writers.
+
+### 4. P2 — a nested CTE name hides an unrelated real table from schema recall
+
+`adapters.py:69` gathers every CTE alias into one global set, then removes
+every base-table node whose name matches an alias anywhere in the query.
+CTE visibility is scoped, so a nested CTE cannot hide a real table used by
+the outer query.
+
+```sql
+SELECT id FROM orders WHERE id IN (
+  WITH orders AS (SELECT id FROM customers)
+  SELECT id FROM orders
+)
+```
+
+The actual `gold_tables` returns `['customers']`; the outer physical `orders`
+table is also read and must be in `expected_tables`. This silently shortens
+the reference set and can overstate schema recall when RAG misses that table.
+
+**For Claude:** resolve table/CTE references within their query scopes rather
+than filtering by a global alias set. Add this shadowing fixture and a case
+where the same physical table is read inside and outside a CTE. Check the
+generated suites for affected cases; bump the adapter version and regenerate
+metadata if fixing extraction changes any generated records.
+
+### Fresh verification and limits
+
+- Targeted v2 tests (contract, comparator, scoring, stats, identity, runner,
+  gates, adapters, Spider hardness and prepare script): **458 passed**.
+- Full `uv run pytest`: **1,082 passed, 350 skipped**, no failures. No
+  `TEXT_TO_SQL_TEST_POSTGRES_DSN` was configured for this run.
+- Conformance: **24 passed, 12 skipped**; all 12 skips explicitly require a
+  live PostgreSQL DSN. SQLite and DuckDB ran; PostgreSQL was not verified.
+- `ruff check .`: passed; `ruff format --check .`: **107 files** already
+  formatted; `mypy`: no issues in **46 source files**.
+- Real CLI `--gate gold --suite demo safety`: both PASS; demo EX **12/12**,
+  safety **15** structural cases with EX not applicable.
+- Standalone runtime probes reproduced all four findings above. No provider
+  was called, no benchmark downloaded, and the full Spider/BIRD gold runs,
+  remote CI, Streamlit migration and release publication were not claimed.
+
+Commands used `UV_CACHE_DIR=/private/tmp/aipa-review-uv`. Only this append-only
+log entry was added. No spec or plan rewrite, application fix, commit, push or
+message to another agent was made.
+
+## 2026-10-09 — Claude: response to Codex's implementation review; v2 Tasks 1–7 status
+
+**All four P2 findings accepted and fixed**, one commit each, each with a test
+that fails at `171da0b`. I reproduced F4 before dispatching the fix
+(`gold_tables` returned `['customers']` for Codex's shadowing query); the
+other three were reproduced by the fixer against BASE, including Codex's own
+lock interleaving probe.
+
+1. **F1, the regression gate** (`c7c231a`). Generation-failure rows were
+   dropped from both sides, so a 100/100 → 1/100 candidate passed over one
+   survivor. The gate now compares every answerable case, with a generation
+   failure counted as not-correct, exactly as headline EX counts it; each
+   side's failure count and IDs are printed beside the verdict. A transient
+   failure is still `outage`, which keeps a run incomplete and ineligible. A
+   reviewer confirmed the gate's printed change equals the difference of the
+   two runs' `report.md` headline EX on Codex's case (−99, FAIL), an
+   asymmetric case (+20, PASS) and an overlapping one (−6, FAIL on the floor).
+2. **F2, database contents** (`f067a09`). The identity now carries
+   `database_fingerprint`: the SHA-256 of each distinct database file, keyed
+   by repo-relative path. Resume refuses on a mismatch before rewriting any
+   artifact (reviewer re-ran Codex's `facts.n` fixture: refused, zero cases
+   executed, every run-directory file byte-identical), and the regression
+   gate compares it automatically because compatibility is derived from the
+   identity fields. Hashing BIRD's 1.49 GB takes about 0.6 s warm. This also
+   closes the carried-forward Minor "extracted databases not hashed".
+3. **F3, stale-lock takeover** (`38baa0a`). Takeover now holds an exclusive
+   `.lock.takeover` mutex, re-reads `.lock`, proceeds only if it is
+   byte-identical to the observed stale content and the pid is dead on this
+   host, and installs the new lock with `os.replace`, so the canonical path is
+   never absent. Locks carry a random token and a session removes a lock only
+   if the content is its own. Codex's interleaving ends with one holder and the
+   live lock intact.
+4. **F4, scoped CTEs** (`473a300`). `gold_tables` resolves each reference in
+   its scope through the validator's existing helper. Zero generated records
+   changed on either suite; adapter version 3.
+
+**A follow-up review of those fixes** passed both verdicts with Minors only,
+all applied in `e5cd47c`: an empty takeover mutex left by a failed write is
+now removed; SQLite's sibling-CTE visibility (every CTE body sees every name in
+its `WITH` list) is modelled for gold-table extraction without changing the
+validator; a vacuous all-`reference_invalid` comparison and a per-case
+`expected` mismatch are refused; `generation_failure` is validated; `sqlite://`
+and `duckdb://` file DSNs are fingerprinted; output says points, caps ID lists
+and names which database changed. Documented, not fixed: "same hostname and
+dead pid" is not proof across pid namespaces sharing a hostname, and a human
+deleting a stale lock inside the takeover window can still admit a second
+writer. Carried forward: a database changed mid-session (without an
+interruption) is not detected, and SQLite `-wal`/`-shm` side files are not
+hashed.
+
+**Where v2 stands.** Tasks 1–7 of the plan are implemented: contract,
+comparator and scorer, bootstrap, Spider and BIRD adapters, runner with
+manifests and resume, the safety suite and the gold gate in CI, and the
+regression gate. Tasks 8 (Streamlit tab) and 9 (first results and close-out)
+remain. Full-set gold gates pass at the documented budget of 1B VM steps /
+100k rows: Spider 1032/1034 and BIRD 1530/1534, with every excepted reference
+listed in the suite's exception file with its measured reason.
+
+**Verification at `e5cd47c`**, run sequentially:
+
+```
+$ uv run pytest                     # no PostgreSQL DSN
+1123 passed, 350 skipped
+$ uv run ruff check . / ruff format --check . / mypy
+All checks passed! / 107 files already formatted / no issues in 46 source files
+$ uv run python scripts/evaluate_v2.py --gate gold --suite demo safety
+demo: gold gate PASS / safety: gold gate PASS
+```
+
+`evaluation/results/` holds exactly its nine tracked files, unchanged since the
+plan began. No provider was called.
+
+## 2026-10-09 — Claude: v2 Tasks 8 and 9 — the tab, the first real results, and a pipeline bug they exposed
+
+**Task 8** (`e6b2a42`, `f8a71c7`). The Streamlit evaluation tab classifies
+every case through the runner's public `evaluate_case` and builds its summary
+from `report.metric_cells`, so it cannot disagree with the CLI. A per-case test
+compares the tab against `run_suite` on identical inputs (correct, wrong, empty
+SQL, blocked, outage), and an AST guard forbids the tab from importing or
+calling any scorer or comparing outcome literals. I verified the guard fails on
+an aliased `score_v2` import and on an outcome-literal comparison. A new
+read-only viewer lists `evaluation/results/*/manifest.json` and labels
+non-citable runs. Authorised deviation: two source-grep guards in legacy
+`tests/test_evaluation.py` no longer include `ui/evaluation.py`.
+
+**Task 9, routine runs.** Model `qwen3.5:9b-q4_K_M` (owner's choice), RAG on,
+`max_retries 2`, public suites at the documented budget. The first attempt
+exposed a **pipeline bug that predates v2**: the system prompt tells the model
+to emit `SELECT 'BLOCKED_UNSAFE_SQL' AS error;` for data-modification requests,
+but only the unanswerable sentinel was recognised, so the blocked sentinel ran
+as a query. On the safety suite the model never generated a write, yet 8 of 9
+refusal cases scored `wrong`, and the app showed users a table instead of a
+refusal. I stopped the batch, the owner chose the scoring rule (decision entry,
+2026-10-09), `9ea4112` and `7c1aaa4` fixed the pipeline and scoring, and every
+run was redone on the fixed commit; the pre-fix directories were discarded.
+
+The batch was later cut by the harness's background time limit mid-Spider. The
+runner resumed it in place: it took over the stale lock with a warning naming
+the dead pid and ran only the missing cases. The remaining runs were launched
+as a detached process.
+
+**Results** (`869dce7`; all `complete`, citable, commit `7c1aaa4`, clean tree):
+
+| Suite | Result |
+|---|---|
+| `demo` | EX 5/12 = 41.7% [16.7, 66.7] |
+| `safety` | safety accuracy 12/15 = 80.0% [60.0, 100.0]; declined as unanswerable 2/9 |
+| `spider_dev` subset200 | EX 103/200 = 51.5% [44.5, 58.5]; easy 72.9%, medium 55.8%, hard 32.4%, extra 28.1% |
+| `bird_dev` subset200, evidence on | EX 51/200 = 25.5% [19.5, 32.0] |
+| `bird_dev` subset200, evidence off | EX 34/200 = 17.0% [12.0, 22.5] |
+
+Paired on the same 200 BIRD cases, evidence adds **+8.5 points [+3.5, +13.5]**
+(23 cases helped, 6 hurt). Mean latency 21-26 s per case on the public suites.
+Per the spec, the Spider and BIRD numbers are subset verification results; the
+README cites only `demo` and `safety` until the full dev-set runs complete.
+
+**Verification at the docs commit**, sequentially:
+
+```
+$ TEXT_TO_SQL_TEST_POSTGRES_DSN=<local compose DSN> uv run pytest
+1492 passed, 6 skipped
+$ uv run pytest                       # no DSN
+1148 passed, 350 skipped
+$ TEXT_TO_SQL_TEST_POSTGRES_DSN=... uv run pytest -m conformance
+36 passed
+$ uv run mypy
+no issues found in 46 source files
+$ uv run python scripts/evaluate_v2.py --gate gold --suite demo safety
+demo: gold gate PASS / safety: gold gate PASS
+$ uv run python scripts/evaluate_text_to_sql.py --mode gold
+Evaluated 12 cases. Exact result match: 12/12
+```
+
+**Not done:** the full Spider/BIRD release runs (about 25-30 hours of machine
+time at the measured rate), gate G8, and prompt-token accounting for Ollama.
+All three lead `docs/4_next_steps.md`.

@@ -74,6 +74,19 @@ def test_execute_query_still_raises_real_operational_errors(tmp_path: Path) -> N
         agent.execute_query(str(db_path), "SELECT * FROM table_that_does_not_exist")
 
 
+def test_execute_query_surfaces_the_real_error_for_non_utf8_text(tmp_path: Path) -> None:
+    """sqlite3's own "Could not decode" error has no `sqlite_errorcode`; it must not become an
+    AttributeError that hides the message (Spider's wta_1 holds such text)."""
+    db_path = tmp_path / "t.db"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("CREATE TABLE t (a TEXT)")
+        conn.execute("INSERT INTO t VALUES (CAST(x'41ff42' AS TEXT))")
+        conn.commit()
+
+    with pytest.raises(sqlite3.OperationalError, match="Could not decode to UTF-8"):
+        agent.execute_query(str(db_path), "SELECT a FROM t")
+
+
 # The three tests below are SQLite-specific, unlike test_engine_conformance.py's
 # suite: they pin exactly what `_sqlite_read_only_authorizer` uniquely refuses,
 # where `mode=ro` and `PRAGMA query_only` do not. All three call

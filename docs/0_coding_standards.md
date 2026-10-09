@@ -129,7 +129,9 @@ reworked anyway" — see `docs/superpowers/specs/2026-09-10-refactor-roadmap.md`
   wall-clock-budget engines, DuckDB (Phase 3a) and PostgreSQL (Phase 3b) —
   each engine's `default_work_limit` sets its own unit and magnitude
   (SQLite 100,000 VM steps; DuckDB and PostgreSQL 5,000 ms each; see
-  `docs/3_decisions.md`). `ui/results.py`'s
+  `docs/3_decisions.md`). `EMPTY_GENERATED_SQL` is written only by the v2
+  evaluation runner, for a model that returned no SQL (scored `error`, never a
+  refusal). `ui/results.py`'s
   `describe_error` maps each to a message a non-technical reader can act on;
   anything else is passed through `ui/uploads.py`'s `redact_dsn` before
   display, because the backend also puts raw exception text in that field

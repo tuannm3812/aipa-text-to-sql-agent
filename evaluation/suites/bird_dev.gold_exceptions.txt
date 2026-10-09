@@ -1,0 +1,4 @@
+701   # ~14.6 billion VM steps, beyond SQLite's 2^31-1 progress-handler ceiling
+1131  # ~1.57 billion VM steps, beyond the 1,000,000,000-step benchmark budget
+518   # aborted at 1,000,000,000 steps; still running at a 2 billion-step probe (17 s), so past the 2^31-1 ceiling too
+384   # reference returns 228,765 rows, beyond the 100,000-row benchmark cap; ~4.2M steps, 1 s

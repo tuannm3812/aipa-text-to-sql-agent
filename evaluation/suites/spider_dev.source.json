@@ -1,0 +1,10 @@
+{
+  "kind": "download",
+  "release": "spider-1.0 dev (spider_data.zip, dev.json revised 2020-08-03)",
+  "url": "https://drive.usercontent.google.com/download?id=1403EGqzIDoHMdQF4c9Bkyl7dZLZ5Wt6J&export=download&confirm=t",
+  "sha256": "00636695dabed6b5f4b8328a16b13e069a2f16591d5efcce57660669c85b121b",
+  "licence": "CC BY-SA 4.0",
+  "adapter_version": "3",
+  "unpacked_at": "2026-10-09T04:23:56+00:00",
+  "licence_source": "https://yale-lily.github.io/spider (the archive bundles no licence file)"
+}
