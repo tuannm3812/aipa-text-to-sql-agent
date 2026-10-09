@@ -14,8 +14,11 @@
    has a terminal row and none is ``outage``.
 
 A session holds an exclusive lock file (``.lock``, created with ``O_CREAT | O_EXCL``, holding
-the pid) for the whole loop, so two concurrent ``--resume`` sessions on one run cannot both
-proceed; a lock left by a killed process is reported, naming its pid, never silently broken.
+``<pid> <host> <token>``) for the whole loop, so two concurrent ``--resume`` sessions on one run
+cannot both proceed, and releases it only if it still holds its own token. A lock left by a
+killed process on this host is taken over with a warning, under a separate takeover mutex and
+an atomic replace, so the lock path is never absent; anything less certain is refused, naming
+the pid and the reason.
 
 Relative ``db_path`` values are resolved against the project root (``identity.REPO_ROOT``,
 the directory holding this package): every suite writes them repo-relative, so a run started
@@ -30,7 +33,6 @@ or the next one on disk, never a torn row.
 
 from __future__ import annotations
 
-import contextlib
 import csv
 import dataclasses
 import hashlib
@@ -548,103 +550,166 @@ class StaleLockWarning(UserWarning):
     """A run's lock was left by a process that no longer exists and was taken over."""
 
 
-def _lock_text() -> str:
-    return f"{os.getpid()} {socket.gethostname()}\n"
+TAKEOVER_SUFFIX = ".takeover"
 
 
-def _holder_is_dead(text: str) -> bool:
-    """Whether a lock's holder is provably gone: same host, and its pid does not exist.
+def _new_lock_line() -> str:
+    """``<pid> <host> <token>``: the token tells two sessions with one pid apart."""
+    return f"{os.getpid()} {socket.gethostname()} {os.urandom(16).hex()}\n"
 
-    Anything unprovable - another host, an unparseable or old-format lock, a pid owned by
-    another user (``PermissionError``) - counts as alive, so the lock is never broken on a
-    guess.
+
+def _read_lock(path: Path) -> str:
+    """The lock file's text. Raises ``FileNotFoundError`` when there is none."""
+    return path.read_text(encoding="utf-8")
+
+
+def _holder_pid(text: str) -> str:
+    parts = text.split()
+    return parts[0] if parts else "unknown"
+
+
+def _why_not_stale(text: str) -> str | None:
+    """``None`` when a lock's holder is provably gone; otherwise why it must be kept.
+
+    Provably gone means: the lock is in the ``<pid> <host> <token>`` format, was taken on
+    this host, and its pid does not exist. Anything unprovable - another host, an
+    unparseable or older-format lock, a pid owned by another user (``PermissionError``) -
+    keeps the lock, so it is never broken on a guess.
     """
     parts = text.split()
-    if len(parts) != 2 or parts[1] != socket.gethostname() or not parts[0].isdigit():
-        return False
+    if len(parts) != 3 or not parts[0].isdigit():
+        return (
+            "the lock is not in the '<pid> <host> <token>' format (an older runner wrote it, "
+            "or it is damaged), so its holder cannot be checked"
+        )
+    if parts[1] != socket.gethostname():
+        return f"it was taken on another host ({parts[1]}), where its pid cannot be checked"
     pid = int(parts[0])
     if pid <= 0 or pid == os.getpid():
-        return False
+        return f"pid {pid} is still running (this process)"
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return True
+        return None
     except OSError:
-        return False
-    return False
+        return f"pid {pid} is still running (owned by another user)"
+    return f"pid {pid} is still running"
 
 
-def _take_over_stale_lock(path: Path, seen: str) -> Literal["taken", "gone", "live"]:
-    """Move a dead holder's lock aside.
+def _take_over_stale_lock(path: Path, seen: str, mine: str) -> bool:
+    """Replace the stale lock ``seen`` with ``mine``; ``False`` if the lock has vanished.
 
-    Returns ``"taken"`` when the lock moved aside was the ``seen`` one, ``"gone"`` when it had
-    already disappeared, and ``"live"`` when a live session had replaced it.
+    The canonical lock path is never absent during a takeover, and a takeover only ever
+    replaces the exact stale lock it observed:
 
-    The lock is renamed to a unique name first (atomic), then re-read: if a live session
-    replaced it in between, its lock is put back (``os.link`` never overwrites) and the
-    takeover is abandoned, so two takers can never both proceed.
+    1. take the short-lived mutex ``<lock>.takeover`` with ``O_CREAT | O_EXCL`` - a held
+       mutex means another session is recovering, and this one refuses;
+    2. while holding it, re-read the lock: proceed only if it is byte-identical to ``seen``
+       and its holder is still provably gone;
+    3. write ``mine`` to a unique temp file and ``os.replace`` it over the lock, which is
+       atomic, so a third session's ``O_EXCL`` create fails throughout;
+    4. release the mutex (only if it still holds this session's line).
+
+    Raises:
+        ResumeRefused: The mutex is held, the lock changed since it was observed, or its
+            holder is no longer provably gone. Refusing an uncertain recovery is preferable to
+            two sessions writing one run.
     """
-    aside = path.with_name(f"{path.name}.stale-{os.getpid()}-{os.urandom(2).hex()}")
+    mutex = path.with_name(path.name + TAKEOVER_SUFFIX)
     try:
-        os.rename(path, aside)
-    except FileNotFoundError:
-        return "gone"
+        fd = os.open(mutex, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        raise ResumeRefused(
+            f"{path.parent}: another session is recovering its stale lock ({mutex} exists); "
+            f"if no session is, delete {mutex} and resume again"
+        ) from None
     try:
-        if aside.read_text(encoding="utf-8") != seen:
-            with contextlib.suppress(FileExistsError):
-                os.link(aside, path)
-            return "live"
-        return "taken"
+        try:
+            os.write(fd, mine.encode())
+        finally:
+            os.close(fd)
+        try:
+            current = _read_lock(path)
+        except FileNotFoundError:
+            return False  # removed by hand meanwhile: an ordinary exclusive create will do
+        if current != seen:
+            raise ResumeRefused(
+                f"{path.parent}: the lock changed while recovering it (now pid "
+                f"{_holder_pid(current)}, {path}); another session holds the run"
+            )
+        reason = _why_not_stale(current)
+        if reason is not None:
+            raise ResumeRefused(f"{path.parent}: not taking over the lock {path}: {reason}")
+        write_atomic(path, mine)
+        return True
     finally:
-        aside.unlink(missing_ok=True)
+        _remove_if_owned(mutex, mine)
+
+
+def _remove_if_owned(path: Path, mine: str) -> None:
+    """Unlink ``path`` only if it holds exactly ``mine``: never another session's file."""
+    try:
+        if _read_lock(path) == mine:
+            path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 @contextmanager
 def _session_lock(run_dir: Path) -> Iterator[None]:
     """Hold ``run_dir/.lock`` for one session; refuse if a live session holds it.
 
-    ``O_CREAT | O_EXCL`` makes taking the lock atomic. The lock records ``<pid> <host>``. It is
-    released on every exit path, ``KeyboardInterrupt`` included; a lock left by a hard kill is
+    ``O_CREAT | O_EXCL`` makes taking a free lock atomic. The lock records
+    ``<pid> <host> <token>``, with a fresh random token per session. It is released on every
+    exit path, ``KeyboardInterrupt`` included - and only if it still holds this session's own
+    line, so a session never removes a lock it does not own. A lock left by a hard kill is
     taken over - with a ``StaleLockWarning`` - only when its holder is provably gone (same
-    host, pid not running). Otherwise the refusal names the pid.
+    host, pid not running), under the protocol in ``_take_over_stale_lock``. Otherwise the
+    refusal names the pid and the reason.
     """
     path = run_dir / LOCK_FILE
+    mine = _new_lock_line()
     for _ in range(3):
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            break
         except FileExistsError:
             try:
-                holder = path.read_text(encoding="utf-8")
+                holder = _read_lock(path)
             except FileNotFoundError:
                 continue  # released between our open and our read: try again
             except OSError:
                 holder = ""
-            outcome = _take_over_stale_lock(path, holder) if _holder_is_dead(holder) else "live"
-            if outcome == "gone":
+            reason = _why_not_stale(holder)
+            if reason is not None:
+                raise ResumeRefused(
+                    f"{run_dir} is locked by another session (pid {_holder_pid(holder)}, "
+                    f"{path}): {reason}; if that process is no longer running the lock is "
+                    "stale - delete the file and resume again"
+                ) from None
+            if not _take_over_stale_lock(path, holder, mine):
                 continue
-            if outcome == "taken":
-                warnings.warn(
-                    f"{path}: took over a stale lock left by pid {holder.split()[0]}, which "
-                    "is no longer running on this host",
-                    StaleLockWarning,
-                    stacklevel=3,
-                )
-                continue
-            pid = holder.split()[0] if holder.split() else "unknown"
-            raise ResumeRefused(
-                f"{run_dir} is locked by another session (pid {pid}, {path}); if that "
-                "process is no longer running the lock is stale - delete the file and "
-                "resume again"
-            ) from None
+            warnings.warn(
+                f"{path}: took over a stale lock left by pid {_holder_pid(holder)}, which "
+                "is no longer running on this host",
+                StaleLockWarning,
+                stacklevel=3,
+            )
+            break
+        try:
+            os.write(fd, mine.encode())
+        except BaseException:
+            # The file is ours but empty; an empty lock counts as live, so remove it now.
+            os.close(fd)
+            path.unlink(missing_ok=True)
+            raise
+        os.close(fd)
+        break
     else:
         raise ResumeRefused(f"{run_dir}: could not take the lock {path}; try again")
     try:
-        os.write(fd, _lock_text().encode())
-        os.close(fd)
         yield
     finally:
-        path.unlink(missing_ok=True)
+        _remove_if_owned(path, mine)
 
 
 def _check_saved_row(row: Row, case: Case, mode: str, cases_path: Path) -> None:

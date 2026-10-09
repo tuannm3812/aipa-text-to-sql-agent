@@ -1348,30 +1348,148 @@ def _dead_pid() -> int:
     return process.pid
 
 
+def _lock_line(pid: int, token: str, host: str | None = None) -> str:
+    return f"{pid} {host or socket.gethostname()} {token}\n"
+
+
+class _Contender:
+    """A third session that tries to take the lock while a takeover holds its mutex.
+
+    Installed as ``runner._read_lock``: the takeover re-reads the lock while holding
+    ``.lock.takeover``, and at that instant this tries a whole ``_session_lock`` of its own.
+    It records whether that was refused, and runs once.
+    """
+
+    def __init__(self, before_takeover: str | None = None) -> None:
+        self.real = runner._read_lock
+        self.before_takeover = before_takeover
+        self.outcomes: list[str] = []
+        self.busy = False
+
+    def __call__(self, path: Path) -> str:
+        if self.busy:
+            return self.real(path)
+        mutex = path.with_name(".lock.takeover")
+        if not mutex.exists() and self.before_takeover is not None:
+            # The session has observed the lock; now another session replaces it before the
+            # takeover starts. `os.replace` is how a takeover writes, so the path never empties.
+            observed = self.real(path)
+            path.with_name("swap").write_text(self.before_takeover, encoding="utf-8")
+            os.replace(path.with_name("swap"), path)
+            self.before_takeover = None
+            return observed
+        if mutex.exists() and not self.outcomes:
+            self.busy = True
+            try:
+                with runner._session_lock(path.parent):
+                    self.outcomes.append("acquired")
+            except ResumeRefused as exc:
+                self.outcomes.append(f"refused: {exc}")
+            finally:
+                self.busy = False
+        return self.real(path)
+
+
 def test_a_stale_lock_on_this_host_is_taken_over_with_a_warning(tmp_path: Path) -> None:
     cases, run_dir = _interrupted_llm_run(tmp_path)
     dead = _dead_pid()
-    (run_dir / ".lock").write_text(f"{dead} {socket.gethostname()}\n", encoding="utf-8")
+    (run_dir / ".lock").write_text(_lock_line(dead, "0" * 32), encoding="utf-8")
+    held: list[str] = []
+    real = runner.evaluate_case
+
+    def record_holder(case: Case, config: RunConfig) -> dict[str, str]:
+        held.append((run_dir / ".lock").read_text(encoding="utf-8"))
+        return real(case, config)
+
+    contender = _Contender()
     with (
         patch("text_to_sql_agent.pipeline.generate_sql", StubGenerator(cases)),
+        patch.object(runner, "_read_lock", contender),
+        patch.object(runner, "evaluate_case", side_effect=record_holder),
         pytest.warns(runner.StaleLockWarning, match=f"pid {dead}"),
     ):
         result = run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=run_dir)
     assert result.manifest.status == "complete"
+    # A third session arriving mid-recovery found the lock path occupied and was refused.
+    assert len(contender.outcomes) == 1 and contender.outcomes[0].startswith("refused")
+    # The session held a lock of its own - pid, host and a fresh token - throughout.
+    pid, host, token = held[0].split()
+    assert (int(pid), host) == (os.getpid(), socket.gethostname()) and token != "0" * 32
+    assert set(held) == {held[0]}
     assert sorted(p.name for p in run_dir.iterdir()) == ["cases.csv", "manifest.json", "report.md"]
 
 
-@pytest.mark.parametrize("holder", ["live", "other-host", "old-format"])
-def test_a_lock_that_is_not_provably_stale_still_refuses(tmp_path: Path, holder: str) -> None:
+def test_a_stale_lock_replaced_by_a_live_one_before_takeover_is_left_alone(
+    tmp_path: Path,
+) -> None:
+    # Codex's interleaving: the session observes a stale lock; before its takeover, another
+    # session replaces it with a live lock; a third session arrives during the recovery. Exactly
+    # one holder must remain - the live one - with its lock intact.
+    cases, run_dir = _interrupted_llm_run(tmp_path)
+    artifacts = {p.name: p.read_bytes() for p in run_dir.iterdir()}
+    lock = run_dir / ".lock"
+    lock.write_text(_lock_line(_dead_pid(), "0" * 32), encoding="utf-8")
+    live = _lock_line(os.getppid(), "1" * 32)
+    contender = _Contender(before_takeover=live)
+    with (
+        patch.object(runner, "_read_lock", contender),
+        pytest.raises(ResumeRefused, match="changed while"),
+    ):
+        run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=run_dir)
+    assert lock.read_text(encoding="utf-8") == live
+    assert len(contender.outcomes) == 1 and contender.outcomes[0].startswith("refused")
+    assert f"pid {os.getppid()}" in contender.outcomes[0]
+    assert {p.name: p.read_bytes() for p in run_dir.iterdir() if p != lock} == artifacts
+
+
+def test_a_held_takeover_mutex_refuses_recovery(tmp_path: Path) -> None:
+    cases, run_dir = _interrupted_llm_run(tmp_path)
+    stale = _lock_line(_dead_pid(), "0" * 32)
+    (run_dir / ".lock").write_text(stale, encoding="utf-8")
+    (run_dir / ".lock.takeover").write_text("someone else\n", encoding="utf-8")
+    with pytest.raises(ResumeRefused, match="another session is recovering"):
+        run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=run_dir)
+    assert (run_dir / ".lock").read_text(encoding="utf-8") == stale
+    assert (run_dir / ".lock.takeover").read_text(encoding="utf-8") == "someone else\n"
+
+
+def test_release_leaves_a_lock_whose_token_is_not_this_sessions(tmp_path: Path) -> None:
+    lock = tmp_path / ".lock"
+    other = _lock_line(os.getpid(), "f" * 32)  # same pid and host, a different session's token
+    with runner._session_lock(tmp_path):
+        ours = lock.read_text(encoding="utf-8")
+        assert ours.split()[:2] == [str(os.getpid()), socket.gethostname()]
+        lock.write_text(other, encoding="utf-8")
+    assert lock.read_text(encoding="utf-8") == other
+    lock.unlink()
+    with runner._session_lock(tmp_path):
+        pass
+    assert not lock.exists()  # its own lock it does remove
+
+
+@pytest.mark.parametrize(
+    "holder,reason",
+    [
+        ("live", "is still running"),
+        ("other-host", "another host"),
+        ("pre-token", "format"),
+        ("old-format", "format"),
+    ],
+)
+def test_a_lock_that_is_not_provably_stale_still_refuses(
+    tmp_path: Path, holder: str, reason: str
+) -> None:
     cases, run_dir = _interrupted_llm_run(tmp_path)
     text = {
-        "live": f"{os.getppid()} {socket.gethostname()}\n",
-        "other-host": f"{_dead_pid()} not-{socket.gethostname()}\n",
+        "live": _lock_line(os.getppid(), "1" * 32),
+        "other-host": _lock_line(_dead_pid(), "1" * 32, host=f"not-{socket.gethostname()}"),
+        "pre-token": f"{_dead_pid()} {socket.gethostname()}\n",
         "old-format": f"{_dead_pid()}\n",
     }[holder]
     (run_dir / ".lock").write_text(text, encoding="utf-8")
-    with pytest.raises(ResumeRefused, match="locked by another session"):
+    with pytest.raises(ResumeRefused, match="locked by another session") as caught:
         run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=run_dir)
+    assert reason in str(caught.value)
     assert (run_dir / ".lock").read_text(encoding="utf-8") == text
 
 
