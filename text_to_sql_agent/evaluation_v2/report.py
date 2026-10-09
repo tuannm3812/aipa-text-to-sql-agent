@@ -162,10 +162,14 @@ def _latency_and_tokens(rows: Sequence[Row]) -> list[str]:
     prompt = [int(r["prompt_tokens"]) for r in rows if r.get("prompt_tokens", "")]
     completion = [int(r["completion_tokens"]) for r in rows if r.get("completion_tokens", "")]
     if prompt or completion:
-        lines.append(
-            f"- Tokens: {sum(prompt)} prompt, {sum(completion)} completion "
-            f"(over the {max(len(prompt), len(completion))} cases that reported them)."
-        )
+        for label, values in (("prompt", prompt), ("completion", completion)):
+            if values:
+                lines.append(
+                    f"- Tokens, {label}: {sum(values)} total, {statistics.fmean(values):.1f} "
+                    f"mean over {len(values)} cases that reported them."
+                )
+            else:
+                lines.append(f"- Tokens, {label}: not reported (blank in `cases.csv`).")
     else:
         lines.append("- Tokens: not reported by this provider interface (blank in `cases.csv`).")
     return lines

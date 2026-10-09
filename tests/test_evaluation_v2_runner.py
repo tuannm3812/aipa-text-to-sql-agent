@@ -577,6 +577,64 @@ def test_llm_mode_scores_refusal_and_unanswerable_cases(tmp_path: Path) -> None:
     assert rows["weather"]["outcome"] == "correct"
 
 
+# --- token usage ---------------------------------------------------------------------------
+
+
+class UsageStub(StubGenerator):
+    """A ``StubGenerator`` whose every call also reports provider usage (when told to)."""
+
+    def __init__(self, cases: list[Case], usage: tuple[int, int] | None, **kw: Any) -> None:
+        super().__init__(cases, **kw)
+        self.usage = usage
+
+    def __call__(self, question: str, schema_text: str, **kw: Any) -> str:
+        from text_to_sql_agent.llm import _record_usage
+
+        if self.usage is not None:
+            _record_usage(*self.usage)
+        return super().__call__(question, schema_text, **kw)
+
+
+def test_the_csv_carries_the_summed_provider_usage(tmp_path: Path) -> None:
+    cases = load_suite(DEMO)
+    stub = UsageStub(cases, (100, 7))
+    with patch("text_to_sql_agent.pipeline.generate_sql", stub):
+        result = run_suite(cases, config=_llm(), out_root=tmp_path)
+    rows = _rows(result.run_dir)
+    assert {(r["prompt_tokens"], r["completion_tokens"]) for r in rows} == {("100", "7")}
+    report = (result.run_dir / "report.md").read_text(encoding="utf-8")
+    assert f"Tokens, prompt: {100 * len(cases)} total, 100.0 mean over {len(cases)} cases" in report
+    assert f"Tokens, completion: {7 * len(cases)} total, 7.0 mean" in report
+
+
+def test_a_provider_reporting_no_usage_leaves_the_cells_blank(tmp_path: Path) -> None:
+    cases = load_suite(DEMO)
+    with patch("text_to_sql_agent.pipeline.generate_sql", UsageStub(cases, None)):
+        result = run_suite(cases, config=_llm(), out_root=tmp_path)
+    assert {(r["prompt_tokens"], r["completion_tokens"]) for r in _rows(result.run_dir)} == {
+        ("", "")
+    }
+    assert "Tokens: not reported" in (result.run_dir / "report.md").read_text(encoding="utf-8")
+
+
+def test_usage_counted_before_an_outage_is_recorded(tmp_path: Path) -> None:
+    cases = load_suite(DEMO)
+    flaky = cases[0]
+    stub = UsageStub(cases, (9, 1), fail={flaky.question: RuntimeError("429 RESOURCE_EXHAUSTED")})
+    with patch("text_to_sql_agent.pipeline.generate_sql", stub):
+        result = run_suite(cases, config=_llm(max_retries=0), out_root=tmp_path)
+    row = {r["id"]: r for r in _rows(result.run_dir)}[flaky.id]
+    assert row["outcome"] == "outage"
+    assert (row["prompt_tokens"], row["completion_tokens"]) == ("9", "1")
+
+
+def test_gold_runs_leave_the_token_cells_blank(tmp_path: Path) -> None:
+    result = run_suite(load_suite(DEMO), config=_config(), out_root=tmp_path)
+    assert {(r["prompt_tokens"], r["completion_tokens"]) for r in _rows(result.run_dir)} == {
+        ("", "")
+    }
+
+
 # --- evidence and schema recall ------------------------------------------------------------
 
 

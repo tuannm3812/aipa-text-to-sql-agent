@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, cast
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_OLLAMA_MODEL, DEFAULT_PROVIDER
+from .control import trim_prose_after_control
 from .engines import Engine
 from .engines.sqlite import SQLiteEngine
 from .env import load_env
@@ -109,6 +114,83 @@ def _load_gemini_sdk() -> tuple[str, Any, Any | None]:
         return "google-generativeai", legacy_genai, None
 
 
+@dataclass
+class TokenUsage:
+    """Provider-reported token totals for the calls made inside one `usage_scope`.
+
+    A total stays `None` until a provider call reports that count, so "the provider said
+    nothing" is distinguishable from a genuine zero.
+    """
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+
+    def add(self, prompt: int | None, completion: int | None) -> None:
+        """Add one call's counts; a `None` count leaves its total as it was."""
+        if prompt is not None:
+            self.prompt_tokens = (self.prompt_tokens or 0) + prompt
+        if completion is not None:
+            self.completion_tokens = (self.completion_tokens or 0) + completion
+
+
+_USAGE: ContextVar[TokenUsage | None] = ContextVar("text_to_sql_agent_usage", default=None)
+
+
+@contextmanager
+def usage_scope() -> Iterator[TokenUsage]:
+    """Sum the token usage of every provider call made inside the block.
+
+    Backed by a `ContextVar`, so each thread (and each asyncio task) that enters its own
+    scope accumulates independently, and a new thread starts outside any scope. Nested
+    scopes: the inner scope counts its own calls separately, and on exit its totals are
+    added to the enclosing scope, so the outer total is the sum of everything beneath it.
+    Outside any scope, recording is a no-op.
+    """
+    usage = TokenUsage()
+    token = _USAGE.set(usage)
+    try:
+        yield usage
+    finally:
+        _USAGE.reset(token)
+        outer = _USAGE.get()
+        if outer is not None:
+            outer.add(usage.prompt_tokens, usage.completion_tokens)
+
+
+def _as_count(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _record_usage(prompt: Any, completion: Any) -> None:
+    usage = _USAGE.get()
+    if usage is not None:
+        usage.add(_as_count(prompt), _as_count(completion))
+
+
+def _record_gemini_usage(response: Any) -> None:
+    """Record `usage_metadata` from either Gemini SDK's response.
+
+    Both SDKs name the counts `prompt_token_count` and `candidates_token_count`. The
+    google-genai SDK reports reasoning separately as `thoughts_token_count`, which is
+    billed as output, so it is counted as completion.
+    """
+    meta = getattr(response, "usage_metadata", None)
+    if meta is None:
+        return
+    completion = _as_count(getattr(meta, "candidates_token_count", None))
+    thoughts = _as_count(getattr(meta, "thoughts_token_count", None))
+    if thoughts is not None:
+        completion = (completion or 0) + thoughts
+    _record_usage(getattr(meta, "prompt_token_count", None), completion)
+
+
+def _record_ollama_usage(response: Any) -> None:
+    """Record an `AIMessage.usage_metadata` (`input_tokens`, `output_tokens`)."""
+    meta = getattr(response, "usage_metadata", None)
+    if meta:
+        _record_usage(meta.get("input_tokens"), meta.get("output_tokens"))
+
+
 def _load_ollama_sdk() -> tuple[Any, Any, Any]:
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
@@ -136,7 +218,9 @@ def _extract_sql_from_text(raw_output: str) -> str:
 
     match = re.search(r"(?is)\b(SELECT|WITH)\b.*?;?$", raw_output)
     if match:
-        return raw_output[match.start() :].strip()
+        # Unfenced: a control statement the model followed with a sentence of prose is cut
+        # back to the statement, so the verdict is not lost to a parse failure downstream.
+        return trim_prose_after_control(raw_output[match.start() :].strip())
     return raw_output
 
 
@@ -180,6 +264,7 @@ def _call_provider(prompt: str, user_prompt: str, *, model_name: str, provider: 
                     contents=user_prompt,
                     generation_config={"temperature": 0.0, "max_output_tokens": 512},
                 )
+            _record_gemini_usage(response)
             return _extract_sql_from_text(str(response.text or ""))
 
         return key_manager.run(generate_with_key)
@@ -197,6 +282,7 @@ def _call_provider(prompt: str, user_prompt: str, *, model_name: str, provider: 
                 HumanMessage(content=user_prompt),
             ]
         )
+        _record_ollama_usage(response)
         return _extract_sql_from_text(str(response.content or ""))
 
     raise ValueError("Unsupported provider. Use 'gemini' or 'ollama'.")

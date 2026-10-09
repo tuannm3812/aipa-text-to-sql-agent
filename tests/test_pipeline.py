@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -592,6 +593,26 @@ def test_a_repair_that_returns_the_blocked_sentinel_is_reported_not_executed(
     assert sql == BLOCKED_SENTINEL_SQL
 
 
+def test_a_usage_scope_around_ask_database_with_sql_sums_generation_and_repair(
+    customers_db: str,
+) -> None:
+    from text_to_sql_agent.llm import _record_usage, usage_scope
+
+    answers = iter(["SELECT nope FROM customers", "SELECT 1"])
+
+    def fake_generate(*_a: object, **_k: object) -> str:
+        _record_usage(100, 10)
+        return next(answers)
+
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", side_effect=fake_generate),
+        usage_scope() as usage,
+    ):
+        sql, result = agent.ask_database_with_sql("list", db_path=customers_db)
+    assert (sql, result.error) == ("SELECT 1", None)
+    assert (usage.prompt_tokens, usage.completion_tokens) == (200, 20)
+
+
 @pytest.fixture
 def events_db(tmp_path: Path) -> str:
     """`events(id, status)` whose rows hold the control codes as ordinary data."""
@@ -714,3 +735,96 @@ def test_near_misses_are_not_sentinels_and_go_to_the_validator(
         assert (result.error, result.rows) == (expected, [])
     else:
         assert result.error != "UNANSWERABLE_WITH_GIVEN_SCHEMA"
+
+
+# --- a control statement followed by prose (extractor) -------------------------------------
+
+
+def _model_says(raw: str) -> object:
+    """Patch the Ollama SDK so the real extractor sees `raw` as the model's whole reply."""
+
+    class _FakeChat:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def invoke(self, _messages: object) -> SimpleNamespace:
+            return SimpleNamespace(content=raw, usage_metadata=None)
+
+    return patch(
+        "text_to_sql_agent.llm._load_ollama_sdk",
+        return_value=(_FakeChat, lambda content: content, lambda content: content),
+    )
+
+
+@pytest.mark.parametrize(
+    ("sentinel_sql", "code"),
+    [
+        (BLOCKED_SENTINEL_SQL, "BLOCKED_UNSAFE_SQL"),
+        (UNANSWERABLE_SENTINEL_SQL, "UNANSWERABLE_WITH_GIVEN_SCHEMA"),
+    ],
+)
+@pytest.mark.parametrize(
+    "prose",
+    [
+        " This request changes data, so I refused it.",
+        "\n\nNote: the schema has no such table.",
+        " I can't answer that.",
+    ],
+)
+def test_a_control_statement_followed_by_prose_keeps_its_code(
+    customers_db: str, sentinel_sql: str, code: str, prose: str
+) -> None:
+    with (
+        _model_says(sentinel_sql + prose),
+        patch("text_to_sql_agent.pipeline.execute_query") as execute,
+    ):
+        sql, result = agent.ask_database_with_sql(
+            "q", db_path=customers_db, provider="ollama", max_repair_attempts=0
+        )
+    assert sql == sentinel_sql
+    assert (result.error, result.rows) == (code, [])
+    execute.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "stacked",
+    [
+        "DROP TABLE customers",
+        "DROP TABLE",
+        "SELECT name FROM customers",
+        "-- x\nDELETE",
+        # sqlglot parses each of these as a bare column; the explicit word list catches them.
+        "REINDEX",
+        "/* x */ reindex customers",
+        "INSTALL httpfs",
+        "VACUUM",
+        "ANALYZE",
+    ],
+)
+def test_a_control_statement_followed_by_a_statement_still_reaches_the_validator(
+    customers_db: str, stacked: str
+) -> None:
+    from text_to_sql_agent.llm import _extract_sql_from_text
+
+    raw = f"{BLOCKED_SENTINEL_SQL} {stacked}"
+    assert _extract_sql_from_text(raw) == raw
+    with _model_says(raw), patch("text_to_sql_agent.pipeline.execute_query") as execute:
+        sql, result = agent.ask_database_with_sql(
+            "q", db_path=customers_db, provider="ollama", max_repair_attempts=0
+        )
+    assert sql == raw
+    assert result.error == "BLOCKED_UNSAFE_SQL" and result.rows == []
+    execute.assert_not_called()
+
+
+def test_extraction_is_unchanged_for_fenced_prose_before_and_ordinary_queries() -> None:
+    from text_to_sql_agent.llm import _extract_sql_from_text as extract
+
+    fenced = f"```sql\n{BLOCKED_SENTINEL_SQL} trailing words\n```"
+    assert extract(fenced) == f"{BLOCKED_SENTINEL_SQL} trailing words"
+    assert extract(f"Sure, here you go.\n{BLOCKED_SENTINEL_SQL}") == BLOCKED_SENTINEL_SQL
+    assert extract(f"Sure.\n{BLOCKED_SENTINEL_SQL}\n\nNote: unsafe.") == BLOCKED_SENTINEL_SQL
+    ordinary = "SELECT name FROM customers; This lists every customer."
+    assert extract(ordinary) == ordinary
+    assert extract("SELECT 1 FROM t;") == "SELECT 1 FROM t;"
+    assert extract("SELECT 'a;b' AS x; Done.") == "SELECT 'a;b' AS x; Done."
