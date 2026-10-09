@@ -567,7 +567,7 @@ def test_llm_mode_scores_refusal_and_unanswerable_cases(tmp_path: Path) -> None:
     cases = load_suite(suite)
     stub = StubGenerator(cases)
     stub.answers[cases[0].question] = "DROP TABLE students"
-    stub.answers[cases[1].question] = "UNANSWERABLE_WITH_GIVEN_SCHEMA"
+    stub.answers[cases[1].question] = "SELECT 'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error;"
     out = tmp_path / "out"
     with patch("text_to_sql_agent.pipeline.generate_sql", stub):
         run_suite(cases, config=_llm(suite="safety_mini", suite_path=suite), out_root=out)
@@ -1344,7 +1344,7 @@ def test_a_model_answering_only_the_sentinel_is_citable(tmp_path: Path) -> None:
     cases = load_suite(suite)
     stub = StubGenerator(cases)
     for case in cases:
-        stub.answers[case.question] = "UNANSWERABLE_WITH_GIVEN_SCHEMA"
+        stub.answers[case.question] = "SELECT 'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error;"
     result, manifest = _clean_llm_run(tmp_path, cases, stub, _llm(suite="unans", suite_path=suite))
     assert [row["outcome"] for row in result.rows] == ["correct"] * 3
     assert (manifest["generation_failures"], manifest["citable"]) == (0, True)

@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 import text_to_sql_agent as agent
-from text_to_sql_agent.engines import EngineUnreachableError
+from text_to_sql_agent.engines import EngineUnreachableError, open_engine
 
 
 def test_ask_database_uses_retrieved_schema_by_default(customers_courses_db: str) -> None:
@@ -590,3 +590,127 @@ def test_a_repair_that_returns_the_blocked_sentinel_is_reported_not_executed(
             BLOCKED_SENTINEL_SQL,
         )
     assert sql == BLOCKED_SENTINEL_SQL
+
+
+@pytest.fixture
+def events_db(tmp_path: Path) -> str:
+    """`events(id, status)` whose rows hold the control codes as ordinary data."""
+    db_path = tmp_path / "events.db"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, status TEXT)")
+        conn.executemany(
+            "INSERT INTO events VALUES (?, ?)",
+            [(1, "BLOCKED_UNSAFE_SQL"), (2, "ok"), (3, "UNANSWERABLE_WITH_GIVEN_SCHEMA")],
+        )
+        conn.commit()
+    return str(db_path)
+
+
+# Ordinary reads that merely contain a control code: they must run and return rows.
+READS_CONTAINING_A_CODE = [
+    ("SELECT id FROM events /* BLOCKED_UNSAFE_SQL */", [(1,), (2,), (3,)]),
+    ("SELECT id FROM events WHERE status = 'BLOCKED_UNSAFE_SQL'", [(1,)]),
+    ("SELECT id FROM events WHERE status <> 'UNANSWERABLE_WITH_GIVEN_SCHEMA'", [(1,), (2,)]),
+]
+
+
+@pytest.mark.parametrize(("read_sql", "rows"), READS_CONTAINING_A_CODE)
+def test_ask_database_runs_a_read_that_merely_contains_a_code(
+    events_db: str, read_sql: str, rows: list[tuple[int]]
+) -> None:
+    with patch("text_to_sql_agent.pipeline.generate_sql", return_value=read_sql):
+        result = agent.ask_database("ids", db_path=events_db)
+
+    assert result.error is None
+    assert [tuple(r) for r in result.rows] == rows
+
+
+@pytest.mark.parametrize(("read_sql", "rows"), READS_CONTAINING_A_CODE)
+def test_ask_database_with_sql_runs_a_read_that_merely_contains_a_code(
+    events_db: str, read_sql: str, rows: list[tuple[int]]
+) -> None:
+    with patch("text_to_sql_agent.pipeline.generate_sql", return_value=read_sql):
+        sql, result = agent.ask_database_with_sql("ids", db_path=events_db)
+
+    assert sql == read_sql
+    assert result.error is None
+    assert [tuple(r) for r in result.rows] == rows
+
+
+@pytest.mark.parametrize(("read_sql", "rows"), READS_CONTAINING_A_CODE)
+@pytest.mark.parametrize("entry", ["ask_database", "ask_database_with_sql"])
+def test_a_repair_that_merely_contains_a_code_is_executed(
+    events_db: str, entry: str, read_sql: str, rows: list[tuple[int]]
+) -> None:
+    answers = iter(["SELECT nope FROM events", read_sql])
+    with patch(
+        "text_to_sql_agent.pipeline.generate_sql", side_effect=lambda *_a, **_k: next(answers)
+    ):
+        out = getattr(agent, entry)("ids", db_path=events_db)
+
+    result = out if entry == "ask_database" else out[1]
+    assert result.error is None
+    assert [tuple(r) for r in result.rows] == rows
+
+
+CONTROL_VARIANTS = [
+    (BLOCKED_SENTINEL_SQL, "BLOCKED_UNSAFE_SQL"),
+    (UNANSWERABLE_SENTINEL_SQL, "UNANSWERABLE_WITH_GIVEN_SCHEMA"),
+    ("select 'BLOCKED_UNSAFE_SQL' as error;", "BLOCKED_UNSAFE_SQL"),
+    ("SELECT 'BLOCKED_UNSAFE_SQL';", "BLOCKED_UNSAFE_SQL"),
+    ("SELECT 'BLOCKED_UNSAFE_SQL' AS \"error\";", "BLOCKED_UNSAFE_SQL"),
+    ("SELECT 'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error", "UNANSWERABLE_WITH_GIVEN_SCHEMA"),
+    ("  \n SELECT   'BLOCKED_UNSAFE_SQL'\n  AS   error \n ;\n\n", "BLOCKED_UNSAFE_SQL"),
+    ("select\n'UNANSWERABLE_WITH_GIVEN_SCHEMA'\nas \"error\"\n", "UNANSWERABLE_WITH_GIVEN_SCHEMA"),
+]
+
+
+@pytest.mark.parametrize(("sentinel_sql", "code"), CONTROL_VARIANTS)
+def test_control_statement_variants_are_recognised_and_never_executed(
+    customers_db: str, sentinel_sql: str, code: str
+) -> None:
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", return_value=sentinel_sql),
+        patch("text_to_sql_agent.pipeline.execute_query") as spy,
+    ):
+        result = agent.ask_database("x", db_path=customers_db)
+        _, with_sql = agent.ask_database_with_sql("x", db_path=customers_db)
+
+    spy.assert_not_called()
+    for r in (result, with_sql):
+        assert (r.error, r.columns, r.rows) == (code, [], [])
+
+
+NEAR_MISSES = [
+    "SELECT 'BLOCKED_UNSAFE_SQL' AS error FROM customers",
+    "SELECT 'BLOCKED_UNSAFE_SQL', 1",
+    "SELECT 'BLOCKED_UNSAFE_SQL' AS error UNION SELECT 'x'",
+    "SELECT 'BLOCKED_UNSAFE_SQL' AS error; SELECT 'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error",
+    "SELECT 'BLOCKED_UNSAFE_SQL' AS error WHERE 1 = 1",
+    "SELECT DISTINCT 'BLOCKED_UNSAFE_SQL' AS error",
+    "WITH c AS (SELECT 1) SELECT 'BLOCKED_UNSAFE_SQL' AS error",
+    "SELECT 'BLOCKED_UNSAFE_SQL' || 'x' AS error",
+    "SELECT 'not a code' AS error",
+    "SELECT 'BLOCKED_UNSAFE_SQL' AS error; DROP TABLE customers",
+]
+
+
+@pytest.mark.parametrize("near_miss", NEAR_MISSES)
+def test_near_misses_are_not_sentinels_and_go_to_the_validator(
+    customers_db: str, near_miss: str
+) -> None:
+    from text_to_sql_agent.pipeline import _sentinel_code
+    from text_to_sql_agent.safety import query_refusal
+
+    engine = open_engine(customers_db)
+    assert _sentinel_code(near_miss, engine=engine) is None
+
+    with patch("text_to_sql_agent.pipeline.generate_sql", return_value=near_miss):
+        result = agent.ask_database("x", db_path=customers_db)
+
+    # Whatever the validator decides is the verdict; the pipeline adds nothing of its own.
+    expected = query_refusal(near_miss, engine=engine)
+    if expected is not None:
+        assert (result.error, result.rows) == (expected, [])
+    else:
+        assert result.error != "UNANSWERABLE_WITH_GIVEN_SCHEMA"

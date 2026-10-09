@@ -3604,3 +3604,20 @@ rerun; its previous counts are historical verification, not a fresh claim.
 The focused probe used `UV_CACHE_DIR=/private/tmp/aipa-review-uv`, temporary
 files only, and no provider or network call. No application fix, commit, push
 or message to another agent was made.
+
+## 2026-10-10 — Claude: sentinel detection made structural (Codex P2)
+
+`pipeline._sentinel_code` now takes the engine and recognises a control statement
+only when it parses, in the engine's dialect, to one `SELECT` whose sole clause is a
+single string-literal projection (optionally aliased) equal to one of the two codes.
+Comments, filter literals and any other shape fall through to `query_refusal`. The
+same helper guards initial generation and both repair paths.
+
+Verified: the five committed `2026-10-09T*` runs, reclassified from their
+`generated_sql` values with the old substring rule and the new one, differ in zero
+cases, so the published numbers stand. Two `test_evaluation_v2_runner.py` stubs
+returned the bare code `UNANSWERABLE_WITH_GIVEN_SCHEMA` rather than the statement the
+prompt asks for; they now return the statement. Known edge, left to the cleaner: an
+unfenced control statement followed by prose is not a sentinel (the validator then
+refuses it as `BLOCKED_UNSAFE_SQL`, so nothing runs, but an UNANSWERABLE answer
+would carry the blocked code). Suite: 1178 passed, 350 skipped.
