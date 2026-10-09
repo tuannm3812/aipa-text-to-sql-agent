@@ -28,6 +28,20 @@ except ModuleNotFoundError:  # pragma: no cover
 
 _DEFAULT_DIALECT = "sqlite"
 
+# Statement words that sqlglot parses as a bare column (so `_looks_like_sql` would call
+# them prose) in at least one of our dialects. Checked first, so a stacked statement that
+# opens with one of them always reaches the validator. Prose that happens to open with one
+# ("Install the ...") stays refused, the safe direction.
+_EXTRA_STATEMENT_WORDS = frozenset(
+    {
+        "ABORT", "ANALYZE", "ATTACH", "CHECKPOINT", "DETACH", "END", "EXPORT", "FORCE",
+        "IMPORT", "INSTALL", "LOAD", "PRAGMA", "REINDEX", "RELEASE", "ROLLBACK",
+        "SAVEPOINT", "UNINSTALL", "VACUUM",
+    }
+)  # fmt: skip
+_LEADING_COMMENTS = re.compile(r"\A(?:\s+|--[^\n]*(?:\n|\Z)|/\*.*?\*/)*", re.DOTALL)
+_FIRST_WORD = re.compile(r"[A-Za-z_]+")
+
 
 def control_statement_code(sql: str, *, dialect: str) -> str | None:
     """The error code if `sql` is exactly one of the model's control statements, else `None`.
@@ -78,6 +92,9 @@ def _looks_like_sql(text: str, *, dialect: str) -> bool:
     as the start of a statement or command.
     """
     if sqlglot is None or exp is None:
+        return True
+    word = _FIRST_WORD.match(text, _LEADING_COMMENTS.match(text).end())  # type: ignore[union-attr]
+    if word and word.group(0).upper() in _EXTRA_STATEMENT_WORDS:
         return True
     try:
         with _quiet_sqlglot():

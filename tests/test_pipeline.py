@@ -787,7 +787,19 @@ def test_a_control_statement_followed_by_prose_keeps_its_code(
 
 
 @pytest.mark.parametrize(
-    "stacked", ["DROP TABLE customers", "DROP TABLE", "SELECT name FROM customers", "-- x\nDELETE"]
+    "stacked",
+    [
+        "DROP TABLE customers",
+        "DROP TABLE",
+        "SELECT name FROM customers",
+        "-- x\nDELETE",
+        # sqlglot parses each of these as a bare column; the explicit word list catches them.
+        "REINDEX",
+        "/* x */ reindex customers",
+        "INSTALL httpfs",
+        "VACUUM",
+        "ANALYZE",
+    ],
 )
 def test_a_control_statement_followed_by_a_statement_still_reaches_the_validator(
     customers_db: str, stacked: str
