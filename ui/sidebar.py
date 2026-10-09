@@ -180,8 +180,8 @@ def render_sidebar() -> Settings:
                 ["Gold SQL baseline", "Selected LLM"],
                 key="sb_eval_mode",
                 help=(
-                    "Gold SQL validates the benchmark. Selected LLM compares model "
-                    "output with gold query results."
+                    "Gold SQL validates the demo suite. Selected LLM scores model "
+                    "output against the gold query results with evaluation v2."
                 ),
             )
             if st.button("Run benchmark", use_container_width=True):
