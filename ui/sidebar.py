@@ -188,15 +188,18 @@ def render_sidebar() -> Settings:
                 if eval_mode == "Selected LLM" and not key_ok:
                     st.error("Add an API key or choose Ollama before running LLM evaluation.")
                 else:
-                    with st.spinner("Evaluating demo databases..."):
-                        st.session_state["evaluation_df"] = evaluate_cases(
-                            mode=eval_mode,
-                            provider=provider,
-                            model_name=model_name,
-                            use_rag=use_rag,
-                            rag_top_k=rag_top_k,
-                        )
-                        st.session_state["evaluation_mode"] = eval_mode
+                    try:
+                        with st.spinner("Evaluating demo databases..."):
+                            st.session_state["evaluation_df"] = evaluate_cases(
+                                mode=eval_mode,
+                                provider=provider,
+                                model_name=model_name,
+                                use_rag=use_rag,
+                                rag_top_k=rag_top_k,
+                            )
+                            st.session_state["evaluation_mode"] = eval_mode
+                    except Exception as e:
+                        st.error(f"Evaluation failed: {redact_dsn(str(e))}")
 
         st.divider()
         if st.button("Clear conversation", use_container_width=True):

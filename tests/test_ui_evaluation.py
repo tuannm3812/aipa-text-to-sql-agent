@@ -8,6 +8,7 @@ puts on the page is safe (a DSN password never reaches the table). Nothing here 
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 from typing import Any
@@ -158,18 +159,84 @@ def test_a_patched_live_run_has_the_same_outcome_per_case_as_run_suite(tmp_path:
             assert tab_row[column] == row[column], (row["id"], column)
 
 
+_FORBIDDEN_NAMES = {"score_v2", "score_case", "rows_equal_v2", "rows_match", "execute_query"}
+_OUTCOMES = {
+    "correct",
+    "wrong",
+    "refused",
+    "outage",
+    "error",
+    "reference_invalid",
+    "not_applicable",
+}
+
+
 def test_the_tab_classifies_only_through_the_runner() -> None:
-    """The tab must not score, compare rows or execute SQL itself (spec section 4.6)."""
-    source = Path("ui/evaluation.py").read_text(encoding="utf-8")
-    assert "runner.evaluate_case(" in source
-    for forbidden in (
-        "score_v2(",
-        "score_case(",
-        "rows_equal_v2(",
-        "rows_match(",
-        "execute_query(",
-    ):
-        assert forbidden not in source, forbidden
+    """The tab must not score, compare rows or execute SQL itself (spec section 4.6).
+
+    Checked on the parsed module, so comments and docstrings neither satisfy nor break it,
+    and an aliased import (`import x as y`) is caught by the imported name.
+    """
+    path = Path(__file__).resolve().parents[1] / "ui" / "evaluation.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    calls_runner = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "evaluate_case"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "runner"
+            ):
+                calls_runner = True
+            called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            assert called not in _FORBIDDEN_NAMES, called
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            for alias in node.names:
+                assert alias.name.split(".")[-1] not in _FORBIDDEN_NAMES, alias.name
+        if isinstance(node, ast.Attribute | ast.Name):
+            name = node.attr if isinstance(node, ast.Attribute) else node.id
+            assert name not in _FORBIDDEN_NAMES, name
+        if isinstance(node, ast.Compare):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    assert sub.value not in _OUTCOMES, sub.value
+                    assert not sub.value.startswith(("BLOCKED_", "QUERY_ABORTED_")), sub.value
+    assert calls_runner, "ui/evaluation.py must call runner.evaluate_case"
+
+
+def test_a_live_run_with_outages_says_they_are_excluded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def down(question: str, schema_text: str, **_: Any) -> str:
+        raise RuntimeError("429 quota exceeded")
+
+    with patch("text_to_sql_agent.pipeline.generate_sql", side_effect=down):
+        df = _live("Selected LLM")
+    assert (df["outcome"] == "outage").all()
+    monkeypatch.setattr(evaluation, "RESULTS_ROOT", tmp_path)
+    at = _app()
+    at.session_state["evaluation_df"] = df
+    at.session_state["evaluation_mode"] = "Selected LLM"
+    at.run()
+    assert not at.exception
+    assert any("12 case(s) hit a provider outage and are excluded" in c.value for c in at.caption)
+
+
+def test_a_broken_suite_shows_an_error_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    broken = tmp_path / "broken.jsonl"
+    broken.write_text("{not json\n", encoding="utf-8")
+    monkeypatch.setattr(evaluation, "RESULTS_ROOT", tmp_path)
+    monkeypatch.setattr(evaluation, "DEMO_SUITE", broken)
+    at = _app().run()
+    at.selectbox(key="sb_eval_mode").select("Gold SQL baseline")
+    next(b for b in at.button if b.label == "Run benchmark").click()
+    at.run()
+    assert not at.exception
+    assert any("Evaluation failed" in e.value for e in at.error)
 
 
 def test_the_live_run_writes_nothing_under_the_results_directory() -> None:

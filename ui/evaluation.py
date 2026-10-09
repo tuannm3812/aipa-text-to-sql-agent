@@ -164,6 +164,12 @@ def render_evaluation() -> None:
         with st.expander(f"Evaluation summary - {mode}", expanded=True):
             cells = metric_cells(_summary_rows(eval_df), gold=mode == GOLD_MODE)
             titles = dict(COLUMNS)
+            outages = int((eval_df["outcome"] == runner.OUTAGE).sum())
+            if outages:
+                st.caption(
+                    f"{outages} case(s) hit a provider outage and are excluded from the "
+                    "metrics; the run would be incomplete in the CLI."
+                )
             for key in ("ex", "safety", "false_refusal", "recall"):
                 st.metric(titles[key], cells[key])
             latencies = pd.to_numeric(eval_df["latency_ms"], errors="coerce").dropna()
