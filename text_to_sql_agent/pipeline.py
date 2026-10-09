@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .config import DEFAULT_MODEL_NAME, DEFAULT_RAG_TOP_K
+from .config import DEFAULT_MAX_ROWS, DEFAULT_MODEL_NAME, DEFAULT_RAG_TOP_K
 from .engines import Engine, open_engine
 from .execution import execute_query
 from .ingestion import ingest_csvs_to_db
@@ -24,6 +24,8 @@ def ask_database(
     use_rag: bool = True,
     rag_top_k: int = DEFAULT_RAG_TOP_K,
     max_repair_attempts: int = 1,
+    work_limit: int | None = None,
+    max_rows: int | None = None,
 ) -> QueryResult:
     """End-to-end Text-to-SQL wrapper: schema retrieval, generation, safety, execution.
 
@@ -41,6 +43,14 @@ def ask_database(
         rag_top_k: Number of schema chunks to retrieve when `use_rag` is set.
         max_repair_attempts: Number of times to ask the model to repair SQL
             that failed execution. `0` disables repair.
+        work_limit: The execution budget, in the engine's own unit (SQLite VM
+            steps; DuckDB/PostgreSQL milliseconds), passed to `execute_query`
+            as `max_vm_steps`. `None` (the default) is the engine's
+            `default_work_limit`, as the app has always run; the evaluation
+            runner sets it per run so a demo guard cannot decide a
+            benchmark's outcome.
+        max_rows: Row cap passed to `execute_query`; `None` is
+            `DEFAULT_MAX_ROWS`.
 
     Returns:
         A `QueryResult`. `error` is set to `UNANSWERABLE_WITH_GIVEN_SCHEMA` if
@@ -75,7 +85,7 @@ def ask_database(
         if refusal is not None:
             return QueryResult(columns=[], rows=[], sql=sql, error=refusal)
         try:
-            return execute_query(db_path, sql)
+            return _execute(db_path, sql, work_limit=work_limit, max_rows=max_rows)
         except Exception as e:
             repaired_sql = _repair_sql(
                 question,
@@ -95,7 +105,7 @@ def ask_database(
             repair_refusal = query_refusal(repaired_sql, engine=engine)
             if repair_refusal is not None:
                 return QueryResult(columns=[], rows=[], sql=repaired_sql, error=repair_refusal)
-            return execute_query(db_path, repaired_sql)
+            return _execute(db_path, repaired_sql, work_limit=work_limit, max_rows=max_rows)
     except Exception as e:
         return QueryResult(columns=[], rows=[], error=f"{type(e).__name__}: {e}")
 
@@ -109,6 +119,8 @@ def ask_database_with_sql(
     use_rag: bool = True,
     rag_top_k: int = DEFAULT_RAG_TOP_K,
     max_repair_attempts: int = 1,
+    work_limit: int | None = None,
+    max_rows: int | None = None,
 ) -> tuple[str, QueryResult]:
     """Same as `ask_database`, but also returns the generated SQL for UI display.
 
@@ -122,6 +134,8 @@ def ask_database_with_sql(
         rag_top_k: Number of schema chunks to retrieve when `use_rag` is set.
         max_repair_attempts: Number of times to ask the model to repair SQL
             that failed execution. `0` disables repair.
+        work_limit: See `ask_database`.
+        max_rows: See `ask_database`.
 
     Returns:
         A `(sql, QueryResult)` tuple. `sql` is `""` if generation itself
@@ -163,7 +177,7 @@ def ask_database_with_sql(
         return sql, QueryResult(columns=[], rows=[], sql=sql, error=refusal)
 
     try:
-        result = execute_query(db_path, sql)
+        result = _execute(db_path, sql, work_limit=work_limit, max_rows=max_rows)
         return result.sql or sql, result
     except Exception as e:
         error_text = f"{type(e).__name__}: {e}"
@@ -186,7 +200,9 @@ def ask_database_with_sql(
                     columns=[], rows=[], sql=repaired_sql, error=repair_refusal
                 )
             try:
-                repaired_result = execute_query(db_path, repaired_sql)
+                repaired_result = _execute(
+                    db_path, repaired_sql, work_limit=work_limit, max_rows=max_rows
+                )
                 return repaired_result.sql or repaired_sql, repaired_result
             except Exception as repaired_error:
                 error_text = f"{type(repaired_error).__name__}: {repaired_error}"
@@ -258,6 +274,22 @@ def ask_from_files(
         )
 
     raise ValueError(f"Unsupported or mixed file types: {sorted(exts)}")
+
+
+def _execute(
+    db_path: str, sql: str, *, work_limit: int | None, max_rows: int | None
+) -> QueryResult:
+    """`execute_query` with `None` meaning the default for each budget.
+
+    `max_vm_steps=None` is already the engine's own default; `max_rows=None` maps to
+    `DEFAULT_MAX_ROWS`, so a caller passing neither runs exactly as before.
+    """
+    return execute_query(
+        db_path,
+        sql,
+        max_rows=DEFAULT_MAX_ROWS if max_rows is None else max_rows,
+        max_vm_steps=work_limit,
+    )
 
 
 def _repair_sql(

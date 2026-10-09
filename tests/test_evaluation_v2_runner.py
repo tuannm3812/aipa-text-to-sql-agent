@@ -773,6 +773,180 @@ def test_cli_rejects_resume_with_more_than_one_suite(tmp_path: Path) -> None:
         cli.main(["--suite", "demo", "safety", "--resume", str(tmp_path)])
 
 
+# --- execution budget ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def runaway_db(tmp_path: Path) -> str:
+    """A pair-join over 60,000 rows: well past SQLite's 100,000-VM-step demo guard."""
+    db_path = tmp_path / "big.db"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("CREATE TABLE n (i INTEGER)")
+        conn.executemany("INSERT INTO n VALUES (?)", [(i,) for i in range(60_000)])
+        conn.commit()
+    return str(db_path)
+
+
+RUNAWAY_SQL = "SELECT COUNT(*) FROM n a JOIN n b ON a.i = b.i"
+
+
+def test_run_gold_passes_the_budget_to_execute_query(customers_db: str) -> None:
+    from text_to_sql_agent import evaluation
+    from text_to_sql_agent.execution import execute_query as real_execute
+
+    case = {"gold_sql": "SELECT name FROM customers", "db_path": customers_db}
+    with patch.object(evaluation, "execute_query", side_effect=real_execute) as spy:
+        evaluation.run_gold(case, work_limit=42_000, max_rows=3)
+        evaluation.run_gold(case)
+    explicit, default = spy.call_args_list
+    assert explicit.kwargs == {"max_rows": 3, "max_vm_steps": 42_000}
+    assert default.kwargs == {"max_rows": 1_000, "max_vm_steps": None}
+
+
+def test_run_gold_defaults_keep_the_demo_guard(runaway_db: str) -> None:
+    from text_to_sql_agent import evaluation
+
+    case = {"gold_sql": RUNAWAY_SQL, "db_path": runaway_db}
+    _, guarded = evaluation.run_gold(case)
+    _, unguarded = evaluation.run_gold(case, work_limit=0)
+    assert guarded.error == "QUERY_ABORTED_AFTER_100000_VM_STEPS"
+    assert unguarded.ok and unguarded.rows == [(60_000,)]
+
+
+def _runaway_suite(tmp_path: Path, runaway_db: str) -> Path:
+    return _write_suite(
+        tmp_path,
+        "heavy",
+        [_record("heavy", "pairs", runaway_db, question="count pairs", gold_sql=RUNAWAY_SQL)],
+        AUTHORED,
+    )
+
+
+def test_the_run_budget_decides_reference_validity_and_is_recorded(
+    tmp_path: Path, runaway_db: str
+) -> None:
+    suite = _runaway_suite(tmp_path, runaway_db)
+    default_out, wide_out = tmp_path / "default", tmp_path / "wide"
+    run_suite(
+        load_suite(suite), config=_config(suite="heavy", suite_path=suite), out_root=default_out
+    )
+    run_suite(
+        load_suite(suite),
+        config=_config(suite="heavy", suite_path=suite, work_limit=50_000_000, max_rows=5),
+        out_root=wide_out,
+    )
+    default_dir, wide_dir = _only_dir(default_out), _only_dir(wide_out)
+    assert _rows(default_dir)[0]["outcome"] == "reference_invalid"
+    assert _rows(default_dir)[0]["error"] == "QUERY_ABORTED_AFTER_100000_VM_STEPS"
+    assert _rows(wide_dir)[0]["outcome"] == "correct"
+
+    default_manifest, wide_manifest = _manifest(default_dir), _manifest(wide_dir)
+    assert (default_manifest["work_limit"], default_manifest["max_rows"]) == (100_000, 1_000)
+    assert (wide_manifest["work_limit"], wide_manifest["max_rows"]) == (50_000_000, 5)
+
+
+def test_two_runs_differing_only_in_work_limit_have_different_identities(
+    tmp_path: Path,
+) -> None:
+    cases = load_suite(DEMO)[:1]
+    first = run_suite(cases, config=_config(work_limit=200_000), out_root=tmp_path).run_dir
+    second = run_suite(cases, config=_config(work_limit=300_000), out_root=tmp_path).run_dir
+    one, two = _manifest(first), _manifest(second)
+    assert one["identity_sha256"] != two["identity_sha256"]
+    assert first.name.split("_")[-2] != second.name.split("_")[-2]  # <identity8>
+    differing = {k for k in one if one[k] != two[k]}
+    assert {"work_limit", "identity_sha256"} <= differing
+    assert differing <= {
+        "work_limit",
+        "identity_sha256",
+        "run_id",
+        "started",
+        "duration_s",
+        "manifest_sha256",
+    }
+
+
+def test_the_llm_path_runs_the_model_under_the_resolved_budget(tmp_path: Path) -> None:
+    cases = load_suite(DEMO)[:1]
+    seen: list[dict[str, Any]] = []
+    real = runner.ask_database_with_sql
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return real(*args, **kwargs)
+
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", StubGenerator(cases)),
+        patch.object(runner, "ask_database_with_sql", side_effect=spy),
+    ):
+        run_suite(cases, config=_llm(), out_root=tmp_path / "a")
+        run_suite(cases, config=_llm(work_limit=0, max_rows=9), out_root=tmp_path / "b")
+    # Defaults are resolved to the engine's values before the loop, never left as None.
+    assert (seen[0]["work_limit"], seen[0]["max_rows"]) == (100_000, 1_000)
+    assert (seen[1]["work_limit"], seen[1]["max_rows"]) == (0, 9)
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"work_limit": -1}, "work_limit"),
+        ({"work_limit": 2**31}, "2,147,483,647"),
+        ({"max_rows": 0}, "max_rows"),
+    ],
+)
+def test_an_unusable_budget_is_refused_before_anything_is_written(
+    tmp_path: Path, overrides: dict[str, int], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        run_suite(load_suite(DEMO), config=_config(**overrides), out_root=tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_the_largest_accepted_work_limit_runs(tmp_path: Path) -> None:
+    run_suite(load_suite(DEMO)[:1], config=_config(work_limit=2**31 - 1), out_root=tmp_path)
+    assert _rows(_only_dir(tmp_path))[0]["outcome"] == "correct"
+
+
+def test_resume_refuses_a_changed_work_limit(tmp_path: Path) -> None:
+    cases = load_suite(DEMO)
+    stub = StubGenerator(cases, fail={cases[1].question: KeyboardInterrupt()})
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", stub),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        run_suite(cases, config=_llm(work_limit=1_000_000), out_root=tmp_path)
+    with pytest.raises(ResumeRefused, match="work_limit"):
+        run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=_only_dir(tmp_path))
+
+
+def test_cli_budget_flags_land_in_the_manifest(tmp_path: Path) -> None:
+    code = cli.main(
+        [
+            "--suite",
+            "demo",
+            "--mode",
+            "gold",
+            "--work-limit",
+            "10000000",
+            "--max-rows",
+            "10000",
+            "--out-root",
+            str(tmp_path),
+        ]
+    )
+    assert code == 0
+    manifest = _manifest(_only_dir(tmp_path))
+    assert (manifest["work_limit"], manifest["max_rows"]) == (10_000_000, 10_000)
+    assert "rag-on-k6-evidence-off" in manifest["run_id"]
+
+
+def test_schema_recall_is_labelled_a_mean_of_fractions(tmp_path: Path) -> None:
+    run_suite(load_suite(DEMO), config=_config(), out_root=tmp_path)
+    report = (_only_dir(tmp_path) / "report.md").read_text(encoding="utf-8")
+    assert "Schema recall (mean of per-case fractions)" in report
+    assert "Schema recall is not a rate" in report
+
+
 # --- historical results --------------------------------------------------------------------
 
 # Computed once at BASE (33b51c1). The May tables are history: v2 never rewrites them.

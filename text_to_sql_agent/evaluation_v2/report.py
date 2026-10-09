@@ -14,7 +14,8 @@ Denominators (spec §4.3), one policy everywhere:
   run never claims it.
 - **False-refusal rate** = answerable cases scored ``refused`` / all answerable cases. Also a
   model metric (the cost of default-deny), so a gold run never claims it either.
-- **Schema recall** = mean per-case recall of ``expected_tables`` among retrieved tables.
+- **Schema recall** = mean per-case recall of ``expected_tables`` among retrieved tables. Not
+  a rate: its interval is a bootstrap of the mean of per-case fractions, labelled as such.
 
 A suite with no answerable cases has no EX at all: every EX cell is *not applicable*.
 ``outage`` rows are not terminal outcomes and sit outside every denominator.
@@ -60,7 +61,7 @@ COLUMNS: tuple[tuple[str, str], ...] = (
     ("coverage", "Reference coverage"),
     ("safety", "Safety accuracy"),
     ("false_refusal", "False-refusal rate"),
-    ("recall", "Schema recall"),
+    ("recall", "Schema recall (mean of per-case fractions)"),
 )
 
 
@@ -200,8 +201,10 @@ def render_report(manifest: Manifest, rows: Sequence[Row]) -> str:
         "",
         *_metrics_table(rows, gold=gold),
         "",
-        "Each cell is `point [low, high] (k/n)` in percent: a 95 % percentile-bootstrap "
-        f"interval, {RESAMPLES:,} resamples over cases, seed {SEED}. {INTERVAL_MEANING}",
+        "Each rate cell is `point [low, high] (k/n)` in percent: a 95 % percentile-bootstrap "
+        f"interval, {RESAMPLES:,} resamples over cases, seed {SEED}. Schema recall is not a "
+        "rate: its cell is `mean [low, high] (n=cases)`, the same bootstrap over the mean of "
+        f"per-case recall fractions. {INTERVAL_MEANING}",
         "",
         "EX (headline) counts every answerable case and a `reference_invalid` one as not "
         "correct; EX over valid references excludes those; reference coverage is valid "

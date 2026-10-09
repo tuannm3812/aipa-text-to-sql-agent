@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .config import DEFAULT_MAX_ROWS
 from .engines import open_engine
 from .execution import execute_query
 from .safety import is_safe_query
@@ -129,7 +130,9 @@ def score_case(result: QueryResult, gold_result: QueryResult) -> CaseScore:
     )
 
 
-def run_gold(case: dict[str, Any]) -> tuple[str, QueryResult]:
+def run_gold(
+    case: dict[str, Any], *, work_limit: int | None = None, max_rows: int | None = None
+) -> tuple[str, QueryResult]:
     """Run a case's reference SQL, refusing it if it is not read-only.
 
     Gold SQL comes from `evaluation/cases.json` rather than from a model, so
@@ -140,6 +143,10 @@ def run_gold(case: dict[str, Any]) -> tuple[str, QueryResult]:
 
     Args:
         case: An evaluation case; `gold_sql` and `db_path` are required.
+        work_limit: Execution budget in the engine's own unit, passed to
+            `execute_query` as `max_vm_steps`; `None` (the default, and what
+            the v1 script and the Streamlit tab use) is the engine's default.
+        max_rows: Row cap; `None` is `DEFAULT_MAX_ROWS`.
 
     Returns:
         A `(sql, QueryResult)` tuple. The result carries `GOLD_SQL_UNSAFE` and
@@ -149,4 +156,9 @@ def run_gold(case: dict[str, Any]) -> tuple[str, QueryResult]:
     engine = open_engine(case["db_path"])
     if not is_safe_query(sql, engine=engine):
         return sql, QueryResult(columns=[], rows=[], sql=sql, error="GOLD_SQL_UNSAFE")
-    return sql, execute_query(case["db_path"], sql)
+    return sql, execute_query(
+        case["db_path"],
+        sql,
+        max_rows=DEFAULT_MAX_ROWS if max_rows is None else max_rows,
+        max_vm_steps=work_limit,
+    )

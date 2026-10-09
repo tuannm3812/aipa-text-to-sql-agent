@@ -53,6 +53,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evidence", choices=["on", "off"], default="off")
     parser.add_argument("--max-retries", type=int, default=0)
     parser.add_argument("--retry-base-seconds", type=float, default=20.0)
+    parser.add_argument(
+        "--work-limit",
+        type=int,
+        default=None,
+        help="execution budget in the engine's unit (SQLite: VM steps; 0 disables); "
+        "default: the engine's demo guard",
+    )
+    parser.add_argument(
+        "--max-rows", type=int, default=None, help="row cap; default: the app's DEFAULT_MAX_ROWS"
+    )
     parser.add_argument("--resume", type=Path, metavar="DIR", default=None)
     parser.add_argument("--out-root", type=Path, default=Path("evaluation/results"))
     parser.add_argument("--suites-dir", type=Path, default=DEFAULT_SUITES_DIR)
@@ -74,6 +84,8 @@ def _config(args: argparse.Namespace, suite: str) -> RunConfig:
         rag_top_k=args.rag_top_k,
         max_retries=args.max_retries,
         retry_base_seconds=args.retry_base_seconds,
+        work_limit=args.work_limit,
+        max_rows=args.max_rows,
     )
 
 

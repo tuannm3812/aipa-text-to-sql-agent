@@ -104,6 +104,12 @@ _RETRYABLE = re.compile(
     re.IGNORECASE,
 )
 
+# SQLite's `set_progress_handler` takes a C int: a budget above 2**31 - 1 raises
+# OverflowError inside every query, which would score every reference `reference_invalid`.
+# Refused up front instead. (On the millisecond engines this is ~24 days - never binding.)
+# A query that needs more than this runs only with the guard disabled (`work_limit=0`).
+MAX_WORK_LIMIT = 2**31 - 1
+
 Mode = Literal["gold", "llm"]
 _T = TypeVar("_T")
 
@@ -118,6 +124,9 @@ class RunConfig:
 
     ``subset`` is ``"full"`` with ``subset_path=None``, or a subset's name with the path of
     its committed ID list. In gold mode ``provider`` and ``model`` are recorded as ``gold``.
+    ``work_limit`` (the engine's own unit; ``0`` disables the guard) and ``max_rows`` are the
+    execution budget for both the reference and the model's query; ``None`` means the
+    engine's ``default_work_limit`` and ``DEFAULT_MAX_ROWS`` - the app's demo guards.
     """
 
     suite: str
@@ -133,6 +142,8 @@ class RunConfig:
     max_repair_attempts: int = 1
     max_retries: int = 0
     retry_base_seconds: float = 20.0
+    work_limit: int | None = None
+    max_rows: int | None = None
 
 
 @dataclass(frozen=True)
@@ -200,17 +211,25 @@ def build_identity(
 ) -> tuple[IdentityPayload, dict[str, Any]]:
     """The run's identity payload and the suite's verbatim ``source`` block.
 
-    ``work_limit`` and ``max_rows`` are the values the pipeline and ``run_gold`` actually run
-    under - the engine's ``default_work_limit`` and ``DEFAULT_MAX_ROWS`` - since neither call
-    takes an override. A suite whose cases span engines with different prompts or limits is
-    refused rather than summarised by one of them.
+    ``work_limit`` and ``max_rows`` are resolved here - the config's explicit values, else the
+    engine's ``default_work_limit`` and ``DEFAULT_MAX_ROWS`` - and ``run_suite`` passes these
+    exact values to ``run_gold`` and the pipeline, so the manifest records the budget actually
+    used. A suite whose cases span engines with different prompts or default limits (and so,
+    possibly, different work-limit units) is refused rather than summarised by one of them.
     """
     _check_subset_config(config)
+    if config.work_limit is not None and not 0 <= config.work_limit <= MAX_WORK_LIMIT:
+        raise ValueError(
+            f"work_limit must be between 0 (guard disabled) and {MAX_WORK_LIMIT:,}, "
+            f"got {config.work_limit:,}"
+        )
+    if config.max_rows is not None and config.max_rows < 1:
+        raise ValueError("max_rows must be >= 1")
     source = load_source(config.suite_path)
     commit, dirty = git_state()
     engines = [open_engine(db_path) for db_path in sorted({case.db_path for case in cases})]
     prompt_sha256 = _single({_prompt_sha256(e) for e in engines}, "system prompts")
-    work_limit = _single({e.default_work_limit for e in engines}, "work limits")
+    default_work_limit = _single({e.default_work_limit for e in engines}, "work limits")
     gold = config.mode == "gold"
     payload = IdentityPayload(
         commit=commit,
@@ -232,8 +251,8 @@ def build_identity(
         evidence=config.evidence,
         use_rag=config.use_rag,
         rag_top_k=config.rag_top_k,
-        work_limit=work_limit,
-        max_rows=DEFAULT_MAX_ROWS,
+        work_limit=default_work_limit if config.work_limit is None else config.work_limit,
+        max_rows=DEFAULT_MAX_ROWS if config.max_rows is None else config.max_rows,
         max_repair_attempts=config.max_repair_attempts,
         retry_policy=retry_policy(config.max_retries, config.retry_base_seconds),
     )
@@ -254,7 +273,7 @@ def _error_text(exc: Exception) -> str:
     return redact_dsn(f"{type(exc).__name__}: {exc}")
 
 
-def _reference(case: Case) -> QueryResult:
+def _reference(case: Case, config: RunConfig) -> QueryResult:
     """Run the case's gold SQL through ``run_gold`` (which applies ``is_safe_query``).
 
     ``run_gold`` returns ``GOLD_SQL_UNSAFE`` for a refused reference but *raises* when a safe
@@ -262,7 +281,11 @@ def _reference(case: Case) -> QueryResult:
     redacted error result so ``score_v2`` scores the case ``reference_invalid``.
     """
     try:
-        _, result = run_gold({"gold_sql": case.gold_sql, "db_path": case.db_path})
+        _, result = run_gold(
+            {"gold_sql": case.gold_sql, "db_path": case.db_path},
+            work_limit=config.work_limit,
+            max_rows=config.max_rows,
+        )
     except Exception as exc:
         return QueryResult(columns=[], rows=[], sql=case.gold_sql, error=_error_text(exc))
     return result
@@ -299,6 +322,8 @@ def _ask_model(
                 use_rag=config.use_rag,
                 rag_top_k=config.rag_top_k,
                 max_repair_attempts=config.max_repair_attempts,
+                work_limit=config.work_limit,
+                max_rows=config.max_rows,
             )
         except Exception as exc:
             # A harness-side failure outside generation (unreachable database, schema
@@ -345,7 +370,7 @@ def evaluate_case(case: Case, config: RunConfig) -> Row:
     """Run and score one case, returning its ``cases.csv`` row (every value a string)."""
     question = question_text(case, evidence=config.evidence)
     started = time.perf_counter()
-    gold_result = _reference(case) if case.expected == "answerable" else None
+    gold_result = _reference(case, config) if case.expected == "answerable" else None
     gold_ms = (time.perf_counter() - started) * 1000
 
     generated_sql = ""
@@ -491,6 +516,9 @@ def run_suite(
         raise ValueError("selected cases repeat an ID")
 
     payload, source = build_identity(cases, config)
+    # From here on the budget is explicit: the identity's resolved values are the ones passed
+    # to every reference and model query, never a default looked up again later.
+    config = dataclasses.replace(config, work_limit=payload.work_limit, max_rows=payload.max_rows)
     session_started = time.monotonic()
     if resume_dir is None:
         started = datetime.now(UTC).replace(microsecond=0)

@@ -461,3 +461,42 @@ def test_ask_database_with_sql_shows_the_sql_postgresql_actually_ran(postgres_ds
     assert sql == 'SELECT name FROM "public".customers ORDER BY customer_id'
     assert result.sql == sql
     assert result.rows == [("Alice",), ("Bob",)]
+
+
+# --- per-call execution budget (Evaluation Contract v2: the runner sets it per run) ---------
+
+
+def _runaway_db(tmp_path: Path) -> str:
+    db_path = tmp_path / "big.db"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute("CREATE TABLE n (i INTEGER)")
+        conn.executemany("INSERT INTO n VALUES (?)", [(i,) for i in range(60_000)])
+        conn.commit()
+    return str(db_path)
+
+
+@pytest.mark.parametrize("entry", ["ask_database", "ask_database_with_sql"])
+def test_the_budget_reaches_execute_query(entry: str, customers_db: str) -> None:
+    from text_to_sql_agent.execution import execute_query as real_execute
+
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", return_value="SELECT 1"),
+        patch("text_to_sql_agent.pipeline.execute_query", side_effect=real_execute) as spy,
+    ):
+        getattr(agent, entry)("q", db_path=customers_db, work_limit=123_456, max_rows=7)
+        getattr(agent, entry)("q", db_path=customers_db)
+
+    explicit, default = spy.call_args_list
+    assert explicit.kwargs == {"max_rows": 7, "max_vm_steps": 123_456}
+    # No budget given: exactly what the app always ran with.
+    assert default.kwargs == {"max_rows": agent.DEFAULT_MAX_ROWS, "max_vm_steps": None}
+
+
+def test_a_disabled_guard_lets_the_runaway_query_finish(tmp_path: Path) -> None:
+    db_path = _runaway_db(tmp_path)
+    runaway = "SELECT COUNT(*) FROM n a JOIN n b ON a.i = b.i"
+    with patch("text_to_sql_agent.pipeline.generate_sql", return_value=runaway):
+        _, default = agent.ask_database_with_sql("count pairs", db_path=db_path)
+        _, unlimited = agent.ask_database_with_sql("count pairs", db_path=db_path, work_limit=0)
+    assert default.error == "QUERY_ABORTED_AFTER_100000_VM_STEPS"
+    assert unlimited.ok and unlimited.rows == [(60_000,)]
