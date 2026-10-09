@@ -1,8 +1,10 @@
 """The v2 result-set comparator: typed cells, multiset rows, one-to-one unordered matching.
 
 Policy (spec §4.3): ``NULL`` equals only ``NULL``; ``bool`` is its own type; numbers compare
-across ``int``/``float``/``Decimal`` under ``abs(a - b) <= 1e-6 * max(1, abs(a), abs(b))``;
-text compares exactly after trimming; text never equals a number. Column count must match and
+across ``int``/``float``/``Decimal`` - exactly when both are integral (``1 == 1.0 ==
+Decimal("1.00")``, ``10_000_000 != 10_000_001``), otherwise under
+``abs(a - b) <= 1e-6 * max(1, abs(a), abs(b))``; text compares exactly after trimming; text
+never equals a number. Column count must match and
 columns compare positionally. Rows are a multiset.
 
 Unordered equality is a **perfect one-to-one matching** between generated and gold rows under
@@ -13,10 +15,10 @@ sort-then-compare is wrong in general: ``[(1.0, "a"), (1.0000001, "b")]`` agains
 
 1. **Bucket by exact cells.** Each row gets a key: per cell its kind, plus the value for
    exact kinds (``None``, ``bool``, trimmed text, hashable other values). Numbers contribute
-   only their kind - *every* number is tolerant, integers included, because the spec applies
-   the tolerance to all numbers. Two rows can only be equal if their keys are equal, so the
-   key multisets must agree and a matching exists iff one exists inside every bucket. A bucket
-   with no tolerant cell is settled by its count alone.
+   only their kind: even an integer is tolerant against a non-integral number
+   (``100 == 100.00000001``), so no number can be bucketed by value. Two rows can only be
+   equal if their keys are equal, so the key multisets must agree and a matching exists iff
+   one exists inside every bucket. A bucket with no tolerant cell is settled by its count.
 2. **Fast path.** Inside a bucket that has tolerant cells, sort both sides by those cells and
    compare positionally. Success is proof (the positional pairing *is* a perfect matching), so
    it returns ``True``; failure proves nothing and falls through.
@@ -75,11 +77,22 @@ def _kind(value: Any) -> str:
     return _OTHER
 
 
+def _is_integral(value: Any) -> bool:
+    if isinstance(value, Integral):
+        return True
+    if isinstance(value, Decimal):
+        return value.is_finite() and value == value.to_integral_value()
+    try:
+        return bool(value == int(value))
+    except (OverflowError, ValueError):  # inf, nan
+        return False
+
+
 def _num_equal(a: Any, b: Any) -> bool:
-    if isinstance(a, Integral) and isinstance(b, Integral):
-        # Exact integer arithmetic: float() overflows past 1e308 and loses precision past 2^53.
-        x, y = int(a), int(b)
-        return abs(x - y) * 1_000_000 <= max(1, abs(x), abs(y))
+    if _is_integral(a) and _is_integral(b):
+        # Exact: integers carry no rounding noise, so COUNT(*) 10_000_001 is not 10_000_000.
+        # int() rather than ==, so a float past 2^53 compares by the integer it holds.
+        return int(a) == int(b)
     try:
         x_f, y_f = float(a), float(b)
     except OverflowError:  # an integer too large for a float, against a non-integer

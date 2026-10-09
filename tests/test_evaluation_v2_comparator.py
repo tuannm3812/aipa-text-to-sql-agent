@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 import random
 from decimal import Decimal
 from typing import Any
@@ -68,6 +69,32 @@ def test_tolerance_is_relative_for_large_values() -> None:
 
 def test_integer_valued_decimal_equals_integer() -> None:
     assert rows_equal_v2([(Decimal("2.00"),)], [(2,)], ordered=False)
+
+
+@pytest.mark.parametrize(
+    ("generated", "gold", "equal"),
+    [
+        (10_000_001, 10_000_000, False),  # both integral: exact, a COUNT(*) off by one
+        (Decimal("2.00"), 2, True),  # integral Decimal is an integer
+        (10_000_001.0, 10_000_000, False),  # integral float too
+        (1.0, Decimal("1.00"), True),
+        (100.00000001, 100, True),  # one side non-integral: tolerant
+        (100.001, 100, False),  # outside the tolerance
+        (0.1 + 0.2, 0.3, True),
+        (Decimal("10000000.5"), 10_000_000, True),  # non-integral, within 1e-6 relative
+    ],
+)
+def test_integral_numbers_compare_exactly_otherwise_tolerantly(
+    generated: Any, gold: Any, equal: bool
+) -> None:
+    assert rows_equal_v2([(generated,)], [(gold,)], ordered=False) is equal
+    assert rows_equal_v2([(generated,)], [(gold,)], ordered=True) is equal
+
+
+def test_non_finite_numbers_are_not_integral() -> None:
+    assert rows_equal_v2([(math.inf,)], [(math.inf,)], ordered=False)
+    assert not rows_equal_v2([(math.inf,)], [(10**400,)], ordered=False)
+    assert rows_equal_v2([(math.nan,)], [(Decimal("NaN"),)], ordered=False)
 
 
 def test_bool_is_its_own_type() -> None:
