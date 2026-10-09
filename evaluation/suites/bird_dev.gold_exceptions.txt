@@ -1,0 +1,2 @@
+701   # ~14.6 billion VM steps, beyond SQLite's progress-handler ceiling
+1131  # ~1.6 billion VM steps at the benchmark budget

@@ -4,18 +4,25 @@
     uv run python scripts/evaluate_v2.py --suite spider_dev --subset subset200 \\
         --mode llm --provider ollama --model llama3:latest
     uv run python scripts/evaluate_v2.py --suite bird_dev --mode llm ... --resume DIR
+    uv run python scripts/evaluate_v2.py --gate gold --suite demo safety
+
+`--gate gold` runs each suite in gold mode into a temporary directory (or `--out-root`) and
+judges it by spec §4.4: valid references self-match, every `reference_invalid` ID is on
+`<suites-dir>/<suite>.gold_exceptions.txt`, non-answerable cases are well-formed.
 
 Each run writes `<out-root>/<run id>/{manifest.json,cases.csv,report.md}`; nothing is ever
 overwritten. `--resume DIR` continues an incomplete run in place and is refused - exit code
 2, naming the fields - unless the same arguments reproduce the saved identity.
 
-Exit codes: 0 every run complete; 1 a run is incomplete (outages); 2 refused.
+Exit codes: 0 every run complete (or every gate passed); 1 a run is incomplete (outages) or a
+gate failed; 2 refused.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -29,6 +36,7 @@ from text_to_sql_agent.config import (  # noqa: E402 - import must follow the sy
 )
 from text_to_sql_agent.dsn import redact_dsn  # noqa: E402
 from text_to_sql_agent.evaluation_v2.contract import SuiteError  # noqa: E402
+from text_to_sql_agent.evaluation_v2.gates import GateResult, gold_gate  # noqa: E402
 from text_to_sql_agent.evaluation_v2.runner import (  # noqa: E402
     ResumeRefused,
     RunConfig,
@@ -64,7 +72,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-rows", type=int, default=None, help="row cap; default: the app's DEFAULT_MAX_ROWS"
     )
     parser.add_argument("--resume", type=Path, metavar="DIR", default=None)
-    parser.add_argument("--out-root", type=Path, default=Path("evaluation/results"))
+    parser.add_argument(
+        "--gate",
+        choices=["gold"],
+        default=None,
+        help="judge each suite's gold run instead of recording a result "
+        "(output goes to a temporary directory unless --out-root is given)",
+    )
+    parser.add_argument(
+        "--out-root",
+        type=Path,
+        default=None,
+        help="where result directories are written (default: evaluation/results; "
+        "with --gate, a temporary directory)",
+    )
     parser.add_argument("--suites-dir", type=Path, default=DEFAULT_SUITES_DIR)
     return parser
 
@@ -89,11 +110,56 @@ def _config(args: argparse.Namespace, suite: str) -> RunConfig:
     )
 
 
+def _print_gate(result: GateResult) -> None:
+    verdict = "PASS" if result.passed else "FAIL"
+    print(f"{result.suite}: gold gate {verdict}")
+    print(
+        f"  {result.answerable} answerable, {result.non_answerable} non-answerable; "
+        f"EX {result.metrics['ex']}; EX over valid references {result.metrics['ex_valid']}; "
+        f"coverage {result.metrics['coverage']}"
+    )
+    if result.excepted:
+        print(f"  excepted ({len(result.excepted)}): {', '.join(result.excepted)}")
+    if result.stale_exceptions:
+        stale = ", ".join(result.stale_exceptions)
+        print(f"  stale exceptions (not reference_invalid this run): {stale}")
+    for failure in result.failures:
+        print(f"  FAILURE {failure}")
+
+
+def _gate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.mode != "gold" or args.subset != "full" or args.resume is not None:
+        parser.error("--gate gold judges whole suites: no --subset, --resume or --mode llm")
+    exit_code = 0
+    with tempfile.TemporaryDirectory(prefix="evaluate_v2_gate_") as scratch:
+        out_root = args.out_root if args.out_root is not None else Path(scratch)
+        for suite in args.suite:
+            try:
+                result = gold_gate(
+                    args.suites_dir / f"{suite}.jsonl",
+                    args.suites_dir / f"{suite}.gold_exceptions.txt",
+                    out_root=out_root,
+                    work_limit=args.work_limit,
+                    max_rows=args.max_rows,
+                )
+            except (ResumeRefused, SuiteError, ValueError, OSError) as exc:
+                print(f"{suite}: refused: {redact_dsn(str(exc))}", file=sys.stderr)
+                return 2
+            _print_gate(result)
+            if not result.passed:
+                exit_code = 1
+    return exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.resume is not None and len(args.suite) != 1:
         parser.error("--resume continues one run, so it takes exactly one --suite")
+    if args.gate is not None:
+        return _gate(args, parser)
+    if args.out_root is None:
+        args.out_root = Path("evaluation/results")
 
     exit_code = 0
     for suite in args.suite:
