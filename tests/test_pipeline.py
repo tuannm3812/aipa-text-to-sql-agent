@@ -522,3 +522,71 @@ def test_a_failed_repair_call_is_reported_to_the_callback_and_still_swallowed(
     assert seen == [boom]
     assert with_callback == without
     assert without[1].error is not None and "no_such_column" in without[1].error
+
+
+BLOCKED_SENTINEL_SQL = "SELECT 'BLOCKED_UNSAFE_SQL' AS error;"
+UNANSWERABLE_SENTINEL_SQL = "SELECT 'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error;"
+
+
+@pytest.mark.parametrize(
+    ("sentinel_sql", "code"),
+    [
+        (BLOCKED_SENTINEL_SQL, "BLOCKED_UNSAFE_SQL"),
+        (UNANSWERABLE_SENTINEL_SQL, "UNANSWERABLE_WITH_GIVEN_SCHEMA"),
+    ],
+)
+def test_ask_database_reports_a_sentinel_without_executing_it(
+    customers_db: str, sentinel_sql: str, code: str
+) -> None:
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", return_value=sentinel_sql),
+        patch("text_to_sql_agent.pipeline.execute_query") as spy,
+    ):
+        result = agent.ask_database("delete everything", db_path=customers_db)
+
+    spy.assert_not_called()
+    assert (result.error, result.columns, result.rows, result.sql) == (code, [], [], sentinel_sql)
+
+
+@pytest.mark.parametrize(
+    ("sentinel_sql", "code"),
+    [
+        (BLOCKED_SENTINEL_SQL, "BLOCKED_UNSAFE_SQL"),
+        (UNANSWERABLE_SENTINEL_SQL, "UNANSWERABLE_WITH_GIVEN_SCHEMA"),
+    ],
+)
+def test_ask_database_with_sql_reports_a_sentinel_without_executing_it(
+    customers_db: str, sentinel_sql: str, code: str
+) -> None:
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", return_value=sentinel_sql),
+        patch("text_to_sql_agent.pipeline.execute_query") as spy,
+    ):
+        sql, result = agent.ask_database_with_sql("delete everything", db_path=customers_db)
+
+    spy.assert_not_called()
+    assert sql == sentinel_sql
+    assert (result.error, result.columns, result.rows, result.sql) == (code, [], [], sentinel_sql)
+
+
+def test_a_repair_that_returns_the_blocked_sentinel_is_reported_not_executed(
+    customers_db: str,
+) -> None:
+    answers = iter(["SELECT nope FROM customers", BLOCKED_SENTINEL_SQL])
+    with patch(
+        "text_to_sql_agent.pipeline.generate_sql", side_effect=lambda *_a, **_k: next(answers)
+    ):
+        first = agent.ask_database("list", db_path=customers_db)
+    answers = iter(["SELECT nope FROM customers", BLOCKED_SENTINEL_SQL])
+    with patch(
+        "text_to_sql_agent.pipeline.generate_sql", side_effect=lambda *_a, **_k: next(answers)
+    ):
+        sql, second = agent.ask_database_with_sql("list", db_path=customers_db)
+
+    for result in (first, second):
+        assert (result.error, result.rows, result.sql) == (
+            "BLOCKED_UNSAFE_SQL",
+            [],
+            BLOCKED_SENTINEL_SQL,
+        )
+    assert sql == BLOCKED_SENTINEL_SQL

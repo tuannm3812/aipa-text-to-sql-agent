@@ -11,7 +11,7 @@ from .execution import execute_query
 from .ingestion import ingest_csvs_to_db
 from .llm import generate_sql
 from .rag import retrieve_relevant_schema
-from .safety import query_refusal
+from .safety import BLOCKED_UNSAFE_SQL, UNANSWERABLE_WITH_GIVEN_SCHEMA, query_refusal
 from .schema import get_schema
 from .types import QueryResult
 
@@ -80,9 +80,7 @@ def ask_database(
             question, schema_text, model_name=model_name, provider=provider, engine=engine
         )
 
-        if "UNANSWERABLE_WITH_GIVEN_SCHEMA" in sql:
-            return QueryResult(columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA")
-        refusal = query_refusal(sql, engine=engine)
+        refusal = _sentinel_code(sql) or query_refusal(sql, engine=engine)
         if refusal is not None:
             return QueryResult(columns=[], rows=[], sql=sql, error=refusal)
         try:
@@ -103,7 +101,9 @@ def ask_database(
             # A refused repair is the terminal verdict: report its code with the
             # SQL it is about, the same contract as a refused first attempt. The
             # first attempt's error would read as repairable when nothing can run.
-            repair_refusal = query_refusal(repaired_sql, engine=engine)
+            repair_refusal = _sentinel_code(repaired_sql) or query_refusal(
+                repaired_sql, engine=engine
+            )
             if repair_refusal is not None:
                 return QueryResult(columns=[], rows=[], sql=repaired_sql, error=repair_refusal)
             return _execute(db_path, repaired_sql, work_limit=work_limit, max_rows=max_rows)
@@ -176,11 +176,7 @@ def ask_database_with_sql(
     except Exception as e:
         return "", QueryResult(columns=[], rows=[], error=f"{type(e).__name__}: {e}")
 
-    if "UNANSWERABLE_WITH_GIVEN_SCHEMA" in sql:
-        return sql, QueryResult(
-            columns=[], rows=[], sql=sql, error="UNANSWERABLE_WITH_GIVEN_SCHEMA"
-        )
-    refusal = query_refusal(sql, engine=engine)
+    refusal = _sentinel_code(sql) or query_refusal(sql, engine=engine)
     if refusal is not None:
         return sql, QueryResult(columns=[], rows=[], sql=sql, error=refusal)
 
@@ -203,7 +199,9 @@ def ask_database_with_sql(
         if repaired_sql:
             # Same contract as `ask_database`: a refused repair is reported as
             # its own refusal, paired with the refused SQL, never executed.
-            repair_refusal = query_refusal(repaired_sql, engine=engine)
+            repair_refusal = _sentinel_code(repaired_sql) or query_refusal(
+                repaired_sql, engine=engine
+            )
             if repair_refusal is not None:
                 return repaired_sql, QueryResult(
                     columns=[], rows=[], sql=repaired_sql, error=repair_refusal
@@ -283,6 +281,24 @@ def ask_from_files(
         )
 
     raise ValueError(f"Unsupported or mixed file types: {sorted(exts)}")
+
+
+def _sentinel_code(sql: str) -> str | None:
+    """The error code for a sentinel the model itself emitted, else `None`.
+
+    The system prompt tells the model to answer a data-modification request with
+    `SELECT 'BLOCKED_UNSAFE_SQL' AS error;` and an unanswerable question with
+    `SELECT 'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error;`. Both are valid SELECTs, so
+    `query_refusal` passes them; checked first, they are reported as the model's own
+    verdict instead of being executed as a query that returns the sentinel text. A
+    sentinel inside a non-SELECT gets the same `BLOCKED_UNSAFE_SQL` the validator would
+    give, so the order never changes the code for blocked input.
+    """
+    if UNANSWERABLE_WITH_GIVEN_SCHEMA in sql:
+        return UNANSWERABLE_WITH_GIVEN_SCHEMA
+    if BLOCKED_UNSAFE_SQL in sql:
+        return BLOCKED_UNSAFE_SQL
+    return None
 
 
 def _execute(

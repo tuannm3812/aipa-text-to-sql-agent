@@ -70,3 +70,9 @@ def test_describe_error_reports_duckdb_abort_in_ms_not_steps() -> None:
 def test_describe_error_redacts_a_dsn_password_in_raw_exception_text() -> None:
     raw = "could not connect to postgresql://u:hunter2@host/db"
     assert "hunter2" not in results.describe_error(raw)
+
+
+def test_blocked_message_reads_correctly_for_a_refusal_the_model_made() -> None:
+    message = results.describe_error("BLOCKED_UNSAFE_SQL")
+    assert "asked to change data" in message
+    assert "generated SQL was blocked" not in message

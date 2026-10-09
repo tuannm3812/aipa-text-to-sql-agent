@@ -32,8 +32,9 @@ def chartable_columns(df: pd.DataFrame) -> tuple[str, str] | None:
 
 _ERROR_MESSAGES = {
     "BLOCKED_UNSAFE_SQL": (
-        "The generated SQL was blocked because it was not a read-only query. "
-        "The SQL is shown below so you can see what was rejected."
+        "The request asked to change data, or the query was not read-only, so it was "
+        "not run. This agent only reads data; it never inserts, updates, deletes or "
+        "alters anything. Any SQL involved is shown below."
     ),
     "BLOCKED_UNSUPPORTED_COLUMN_TYPE": (
         "The generated SQL was not run because it uses a column whose data type "
