@@ -59,7 +59,15 @@ Project-specific rules and deliberate overrides: @docs/0_coding_standards.md
   container and fails the build if any conformance test is skipped, the same
   guard Phase 3a added for `duckdb`. `psycopg` stays out of
   `requirements.txt`, like `duckdb` — both are optional extras (`postgres`,
-  or `engines` for both together). Phase 4 (real RAG) is next; see
+  or `engines` for both together).
+- 2026-10-09: Evaluation contract v2 (gate G2) implemented — Tasks 1-9 of
+  `docs/superpowers/plans/2026-10-08-evaluation-contract-v2.md`. `1492`
+  passed / `6` skipped with the DSN set, `1148` / `350` without; conformance
+  `36` / `0`. CI also runs the v2 gold gate on `demo` and `safety`. First
+  results on `qwen3.5:9b-q4_K_M` are committed under `evaluation/results/`;
+  the Spider and BIRD **full** release runs are still pending. Run the v2
+  harness and anything touching `evaluation/results/` from a clean tree —
+  a dirty run is recorded as not citable. Phase 4 (real RAG) follows; see
   `docs/4_next_steps.md`.
 
 ## Open risks

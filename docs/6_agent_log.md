@@ -3411,3 +3411,68 @@ demo: gold gate PASS / safety: gold gate PASS
 
 `evaluation/results/` holds exactly its nine tracked files, unchanged since the
 plan began. No provider was called.
+
+## 2026-10-09 — Claude: v2 Tasks 8 and 9 — the tab, the first real results, and a pipeline bug they exposed
+
+**Task 8** (`e6b2a42`, `f8a71c7`). The Streamlit evaluation tab classifies
+every case through the runner's public `evaluate_case` and builds its summary
+from `report.metric_cells`, so it cannot disagree with the CLI. A per-case test
+compares the tab against `run_suite` on identical inputs (correct, wrong, empty
+SQL, blocked, outage), and an AST guard forbids the tab from importing or
+calling any scorer or comparing outcome literals. I verified the guard fails on
+an aliased `score_v2` import and on an outcome-literal comparison. A new
+read-only viewer lists `evaluation/results/*/manifest.json` and labels
+non-citable runs. Authorised deviation: two source-grep guards in legacy
+`tests/test_evaluation.py` no longer include `ui/evaluation.py`.
+
+**Task 9, routine runs.** Model `qwen3.5:9b-q4_K_M` (owner's choice), RAG on,
+`max_retries 2`, public suites at the documented budget. The first attempt
+exposed a **pipeline bug that predates v2**: the system prompt tells the model
+to emit `SELECT 'BLOCKED_UNSAFE_SQL' AS error;` for data-modification requests,
+but only the unanswerable sentinel was recognised, so the blocked sentinel ran
+as a query. On the safety suite the model never generated a write, yet 8 of 9
+refusal cases scored `wrong`, and the app showed users a table instead of a
+refusal. I stopped the batch, the owner chose the scoring rule (decision entry,
+2026-10-09), `9ea4112` and `7c1aaa4` fixed the pipeline and scoring, and every
+run was redone on the fixed commit; the pre-fix directories were discarded.
+
+The batch was later cut by the harness's background time limit mid-Spider. The
+runner resumed it in place: it took over the stale lock with a warning naming
+the dead pid and ran only the missing cases. The remaining runs were launched
+as a detached process.
+
+**Results** (`869dce7`; all `complete`, citable, commit `7c1aaa4`, clean tree):
+
+| Suite | Result |
+|---|---|
+| `demo` | EX 5/12 = 41.7% [16.7, 66.7] |
+| `safety` | safety accuracy 12/15 = 80.0% [60.0, 100.0]; declined as unanswerable 2/9 |
+| `spider_dev` subset200 | EX 103/200 = 51.5% [44.5, 58.5]; easy 72.9%, medium 55.8%, hard 32.4%, extra 28.1% |
+| `bird_dev` subset200, evidence on | EX 51/200 = 25.5% [19.5, 32.0] |
+| `bird_dev` subset200, evidence off | EX 34/200 = 17.0% [12.0, 22.5] |
+
+Paired on the same 200 BIRD cases, evidence adds **+8.5 points [+3.5, +13.5]**
+(23 cases helped, 6 hurt). Mean latency 21-26 s per case on the public suites.
+Per the spec, the Spider and BIRD numbers are subset verification results; the
+README cites only `demo` and `safety` until the full dev-set runs complete.
+
+**Verification at the docs commit**, sequentially:
+
+```
+$ TEXT_TO_SQL_TEST_POSTGRES_DSN=<local compose DSN> uv run pytest
+1492 passed, 6 skipped
+$ uv run pytest                       # no DSN
+1148 passed, 350 skipped
+$ TEXT_TO_SQL_TEST_POSTGRES_DSN=... uv run pytest -m conformance
+36 passed
+$ uv run mypy
+no issues found in 46 source files
+$ uv run python scripts/evaluate_v2.py --gate gold --suite demo safety
+demo: gold gate PASS / safety: gold gate PASS
+$ uv run python scripts/evaluate_text_to_sql.py --mode gold
+Evaluated 12 cases. Exact result match: 12/12
+```
+
+**Not done:** the full Spider/BIRD release runs (about 25-30 hours of machine
+time at the measured rate), gate G8, and prompt-token accounting for Ollama.
+All three lead `docs/4_next_steps.md`.

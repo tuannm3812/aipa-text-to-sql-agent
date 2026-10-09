@@ -32,11 +32,12 @@ The implemented backend flow is:
 
 The local verification status as of this documentation pass (2026-09-26) is:
 
-- Unit tests: `786` passed, `6` skipped with `uv run pytest` (`uv sync --extra engines`, `TEXT_TO_SQL_TEST_POSTGRES_DSN` set against a live `docker compose -f docker/postgres.yml up -d` container). The 6 skips are a deliberate SQLite exemption (`ATTACH` is denied, so SQLite has exactly one schema), not a PostgreSQL gap. Without `TEXT_TO_SQL_TEST_POSTGRES_DSN` set, the same command reports `538` passed, `254` skipped — the subset that needs a live PostgreSQL server.
+- Unit tests: `1492` passed, `6` skipped with `uv run pytest` (`uv sync --extra engines`, `TEXT_TO_SQL_TEST_POSTGRES_DSN` set against a live `docker compose -f docker/postgres.yml up -d` container). The 6 skips are a deliberate SQLite exemption (`ATTACH` is denied, so SQLite has exactly one schema), not a PostgreSQL gap. Without `TEXT_TO_SQL_TEST_POSTGRES_DSN` set, the same command reports `1148` passed, `350` skipped — the subset that needs a live PostgreSQL server. (Measured 2026-10-09 at `869dce7`.)
 - Engine conformance: `36` tests passing (12 per engine, SQLite, DuckDB, and PostgreSQL), `0` skipped, with `uv run pytest -m conformance -rs` and the DSN set. CI (`.github/workflows/tests.yml`) runs a `postgres:16` service container and fails the build if any conformance test is skipped.
 - Gold evaluation: `12/12` safe, executed, value-matched, row-matched, and exact-matched cases with `uv run python scripts/evaluate_text_to_sql.py --mode gold`.
-- Gemini evaluation: `gemini-2.5-flash` completed all `12` cases with multi-key quota failover, reaching `11/12` value match.
-- Local LLM evaluation: Ollama `llama3:latest` reached `8/12` value match with `12/12` safe/executed queries; `gemma4:latest` reached `8/12` value match overall and `8/10` among executed queries.
+- Evaluation v2 (`text_to_sql_agent/evaluation_v2/`, `scripts/evaluate_v2.py`): a typed case contract over four suites (`demo`, `safety`, and Spider and BIRD dev via `scripts/prepare_benchmarks.py`), a typed comparator with one-to-one row matching, outcome scoring with a separate safety metric, bootstrap intervals, run directories with a manifest whose identity binds code, suite, prompt, settings and database contents, crash-safe resume, a gold gate run in CI and a paired regression gate. The Streamlit evaluation tab classifies through the same runner function. First results (2026-10-09, `qwen3.5:9b-q4_K_M`): `demo` EX `5/12`, `safety` accuracy `12/15`; Spider/BIRD full-set runs pending. See `README.md`'s Evaluation Results.
+- Gemini evaluation: *(May 2026, v1 scorer, pre-refactor pipeline — historical)* `gemini-2.5-flash` completed all `12` cases with multi-key quota failover, reaching `11/12` value match.
+- Local LLM evaluation: *(May 2026, v1 scorer, pre-refactor pipeline — historical)* Ollama `llama3:latest` reached `8/12` value match with `12/12` safe/executed queries; `gemma4:latest` reached `8/12` value match overall and `8/10` among executed queries.
 
 ## Diagram Source
 
