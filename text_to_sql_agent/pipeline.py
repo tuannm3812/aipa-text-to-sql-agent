@@ -4,26 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from types import ModuleType
 
 from .config import DEFAULT_MAX_ROWS, DEFAULT_MODEL_NAME, DEFAULT_RAG_TOP_K
+from .control import control_statement_code
 from .engines import Engine, open_engine
 from .execution import execute_query
 from .ingestion import ingest_csvs_to_db
 from .llm import generate_sql
 from .rag import retrieve_relevant_schema
-from .safety import BLOCKED_UNSAFE_SQL, UNANSWERABLE_WITH_GIVEN_SCHEMA, query_refusal
+from .safety import query_refusal
 from .schema import get_schema
 from .types import QueryResult
-
-sqlglot: ModuleType | None
-exp: ModuleType | None
-try:
-    import sqlglot
-    from sqlglot import expressions as exp
-except ModuleNotFoundError:  # pragma: no cover
-    sqlglot = None
-    exp = None
 
 
 def ask_database(
@@ -311,31 +302,7 @@ def _sentinel_code(sql: str, *, engine: Engine) -> str | None:
     operation, CTE or second statement, or that does not parse: all of those go on to
     `query_refusal` unchanged, so a non-read-only statement stays governed by it.
     """
-    if sqlglot is None or exp is None:
-        return None
-    try:
-        statements = sqlglot.parse(sql, read=engine.sqlglot_dialect)
-    except Exception:
-        return None
-    if len(statements) != 1:
-        return None
-    select = statements[0]
-    if not isinstance(select, exp.Select):
-        return None
-    if any(value for key, value in select.args.items() if key != "expressions"):
-        return None
-    projections = select.args.get("expressions") or []
-    if len(projections) != 1:
-        return None
-    value = projections[0]
-    if isinstance(value, exp.Alias):
-        value = value.this
-    if not (isinstance(value, exp.Literal) and value.is_string):
-        return None
-    for code in (BLOCKED_UNSAFE_SQL, UNANSWERABLE_WITH_GIVEN_SCHEMA):
-        if value.this == code:
-            return code
-    return None
+    return control_statement_code(sql, dialect=engine.sqlglot_dialect)
 
 
 def _execute(

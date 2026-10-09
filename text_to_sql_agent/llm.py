@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from .config import DEFAULT_MODEL_NAME, DEFAULT_OLLAMA_MODEL, DEFAULT_PROVIDER
+from .control import trim_prose_after_control
 from .engines import Engine
 from .engines.sqlite import SQLiteEngine
 from .env import load_env
@@ -217,7 +218,9 @@ def _extract_sql_from_text(raw_output: str) -> str:
 
     match = re.search(r"(?is)\b(SELECT|WITH)\b.*?;?$", raw_output)
     if match:
-        return raw_output[match.start() :].strip()
+        # Unfenced: a control statement the model followed with a sentence of prose is cut
+        # back to the statement, so the verdict is not lost to a parse failure downstream.
+        return trim_prose_after_control(raw_output[match.start() :].strip())
     return raw_output
 
 
