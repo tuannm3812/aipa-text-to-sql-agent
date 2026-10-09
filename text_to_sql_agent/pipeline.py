@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
 
 from .config import DEFAULT_MAX_ROWS, DEFAULT_MODEL_NAME, DEFAULT_RAG_TOP_K
 from .engines import Engine, open_engine
@@ -14,6 +15,15 @@ from .rag import retrieve_relevant_schema
 from .safety import BLOCKED_UNSAFE_SQL, UNANSWERABLE_WITH_GIVEN_SCHEMA, query_refusal
 from .schema import get_schema
 from .types import QueryResult
+
+sqlglot: ModuleType | None
+exp: ModuleType | None
+try:
+    import sqlglot
+    from sqlglot import expressions as exp
+except ModuleNotFoundError:  # pragma: no cover
+    sqlglot = None
+    exp = None
 
 
 def ask_database(
@@ -80,7 +90,7 @@ def ask_database(
             question, schema_text, model_name=model_name, provider=provider, engine=engine
         )
 
-        refusal = _sentinel_code(sql) or query_refusal(sql, engine=engine)
+        refusal = _sentinel_code(sql, engine=engine) or query_refusal(sql, engine=engine)
         if refusal is not None:
             return QueryResult(columns=[], rows=[], sql=sql, error=refusal)
         try:
@@ -101,7 +111,7 @@ def ask_database(
             # A refused repair is the terminal verdict: report its code with the
             # SQL it is about, the same contract as a refused first attempt. The
             # first attempt's error would read as repairable when nothing can run.
-            repair_refusal = _sentinel_code(repaired_sql) or query_refusal(
+            repair_refusal = _sentinel_code(repaired_sql, engine=engine) or query_refusal(
                 repaired_sql, engine=engine
             )
             if repair_refusal is not None:
@@ -176,7 +186,7 @@ def ask_database_with_sql(
     except Exception as e:
         return "", QueryResult(columns=[], rows=[], error=f"{type(e).__name__}: {e}")
 
-    refusal = _sentinel_code(sql) or query_refusal(sql, engine=engine)
+    refusal = _sentinel_code(sql, engine=engine) or query_refusal(sql, engine=engine)
     if refusal is not None:
         return sql, QueryResult(columns=[], rows=[], sql=sql, error=refusal)
 
@@ -199,7 +209,7 @@ def ask_database_with_sql(
         if repaired_sql:
             # Same contract as `ask_database`: a refused repair is reported as
             # its own refusal, paired with the refused SQL, never executed.
-            repair_refusal = _sentinel_code(repaired_sql) or query_refusal(
+            repair_refusal = _sentinel_code(repaired_sql, engine=engine) or query_refusal(
                 repaired_sql, engine=engine
             )
             if repair_refusal is not None:
@@ -283,21 +293,48 @@ def ask_from_files(
     raise ValueError(f"Unsupported or mixed file types: {sorted(exts)}")
 
 
-def _sentinel_code(sql: str) -> str | None:
-    """The error code for a sentinel the model itself emitted, else `None`.
+def _sentinel_code(sql: str, *, engine: Engine) -> str | None:
+    """The error code for a control statement the model itself emitted, else `None`.
 
     The system prompt tells the model to answer a data-modification request with
     `SELECT 'BLOCKED_UNSAFE_SQL' AS error;` and an unanswerable question with
     `SELECT 'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error;`. Both are valid SELECTs, so
     `query_refusal` passes them; checked first, they are reported as the model's own
-    verdict instead of being executed as a query that returns the sentinel text. A
-    sentinel inside a non-SELECT gets the same `BLOCKED_UNSAFE_SQL` the validator would
-    give, so the order never changes the code for blocked input.
+    verdict instead of being executed as a query that returns the sentinel text.
+
+    Recognised structurally, never by substring: `sql` must parse, in the engine's
+    dialect, to exactly one `SELECT` whose only clause is a projection list of a
+    single string literal (optionally aliased) equal to one of the two codes. Keyword
+    case, whitespace, a trailing semicolon and the alias form do not matter. A
+    comment, a column name or a filter literal that merely contains a code is an
+    ordinary query, and so is anything with a `FROM`, `WHERE`, `DISTINCT`, set
+    operation, CTE or second statement, or that does not parse: all of those go on to
+    `query_refusal` unchanged, so a non-read-only statement stays governed by it.
     """
-    if UNANSWERABLE_WITH_GIVEN_SCHEMA in sql:
-        return UNANSWERABLE_WITH_GIVEN_SCHEMA
-    if BLOCKED_UNSAFE_SQL in sql:
-        return BLOCKED_UNSAFE_SQL
+    if sqlglot is None or exp is None:
+        return None
+    try:
+        statements = sqlglot.parse(sql, read=engine.sqlglot_dialect)
+    except Exception:
+        return None
+    if len(statements) != 1:
+        return None
+    select = statements[0]
+    if not isinstance(select, exp.Select):
+        return None
+    if any(value for key, value in select.args.items() if key != "expressions"):
+        return None
+    projections = select.args.get("expressions") or []
+    if len(projections) != 1:
+        return None
+    value = projections[0]
+    if isinstance(value, exp.Alias):
+        value = value.this
+    if not (isinstance(value, exp.Literal) and value.is_string):
+        return None
+    for code in (BLOCKED_UNSAFE_SQL, UNANSWERABLE_WITH_GIVEN_SCHEMA):
+        if value.this == code:
+            return code
     return None
 
 

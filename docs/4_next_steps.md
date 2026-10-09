@@ -26,6 +26,19 @@ Remaining, in order:
    hash is rebuilt through a private `llm` helper; "same hostname and dead pid"
    is not proof across pid namespaces sharing a hostname. The v1 script
    (`scripts/evaluate_text_to_sql.py`) and the May tables remain as history.
+4. **A control statement followed by prose gets the wrong code.** Since
+   2026-10-10 the pipeline recognises the model's two control statements
+   (`SELECT 'BLOCKED_UNSAFE_SQL' AS error;`, `SELECT
+   'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error;`) structurally, so a read that
+   merely mentions a code in a comment or literal runs normally (Codex,
+   2026-10-09). If the model appends prose *after* an unfenced control
+   statement, `llm._extract_sql_from_text` keeps it, the text no longer parses
+   as one statement, and the validator refuses it as `BLOCKED_UNSAFE_SQL` —
+   safe, but an "unanswerable" answer would be mis-coded. It occurred in 0 of
+   the 627 committed v2 cases. Fix it in the extractor (stop at the end of a
+   recognised control statement), never by widening detection back to
+   substring matching, and never by truncating at the first `;` in general,
+   which would hide a stacked statement from the validator.
 
 ## Phase 4 — Real RAG (next)
 
