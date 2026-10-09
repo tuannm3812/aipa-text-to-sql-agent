@@ -309,10 +309,33 @@ def test_a_database_outside_the_root_is_keyed_by_its_absolute_path(tmp_path: Pat
     assert key == Path(outside).as_posix()
 
 
-def test_a_server_dsn_cannot_be_fingerprinted_and_is_refused(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="cannot fingerprint") as caught:
-        database_fingerprint(["postgresql://u:secret@h/db"], root=tmp_path)
+@pytest.mark.parametrize("dsn", ["postgresql://u:secret@h/db", "postgres://u:secret@h/db"])
+def test_a_server_dsn_cannot_be_fingerprinted_and_is_refused(tmp_path: Path, dsn: str) -> None:
+    with pytest.raises(ValueError, match="server-side fingerprint is not implemented") as caught:
+        database_fingerprint([dsn], root=tmp_path)
     assert "secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize("scheme", ["sqlite", "duckdb"])
+def test_a_file_dsn_fingerprints_the_file_it_names(tmp_path: Path, scheme: str) -> None:
+    path = _db(tmp_path, "data/a.db", b"file bytes")
+    assert database_fingerprint([f"{scheme}://{path}"], root=tmp_path) == database_fingerprint(
+        [path], root=tmp_path
+    )
+
+
+def test_fingerprint_changes_name_only_the_databases_that_differ() -> None:
+    from text_to_sql_agent.evaluation_v2.identity import fingerprint_changes
+
+    old = [["data/a.db", "1" * 64], ["data/b.db", "2" * 64], ["data/c.db", "3" * 64]]
+    new = (("data/a.db", "1" * 64), ("data/b.db", "9" * 64), ("data/d.db", "4" * 64))
+    changes = fingerprint_changes(old, new)
+    assert changes == [
+        f"data/b.db ({'2' * 12} -> {'9' * 12})",
+        "data/c.db (no longer used)",
+        "data/d.db (newly used)",
+    ]
+    assert fingerprint_changes(old, [list(pair) for pair in old]) == []
 
 
 def test_git_state_reports_this_checkout_head() -> None:

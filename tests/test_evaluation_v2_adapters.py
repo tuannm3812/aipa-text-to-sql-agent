@@ -286,11 +286,40 @@ def test_a_table_read_inside_and_outside_a_cte_appears_once() -> None:
     assert gold_tables(sql) == ["orders"]
 
 
-def test_a_cte_body_reading_the_real_table_it_shadows_keeps_it() -> None:
-    # Without RECURSIVE a CTE is not visible in its own body: `customers` there is the table.
-    assert gold_tables("WITH customers AS (SELECT * FROM customers) SELECT * FROM customers") == [
-        "customers"
-    ]
+def _sqlite_answer(sql: str) -> object:
+    """What SQLite itself does with ``sql`` over tables ``t`` and ``customers``."""
+    with closing(sqlite3.connect(":memory:")) as conn:
+        conn.execute("CREATE TABLE t (x INTEGER)")
+        conn.execute("CREATE TABLE customers (id INTEGER)")
+        conn.execute("INSERT INTO t VALUES (7)")
+        try:
+            return conn.execute(sql).fetchall()
+        except sqlite3.Error as exc:
+            return str(exc)
+
+
+def test_a_cte_body_naming_its_own_cte_binds_to_the_cte_in_sqlite() -> None:
+    # SQLite does not read the real `customers` here: inside the body the name binds to the CTE
+    # itself, and SQLite rejects the query as a circular reference. So no such query can be a
+    # valid gold reference, and the name is a CTE reference, not a table read.
+    sql = "WITH customers AS (SELECT * FROM customers) SELECT * FROM customers"
+    assert _sqlite_answer(sql) == "circular reference: customers"
+    assert gold_tables(sql) == []
+
+
+def test_a_forward_referenced_sibling_cte_is_the_cte_in_sqlite() -> None:
+    # SQLite resolves `b` in the first CTE's body to the *later* sibling CTE `b`.
+    sql = "WITH a AS (SELECT * FROM b), b AS (SELECT 1 AS x FROM t) SELECT * FROM a"
+    assert _sqlite_answer(sql) == [(1,)]
+    assert gold_tables(sql) == ["t"]
+
+
+def test_sibling_cte_names_do_not_reach_outside_their_with() -> None:
+    sql = (
+        "SELECT * FROM b WHERE x IN ("
+        "WITH a AS (SELECT * FROM b), b AS (SELECT 1 AS x FROM t) SELECT x FROM a)"
+    )
+    assert gold_tables(sql) == ["b", "t"]
 
 
 def test_a_recursive_ctes_self_reference_is_not_a_table() -> None:

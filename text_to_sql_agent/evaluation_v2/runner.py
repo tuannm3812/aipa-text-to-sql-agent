@@ -61,6 +61,7 @@ from text_to_sql_agent.evaluation_v2.identity import (
     allocate_run_dir,
     config_label,
     database_fingerprint,
+    fingerprint_changes,
     git_state,
     identity_diff,
     retry_policy,
@@ -610,6 +611,25 @@ def _take_over_stale_lock(path: Path, seen: str, mine: str) -> bool:
        atomic, so a third session's ``O_EXCL`` create fails throughout;
     4. release the mutex (only if it still holds this session's line).
 
+    If writing this session's line into the freshly created mutex fails (``ENOSPC``, a
+    ``KeyboardInterrupt``), the mutex is unlinked before the error propagates: an empty
+    mutex matches no session's line, so ``_remove_if_owned`` could never clear it and every
+    later recovery would be refused until someone deleted it by hand - the same reason
+    ``_session_lock`` removes an empty ``.lock``.
+
+    Assumptions and known limits:
+
+    - "Stale" means *same hostname and a pid that does not exist*. That holds only when every
+      process that could hold the lock shares one pid namespace per hostname. It does not hold
+      across pid namespaces that share a hostname - for example containers run with
+      ``--network host`` (same hostname, separate pid namespaces) on one run directory: a live
+      holder in another container is invisible to ``os.kill(pid, 0)`` here and would be taken
+      for dead. Do not share a run directory across such containers.
+    - Every step above is atomic against another *session*, but not against a human. Deleting
+      ``.lock`` or ``.lock.takeover`` by hand while a session is recovering - the refusal
+      messages suggest it only when no session is - can let a second session in during that
+      window. The locks protect sessions from each other, not from manual intervention.
+
     Raises:
         ResumeRefused: The mutex is held, the lock changed since it was observed, or its
             holder is no longer provably gone. Refusing an uncertain recovery is preferable to
@@ -624,10 +644,13 @@ def _take_over_stale_lock(path: Path, seen: str, mine: str) -> bool:
             f"if no session is, delete {mutex} and resume again"
         ) from None
     try:
-        try:
-            os.write(fd, mine.encode())
-        finally:
-            os.close(fd)
+        os.write(fd, mine.encode())
+    except BaseException:
+        os.close(fd)
+        mutex.unlink(missing_ok=True)  # ours, and empty: no other session can own it
+        raise
+    os.close(fd)
+    try:
         try:
             current = _read_lock(path)
         except FileNotFoundError:
@@ -734,6 +757,20 @@ def _check_saved_row(row: Row, case: Case, mode: str, cases_path: Path) -> None:
             )
 
 
+def _saved_vs_now(name: str, saved: dict[str, Any], now: dict[str, Any]) -> str:
+    """One differing identity field, described for a resume refusal.
+
+    A changed database fingerprint names the databases that changed rather than printing both
+    full lists.
+    """
+    if name == "database_fingerprint" and name in saved:
+        try:
+            return f"{name} changed for {', '.join(fingerprint_changes(saved[name], now[name]))}"
+        except (TypeError, ValueError):
+            pass  # a malformed saved value: show it as it is
+    return f"{name} (saved {saved.get(name, '<missing>')!r}, now {now[name]!r})"
+
+
 def _load_for_resume(
     run_dir: Path, payload: IdentityPayload, config: RunConfig, cases: Sequence[Case]
 ) -> tuple[dict[str, Any], dict[str, Row]]:
@@ -759,10 +796,7 @@ def _load_for_resume(
     }
     differing += [name for name in ("mode", "case_count") if saved.get(name) != now[name]]
     if differing:
-        detail = "; ".join(
-            f"{name} (saved {saved.get(name, '<missing>')!r}, now {now[name]!r})"
-            for name in differing
-        )
+        detail = "; ".join(_saved_vs_now(name, saved, now) for name in differing)
         raise ResumeRefused(f"{run_dir}: identity differs from the saved manifest: {detail}")
 
     rows: dict[str, Row] = {}

@@ -36,8 +36,8 @@ from text_to_sql_agent.safety import _names_visible_cte
 # Bump when a change here would alter any generated record; the run manifest records it via
 # each suite's .source.json, so results from different conversions are never compared blind.
 # 2: expected_tables derived from the gold SQL (was always empty in 1).
-# 3: CTE names resolved per scope, so a nested CTE no longer hides an outer real table that
-#    shares its name, and a CTE body reading the table it shadows keeps that table.
+# 3: CTE names resolved per scope, by SQLite's rules: a nested CTE no longer hides an outer
+#    real table that shares its name, and a CTE body sees every sibling in its WITH list.
 ADAPTER_VERSION = "3"
 
 SPIDER_SUITE = "spider_dev"
@@ -74,9 +74,8 @@ def gold_tables(sql: str) -> list[str]:
     """Base tables ``sql`` reads: CTE references excluded, lowercased, deduplicated, sorted.
 
     Whether a reference names a CTE or a real table is decided at that reference's own
-    position by ``safety._names_visible_cte`` - the scope rules the validator and the
-    PostgreSQL qualification already use - never by a global set of CTE names: a nested CTE
-    must not hide an outer real table of the same name.
+    position (``_names_sqlite_cte``), never by a global set of CTE names: a nested CTE must not
+    hide an outer real table of the same name.
 
     Raises ``ValueError`` when ``sql`` is not exactly one parseable statement.
     """
@@ -89,9 +88,40 @@ def gold_tables(sql: str) -> list[str]:
     names = {
         str(table.name).lower()
         for table in statements[0].find_all(exp.Table)
-        if not _names_visible_cte(table, dialect="sqlite")
+        if not _names_sqlite_cte(table)
     }
     return sorted(name for name in names if name)
+
+
+def _names_sqlite_cte(table: exp.Table) -> bool:
+    """Whether bare ``table`` binds to a CTE at its position, by SQLite's own rules.
+
+    ``safety._names_visible_cte`` is the shared scope walk, so it is asked first: it decides
+    the main-query and nesting rules, and a CTE is never visible outside the query owning its
+    ``WITH``. Its sibling rule, though, is DuckDB's (only *earlier* siblings, plus the CTE itself
+    under ``RECURSIVE``), which SQLite does not follow: in SQLite every name in a ``WITH`` list
+    is visible inside every CTE body of that list - a later sibling (``WITH a AS (SELECT *
+    FROM b), b AS (...)`` reads the CTE ``b``) and the CTE's own name (which SQLite then
+    rejects as a circular reference unless it is a valid recursive CTE). That widening is
+    applied here, for gold-table extraction only; the validator's visibility rules, which are
+    security-relevant, are unchanged.
+    """
+    if _names_visible_cte(table, dialect="sqlite"):
+        return True
+    if table.args.get("db") or table.args.get("catalog"):
+        return False
+    name = str(table.name).lower()
+    node: exp.Expression = table
+    while node.parent is not None:
+        parent = node.parent
+        if (
+            isinstance(parent, exp.CTE)
+            and isinstance(parent.parent, exp.With)
+            and any(str(cte.alias_or_name).lower() == name for cte in parent.parent.expressions)
+        ):
+            return True
+        node = parent
+    return False
 
 
 def _expected_tables(

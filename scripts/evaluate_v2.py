@@ -47,6 +47,7 @@ from text_to_sql_agent.evaluation_v2.gates import (  # noqa: E402
     GateResult,
     PairedChange,
     RegressionRefused,
+    format_ids,
     gold_gate,
     regression_gate,
 )
@@ -66,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--subset", default="full", help="'full', or a subset name such as subset200"
     )
-    parser.add_argument("--mode", choices=["gold", "llm"], default="gold")
+    parser.add_argument("--mode", choices=["gold", "llm"], default=None, help="default: gold")
     parser.add_argument("--provider", choices=["gemini", "ollama"], default=DEFAULT_PROVIDER)
     parser.add_argument("--model", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--no-rag", action="store_true")
@@ -136,9 +137,9 @@ def _print_gate(result: GateResult) -> None:
         f"coverage {result.metrics['coverage']}"
     )
     if result.excepted:
-        print(f"  excepted ({len(result.excepted)}): {', '.join(result.excepted)}")
+        print(f"  excepted ({len(result.excepted)}): {format_ids(result.excepted)}")
     if result.stale_exceptions:
-        stale = ", ".join(result.stale_exceptions)
+        stale = format_ids(result.stale_exceptions)
         print(f"  stale exceptions (not reference_invalid this run): {stale}")
     for failure in result.failures:
         print(f"  FAILURE {failure}")
@@ -203,7 +204,7 @@ def _print_regression(result: GateResult) -> None:
         if failed:
             print(
                 f"  {label}: {len(failed)} generation failure(s), scored as not correct as in "
-                f"headline EX: {', '.join(failed)}"
+                f"headline EX: {format_ids(failed)}"
             )
     for failure in result.failures:
         print(f"  FAILURE {failure}")
@@ -230,7 +231,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.gate == "regression":
+        if args.suite or args.mode is not None:
+            parser.error("--gate regression compares two run directories: no --suite or --mode")
         return _regression(args, parser)
+    if args.new is not None or args.baseline is not None:
+        parser.error("--new and --baseline apply only to --gate regression")
+    if args.mode is None:
+        args.mode = "gold"
     if not args.suite:
         parser.error("the following arguments are required: --suite")
     if args.resume is not None and len(args.suite) != 1:

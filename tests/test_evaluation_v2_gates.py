@@ -667,6 +667,103 @@ def test_the_cli_regression_exit_codes_and_output(
     assert usage.value.code == 2
 
 
+def _rewrite_cases(run_dir: Path, **changes: dict[str, str]) -> None:
+    """Rewrite one column of chosen rows in a run's cases.csv: ``column={id: value}``."""
+    rows = runner.read_rows(run_dir / CASES_FILE)
+    for column, values in changes.items():
+        for row in rows:
+            if row["id"] in values:
+                row[column] = values[row["id"]]
+    write_rows(run_dir / CASES_FILE, rows)
+
+
+def test_a_comparison_where_every_reference_is_invalid_is_refused(tmp_path: Path) -> None:
+    ids = [f"c{i:03d}" for i in range(10)]
+    outcomes = dict.fromkeys(ids, "reference_invalid")
+    with pytest.raises(RegressionRefused, match="every answerable case is reference_invalid"):
+        _gate(tmp_path, outcomes, outcomes)
+
+
+def test_runs_whose_expected_column_disagrees_are_refused_naming_the_ids(tmp_path: Path) -> None:
+    old, new = _outcomes(30)
+    new_dir = make_run(tmp_path, "new", new, expected={"c003": "expect_refusal"})
+    old_dir = make_run(tmp_path, "old", old)
+    with pytest.raises(RegressionRefused, match="expected.*c003") as caught:
+        regression_gate(new_dir, old_dir)
+    assert "c004" not in str(caught.value)
+
+
+@pytest.mark.parametrize("side", ["new", "old"])
+def test_an_invalid_generation_failure_flag_is_refused(tmp_path: Path, side: str) -> None:
+    old, new = _outcomes(10)
+    dirs = {"new": make_run(tmp_path, "new", new), "old": make_run(tmp_path, "old", old)}
+    _rewrite_cases(dirs[side], generation_failure={"c002": "yes"})
+    with pytest.raises(RegressionRefused, match="generation_failure 'yes'"):
+        regression_gate(dirs["new"], dirs["old"])
+
+
+def test_failure_lines_state_points_not_percent(tmp_path: Path) -> None:
+    import re
+
+    old, new = _outcomes(200, wrong=set(range(20)))
+    result = _gate(tmp_path, old, new)
+    assert len(result.failures) == 2
+    assert all(re.search(r"\d%", line) is None for line in result.failures), result.failures
+    assert "] pp" in result.failures[0] and "10.0 points" in result.failures[1]
+
+
+def test_differing_database_fingerprints_name_the_changed_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    old, new = _outcomes(10)
+    same = ("data/y.db", "1" * 64)
+    new_dir = make_run(tmp_path, "new", new, database_fingerprint=(("data/x.db", "0" * 64), same))
+    old_dir = make_run(tmp_path, "old", old, database_fingerprint=(("data/x.db", "f" * 64), same))
+    with pytest.raises(RegressionRefused, match="data/x.db") as caught:
+        regression_gate(new_dir, old_dir)
+    assert "data/y.db" not in str(caught.value) and "f" * 64 not in str(caught.value)
+    assert (
+        cli.main(["--gate", "regression", "--baseline", str(old_dir), "--new", str(new_dir)]) == 2
+    )
+    err = capsys.readouterr().err
+    assert "data/x.db" in err and "data/y.db" not in err and "0" * 64 not in err
+
+
+def test_listed_ids_are_capped_at_twenty(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    old, new = _outcomes(100)
+    dead = frozenset(f"c{i:03d}" for i in range(30))
+    for case_id in dead:
+        new[case_id] = "error"
+    new_dir = make_run(tmp_path, "new", new, failures=dead)
+    old_dir = make_run(tmp_path, "old", old)
+    assert (
+        cli.main(["--gate", "regression", "--baseline", str(old_dir), "--new", str(new_dir)]) == 1
+    )
+    out = capsys.readouterr().out
+    assert "c019" in out and "c020" not in out and "... and 10 more" in out
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--suite", "demo", "--new", "x"],
+        ["--suite", "demo", "--baseline", "x"],
+        ["--gate", "gold", "--suite", "demo", "--new", "x"],
+        ["--gate", "regression", "--new", "x", "--baseline", "y", "--suite", "demo"],
+        ["--gate", "regression", "--new", "x", "--baseline", "y", "--mode", "gold"],
+    ],
+)
+def test_options_that_do_not_apply_are_refused_not_ignored(tmp_path: Path, argv: list[str]) -> None:
+    # `--out-root` keeps a regression (an option silently ignored, so a real run) out of
+    # evaluation/results/.
+    with pytest.raises(SystemExit) as usage:
+        cli.main([*argv, "--out-root", str(tmp_path / "out")])
+    assert usage.value.code == 2
+    assert not (tmp_path / "out").exists()
+
+
 def test_the_cli_reports_each_sides_generation_failures_beside_the_verdict(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

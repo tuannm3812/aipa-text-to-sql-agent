@@ -326,9 +326,13 @@ def test_resume_refuses_when_only_the_database_contents_changed(tmp_path: Path) 
         conn.execute("UPDATE facts SET n = 2")
         conn.commit()
 
-    with pytest.raises(ResumeRefused, match="database_fingerprint"):
+    with pytest.raises(ResumeRefused, match="database_fingerprint") as caught:
         run_suite(select_cases(config), config=config, out_root=out, resume_dir=run_dir)
     assert {p.name: p.read_bytes() for p in run_dir.iterdir()} == before
+    # The refusal names the database that changed, not two full fingerprint lists.
+    message = str(caught.value)
+    assert db.as_posix() in message
+    assert hashlib.sha256(db.read_bytes()).hexdigest() not in message
 
 
 def test_resume_refuses_a_saved_row_outside_the_selected_cases(tmp_path: Path) -> None:
@@ -1451,6 +1455,29 @@ def test_a_held_takeover_mutex_refuses_recovery(tmp_path: Path) -> None:
         run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=run_dir)
     assert (run_dir / ".lock").read_text(encoding="utf-8") == stale
     assert (run_dir / ".lock.takeover").read_text(encoding="utf-8") == "someone else\n"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError(28, "No space left on device"), KeyboardInterrupt()],
+    ids=["enospc", "interrupt"],
+)
+def test_a_failed_write_into_the_takeover_mutex_removes_it(
+    tmp_path: Path, failure: BaseException
+) -> None:
+    lock, mutex = tmp_path / ".lock", tmp_path / ".lock.takeover"
+    stale = _lock_line(_dead_pid(), "0" * 32)
+    lock.write_text(stale, encoding="utf-8")
+    with (
+        patch.object(runner.os, "write", side_effect=failure),
+        pytest.raises(type(failure)),
+    ):
+        runner._take_over_stale_lock(lock, stale, _lock_line(os.getpid(), "2" * 32))
+    assert not mutex.exists()  # an empty mutex would refuse every later recovery
+    assert lock.read_text(encoding="utf-8") == stale
+    with pytest.warns(runner.StaleLockWarning), runner._session_lock(tmp_path):
+        pass  # the next session can still recover the stale lock
+    assert not lock.exists()
 
 
 def test_release_leaves_a_lock_whose_token_is_not_this_sessions(tmp_path: Path) -> None:

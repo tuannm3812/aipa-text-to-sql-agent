@@ -21,11 +21,12 @@ model metric, so the gate never reports it (``metric_cells(..., gold=True)``).
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from text_to_sql_agent.evaluation_v2.contract import Case
-from text_to_sql_agent.evaluation_v2.identity import IDENTITY_FIELDS
+from text_to_sql_agent.evaluation_v2.identity import IDENTITY_FIELDS, fingerprint_changes
 from text_to_sql_agent.evaluation_v2.manifest import Manifest, read_manifest
 from text_to_sql_agent.evaluation_v2.report import Row, metric_cells
 from text_to_sql_agent.evaluation_v2.runner import (
@@ -195,6 +196,18 @@ COMPATIBILITY_FIELDS: tuple[str, ...] = tuple(
 
 RESAMPLES = 10_000
 SEED = 0
+# Lists of case IDs in messages stop here and say how many more there are.
+MAX_LISTED_IDS = 20
+_GENERATION_FAILURE_FLAGS = frozenset({"", "1"})
+
+
+def format_ids(ids: Sequence[str], limit: int = MAX_LISTED_IDS) -> str:
+    """``ids`` comma-separated, the first ``limit`` only, then ``... and N more``."""
+    shown = ", ".join(ids[:limit])
+    rest = len(ids) - limit
+    return f"{shown}, ... and {rest} more" if rest > 0 else shown
+
+
 # A drop of this many percentage points fails regardless of the interval (spec §4.5): it also
 # covers the 0/n and n/n cases, where a one-run interval has zero width.
 FLOOR_POINTS = 5
@@ -258,10 +271,26 @@ def compatible(new: Manifest, old: Manifest) -> list[str]:
     return differing
 
 
-def _field_value(manifest: Manifest, name: str) -> str:
+def _field_value(manifest: Manifest, name: str, other: Manifest) -> str:
     if name == "mode":
         return manifest.mode
+    if name == "database_fingerprint":
+        # Only the databases that differ from the other run, digests shortened: two full
+        # lists of eleven 64-digit hashes would hide which file changed.
+        mine = dict(manifest.identity.database_fingerprint)
+        theirs = dict(other.identity.database_fingerprint)
+        differing = sorted(p for p in mine.keys() | theirs.keys() if mine.get(p) != theirs.get(p))
+        return ", ".join(f"{p}={mine[p][:12] if p in mine else '(not used)'}" for p in differing)
     return str(getattr(manifest.identity, name))
+
+
+def _describe(name: str, new: Manifest, old: Manifest) -> str:
+    if name == "database_fingerprint":
+        changes = fingerprint_changes(
+            old.identity.database_fingerprint, new.identity.database_fingerprint
+        )
+        return f"{name} (baseline -> new: {'; '.join(changes)})"
+    return name
 
 
 def _load_run(directory: Path, label: str) -> tuple[Manifest, dict[str, Row]]:
@@ -282,6 +311,15 @@ def _load_run(directory: Path, label: str) -> tuple[Manifest, dict[str, Row]]:
             f"{label} run {directory} is not citable: {manifest.citable_reason}"
         )
     by_id = {row["id"]: row for row in rows}
+    bad_flags = [
+        row["id"] for row in rows if row["generation_failure"] not in _GENERATION_FAILURE_FLAGS
+    ]
+    if bad_flags:
+        raise RegressionRefused(
+            f"{label} run {directory}: generation_failure "
+            f"{by_id[bad_flags[0]]['generation_failure']!r} is neither '1' nor '' "
+            f"(cases {format_ids(bad_flags)}), so cases.csv was not written by the runner"
+        )
     if len(by_id) != len(rows):
         raise RegressionRefused(f"{label} run {directory}: cases.csv repeats a case id")
     if len(rows) != manifest.case_count:
@@ -326,9 +364,14 @@ def regression_gate(new_dir: Path, old_dir: Path) -> GateResult:
     differing = compatible(new_manifest, old_manifest)
     if differing:
         raise RegressionRefused(
-            "incompatible runs, differing in: " + ", ".join(differing),
+            "incompatible runs, differing in: "
+            + ", ".join(_describe(name, new_manifest, old_manifest) for name in differing),
             tuple(
-                (name, _field_value(new_manifest, name), _field_value(old_manifest, name))
+                (
+                    name,
+                    _field_value(new_manifest, name, old_manifest),
+                    _field_value(old_manifest, name, new_manifest),
+                )
                 for name in differing
             ),
         )
@@ -338,17 +381,29 @@ def regression_gate(new_dir: Path, old_dir: Path) -> GateResult:
     )
     if only_new or only_old:
         raise RegressionRefused(
-            f"case IDs differ: {len(only_new)} only in the new run {only_new[:5]}, "
-            f"{len(only_old)} only in the baseline {only_old[:5]}"
+            f"case IDs differ: {len(only_new)} only in the new run [{format_ids(only_new)}], "
+            f"{len(only_old)} only in the baseline [{format_ids(only_old)}]"
         )
 
     ids = sorted(new_rows)
+    disagree = [i for i in ids if new_rows[i]["expected"] != old_rows[i]["expected"]]
+    if disagree:
+        raise RegressionRefused(
+            f"the runs disagree on 'expected' for {len(disagree)} case(s): {format_ids(disagree)}"
+        )
     answerable = [i for i in ids if new_rows[i]["expected"] == "answerable"]
     others = [i for i in ids if new_rows[i]["expected"] != "answerable"]
 
     ex = _paired(answerable, new_rows, old_rows)
     if ex is None:
         raise RegressionRefused("no answerable case to compare; the verdict rests on EX")
+    if all(
+        new_rows[i]["outcome"] == old_rows[i]["outcome"] == "reference_invalid" for i in answerable
+    ):
+        raise RegressionRefused(
+            f"every answerable case is reference_invalid in both runs ({len(answerable)}): "
+            "with no valid reference the comparison measures nothing"
+        )
     safety = None if new_manifest.mode == "gold" else _paired(others, new_rows, old_rows)
 
     # Integer arithmetic: a drop of exactly 5 points must not depend on float rounding.
@@ -358,12 +413,13 @@ def regression_gate(new_dir: Path, old_dir: Path) -> GateResult:
     failures = []
     if below_zero:
         failures.append(
-            f"the 95% interval for the change in EX lies entirely below zero "
-            f"[{ex.interval.low:+.1%}, {ex.interval.high:+.1%}]"
+            "the 95 percent paired interval for the change in EX lies entirely below zero "
+            f"[{ex.interval.low * 100:+.1f}, {ex.interval.high * 100:+.1f}] pp"
         )
     if floor_breached:
         failures.append(
-            f"EX dropped {-ex.interval.point:.1%}, at or past the {FLOOR_POINTS}-point floor"
+            f"EX dropped {-ex.interval.point * 100 + 0.0:.1f} points, at or past the "
+            f"{FLOOR_POINTS}-point floor"
         )
 
     detail = RegressionDetail(

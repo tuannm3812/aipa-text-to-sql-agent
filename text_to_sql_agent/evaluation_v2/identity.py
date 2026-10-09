@@ -97,6 +97,29 @@ def fingerprint_from_json(value: Any) -> tuple[tuple[str, str], ...]:
     return tuple((str(path), str(digest)) for path, digest in value)
 
 
+def fingerprint_changes(old: Any, new: Any) -> list[str]:
+    """Which databases differ between two fingerprints, one short phrase each, by path.
+
+    Either side may be the tuple form or the JSON list form. A changed file reads
+    ``path (<old sha256[:12]> -> <new sha256[:12]>)``; a path on one side only reads
+    ``(no longer used)`` or ``(newly used)``. Empty when the two are equal.
+    """
+    before, after = dict(fingerprint_from_json(old)), dict(fingerprint_from_json(new))
+    changes = []
+    for path in sorted(before.keys() | after.keys()):
+        if path not in after:
+            changes.append(f"{path} (no longer used)")
+        elif path not in before:
+            changes.append(f"{path} (newly used)")
+        elif before[path] != after[path]:
+            changes.append(f"{path} ({before[path][:12]} -> {after[path][:12]})")
+    return changes
+
+
+# DSN schemes whose remainder is a database file path (as `engines.open_engine` passes it on).
+_FILE_SCHEMES = frozenset({"sqlite", "duckdb"})
+
+
 def database_fingerprint(
     db_paths: Iterable[str], *, root: Path = REPO_ROOT
 ) -> tuple[tuple[str, str], ...]:
@@ -104,24 +127,34 @@ def database_fingerprint(
 
     ``path`` is relative to ``root`` (POSIX separators) when the file is under it - so two
     checkouts holding identical copies get the same fingerprint - and absolute otherwise. A
-    relative ``db_path`` is resolved against ``root``. Each file is streamed through SHA-256
-    (``hashlib.file_digest``), never read whole: BIRD dev's databases total about 1.4 GB.
+    relative bare ``db_path`` is resolved against ``root``. A ``sqlite://`` or ``duckdb://`` DSN
+    names a file too: the scheme is stripped and that file is hashed (a relative remainder is
+    resolved against the working directory, where the engine opens it). Each file is streamed
+    through SHA-256 (``hashlib.file_digest``), never read whole: BIRD dev's databases total
+    about 1.4 GB.
 
     Raises:
-        ValueError: If a ``db_path`` is a ``scheme://`` DSN. A server database has no file to
-            hash, and an identity that silently skipped it would bind nothing.
+        ValueError: If a ``db_path`` is a server DSN (``postgresql://``) or another scheme with
+            no file behind it. A server-side fingerprint is not implemented, and an identity
+            that silently skipped the database would bind nothing.
         OSError: If a file cannot be read.
     """
     digests: dict[str, str] = {}
     for db_path in db_paths:
-        if "://" in db_path:
-            scheme = db_path.split("://", 1)[0]
-            raise ValueError(
-                f"cannot fingerprint a '{scheme}://' database: the run identity binds each "
-                "database file's contents, and only file-backed SQLite databases are supported"
-            )
-        path = Path(db_path)
-        full = path if path.is_absolute() else root / path
+        scheme, separator, rest = db_path.partition("://")
+        if separator:
+            if scheme not in _FILE_SCHEMES:
+                raise ValueError(
+                    f"cannot fingerprint a '{scheme}://' database: the run identity binds each "
+                    "database's contents, and a server-side fingerprint is not implemented "
+                    f"(file-backed {', '.join(f'{s}://' for s in sorted(_FILE_SCHEMES))} "
+                    "databases and bare paths are supported)"
+                )
+            path = Path(rest)
+            full = path if path.is_absolute() else Path.cwd() / path
+        else:
+            path = Path(db_path)
+            full = path if path.is_absolute() else root / path
         try:
             key = full.relative_to(root).as_posix()
         except ValueError:
