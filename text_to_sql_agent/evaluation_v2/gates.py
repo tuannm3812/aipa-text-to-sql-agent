@@ -39,7 +39,7 @@ class GateResult:
     """The gate's verdict and everything it was judged on.
 
     ``failures`` is empty exactly when ``passed``. ``excepted`` are the ``reference_invalid``
-    IDs the exception list covers; ``stale_exceptions`` are listed IDs that were not
+    IDs the exception list covers; ``stale_exceptions`` are listed IDs in the suite that were not
     ``reference_invalid`` this run (informational: a fixed reference leaves a stale entry, and
     the list should then be pruned). ``metrics`` are the gold-mode report cells for the whole
     suite, keyed as ``report.COLUMNS``.
@@ -60,15 +60,29 @@ def load_exceptions(path: Path | None) -> frozenset[str]:
     """The IDs in an exception list: one per line, ``#`` starts a comment, blanks ignored.
 
     ``None`` is an empty list. A path that does not exist raises ``OSError``: a gate that
-    silently treated a missing list as empty would also pass a typo'd filename.
+    silently treated a missing list as empty would also pass a typo'd filename. A line that
+    holds more than one ID (whitespace or a comma) raises ``ValueError`` naming the line,
+    rather than becoming an ID that matches nothing.
     """
     if path is None:
         return frozenset()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"{path}: no exception list - create an empty {path.name} to declare no exceptions"
+        ) from exc
     ids: set[str] = set()
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line_no, line in enumerate(text.splitlines(), start=1):
         entry = line.split("#", 1)[0].strip()
-        if entry:
-            ids.add(entry)
+        if not entry:
+            continue
+        if len(entry.split()) != 1 or "," in entry:
+            raise ValueError(
+                f"{path}:{line_no}: expected one ID per line, got {entry!r} "
+                "(put a reason after '#')"
+            )
+        ids.add(entry)
     return frozenset(ids)
 
 
@@ -137,13 +151,18 @@ def gold_gate(
     rows = result.rows
     invalid = {row["id"] for row in rows if row["outcome"] == "reference_invalid"}
     failures = judge(cases, rows, excepted_ids)
+    known = {case.id for case in cases}
+    failures.extend(
+        f"{case_id}: on the exception list but not in the suite (typo or removed case)"
+        for case_id in sorted(excepted_ids - known)
+    )
     answerable = sum(1 for case in cases if case.expected == "answerable")
     return GateResult(
         suite=name,
         passed=not failures,
         failures=tuple(failures),
         excepted=tuple(sorted(invalid & excepted_ids)),
-        stale_exceptions=tuple(sorted(excepted_ids - invalid)),
+        stale_exceptions=tuple(sorted((excepted_ids & known) - invalid)),
         answerable=answerable,
         non_answerable=len(cases) - answerable,
         metrics=metric_cells(rows, gold=True),
