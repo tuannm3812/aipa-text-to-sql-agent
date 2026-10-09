@@ -165,11 +165,13 @@ legacy `rows_match`:
   text `'None'` or `''`.
 - Text compares **exactly** after trimming surrounding whitespace — case is
   preserved, because `'A'` and `'a'` are different answers.
-- Numbers compare as numbers across `int`/`float`/`Decimal`. When **both**
-  values are integral (`int`, or a float/Decimal with no fractional part)
-  they compare **exactly** — a count of `10,000,000` is not a count of
+- Numbers compare as numbers across `int`/`float`/`Decimal`. When **at least
+  one side is an `int` or a `Decimal`** and both values are integral, they
+  compare **exactly** — a count of `10,000,000` is not a count of
   `10,000,001`, whatever the relative tolerance would allow (implementer's
-  finding, 2026-10-09). Otherwise they are equal when
+  finding, 2026-10-09). A float/float pair always uses the tolerance, because
+  every float at or above 2^52 is "integral" yet still carries rounding noise
+  (review finding, same day). Otherwise they are equal when
   `abs(a - b) <= 1e-6 * max(1, abs(a), abs(b))`, so a float `SUM()` of
   `100.00000001` still matches an integral gold `100`. An integer-valued
   float equals its integer. Text never equals a number; `bool` is its own
@@ -179,9 +181,14 @@ legacy `rows_match`:
 - Unordered equality is a **one-to-one matching** of rows under the cell
   predicate above — not a sort-then-compare, because a relative tolerance is
   not a total order and two rows can tie on a numeric cell while differing on
-  a text one. The implementation finds a perfect matching (backtracking over
-  candidate pairs; result sets here are small) and treats an ambiguous
-  candidate set exactly, never greedily.
+  a text one. The implementation groups rows by their exact cells, accepts a
+  sorted pairing only when it proves equality, and otherwise finds a perfect
+  matching with Hopcroft–Karp (polynomial; a dense 1,000-row group takes
+  under a second). It never decides greedily.
+- A top-level `ORDER BY` on a non-unique key makes tied rows order-sensitive,
+  so an equal answer that orders ties differently is rejected. This is
+  Spider's known weakness and is accepted knowingly; reference queries should
+  add a tie-breaker where ties are plausible.
 - Order matters **iff the gold SQL has a top-level `ORDER BY`** (Spider's
   rule, applied to both suites); otherwise rows are compared unordered.
 - Column *names* are ignored, column *count* must match, and columns are
