@@ -1,26 +1,40 @@
 """Convert Spider 1.0 dev and BIRD dev into the v2 case contract, and draw subsets.
 
-Pure functions on already-parsed JSON. Downloading, hashing and unpacking live in
-``scripts/prepare_benchmarks.py``; nothing here touches the network or the filesystem.
+Pure functions on already-parsed JSON. Downloading, hashing, unpacking and opening the
+databases live in ``scripts/prepare_benchmarks.py``; nothing here touches the network or the
+filesystem. What the adapters need from the databases - each one's real table names - is
+passed in as data.
 
 ``db_path`` is ``<db_root>/<db_id>/<db_id>.sqlite`` with ``db_root`` relative to the repository
 root (for example ``data/benchmarks/spider/database``), so a generated suite file names the
 same database on every machine. ``load_suite`` does not check that the file exists, by
 design: a suite can be validated, hashed and subset without the data present.
+
+``expected_tables`` is derived from the gold SQL: every base table the query reads, CTE names
+excluded, lowercased, deduplicated and sorted, and each one checked against the database's
+real table names. A gold query that reads a table the database does not have, or that does
+not parse, is a conversion error naming the case - never a silently shorter list. Names are
+lowercased because SQLite table names are case-insensitive and Spider's gold SQL spells them
+freely (``CAR_MAKERS`` for ``car_makers``); whoever compares them must lowercase too.
 """
 
 from __future__ import annotations
 
 import random
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any, get_args
+
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import SqlglotError
 
 from text_to_sql_agent.evaluation_v2.contract import Case, Hardness, SuiteError, _parse_record
 
 # Bump when a change here would alter any generated record; the run manifest records it via
 # each suite's .source.json, so results from different conversions are never compared blind.
-ADAPTER_VERSION = "1"
+# 2: expected_tables derived from the gold SQL (was always empty in 1).
+ADAPTER_VERSION = "2"
 
 SPIDER_SUITE = "spider_dev"
 BIRD_SUITE = "bird_dev"
@@ -42,13 +56,49 @@ def _require_str(suite: str, position: int, record: Any, field: str) -> str:
     return value
 
 
-def _db_path(suite: str, db_root: Path, db_id: str) -> str:
+def database_path(db_root: Path, db_id: str, *, suite: str) -> str:
+    """The repo-relative ``db_path`` for ``db_id``; rejects anything that is not portable."""
     if db_root.is_absolute():
         raise SuiteError(f"{suite}: db_root must be relative to the repository root: {db_root}")
     # Reject anything that would let a db_id escape db_root ("../x", "a/b").
     if db_id in {".", ".."} or "/" in db_id or "\\" in db_id:
         raise SuiteError(f"{suite}: db_id '{db_id}' is not a plain directory name")
     return str(PurePosixPath(db_root.as_posix()) / db_id / f"{db_id}.sqlite")
+
+
+def gold_tables(sql: str) -> list[str]:
+    """Base tables ``sql`` reads: CTE names excluded, lowercased, deduplicated, sorted.
+
+    Raises ``ValueError`` when ``sql`` is not exactly one parseable statement.
+    """
+    try:
+        statements = [s for s in sqlglot.parse(sql, read="sqlite") if s is not None]
+    except SqlglotError as exc:
+        raise ValueError(f"gold SQL does not parse: {exc}") from exc
+    if len(statements) != 1:
+        raise ValueError(f"gold SQL must be one statement, found {len(statements)}")
+    tree = statements[0]
+    ctes = {str(cte.alias_or_name).lower() for cte in tree.find_all(exp.CTE)}
+    names = {str(table.name).lower() for table in tree.find_all(exp.Table)}
+    return sorted(name for name in names if name and name not in ctes)
+
+
+def _expected_tables(
+    suite: str, case_id: str, db_id: str, sql: str, tables: Mapping[str, Collection[str]]
+) -> list[str]:
+    if db_id not in tables:
+        raise SuiteError(f"{suite} case {case_id}: no table list for database '{db_id}'")
+    try:
+        read = gold_tables(sql)
+    except ValueError as exc:
+        raise SuiteError(f"{suite} case {case_id}: {exc}") from exc
+    real = {name.lower() for name in tables[db_id]}
+    missing = [name for name in read if name not in real]
+    if missing:
+        raise SuiteError(
+            f"{suite} case {case_id}: gold SQL reads {missing}, not tables of database '{db_id}'"
+        )
+    return read
 
 
 def _to_case(suite: str, position: int, record: dict[str, Any]) -> Case:
@@ -68,15 +118,19 @@ def _check_unique(suite: str, cases: list[Case]) -> list[Case]:
 
 
 def spider_to_cases(
-    dev: list[dict[str, Any]], *, db_root: Path, hardness: Mapping[str, str]
+    dev: list[dict[str, Any]],
+    *,
+    db_root: Path,
+    hardness: Mapping[str, str],
+    tables: Mapping[str, Collection[str]],
 ) -> list[Case]:
     """Spider ``dev.json`` records as cases.
 
     ``id`` is the record's 0-based position in ``dev.json`` (Spider has no question ID of its
     own, and every Spider tool indexes dev this way). ``hardness`` maps that ID to the official
-    label, precomputed with ``spider_hardness.spider_hardness``. Spider has no evidence, so
-    ``evidence`` is ``""``. ``expected_tables`` is left empty: deriving it needs the database's
-    own table-name spelling, which a pure adapter does not have.
+    label, precomputed with ``spider_hardness.spider_hardness``. ``tables`` maps each ``db_id``
+    to its database's real table names, for ``expected_tables``. Spider has no evidence, so
+    ``evidence`` is ``""``.
     """
     cases: list[Case] = []
     for position, record in enumerate(dev):
@@ -93,25 +147,30 @@ def spider_to_cases(
                 {
                     "suite": SPIDER_SUITE,
                     "id": case_id,
-                    "db_path": _db_path(SPIDER_SUITE, db_root, db_id),
+                    "db_path": database_path(db_root, db_id, suite=SPIDER_SUITE),
                     "question": question,
                     "evidence": "",
                     "gold_sql": query,
                     "hardness": hardness[case_id],
                     "expected": "answerable",
-                    "expected_tables": [],
+                    "expected_tables": _expected_tables(
+                        SPIDER_SUITE, case_id, db_id, query, tables
+                    ),
                 },
             )
         )
     return _check_unique(SPIDER_SUITE, cases)
 
 
-def bird_to_cases(dev: list[dict[str, Any]], *, db_root: Path) -> list[Case]:
+def bird_to_cases(
+    dev: list[dict[str, Any]], *, db_root: Path, tables: Mapping[str, Collection[str]]
+) -> list[Case]:
     """BIRD dev records as cases.
 
     ``id`` is BIRD's own ``question_id``. ``evidence`` is carried verbatim (``null`` becomes
     ``""``; the 2025-11-06 dataset card allows either). ``difficulty`` maps through
-    ``BIRD_HARDNESS``; an unknown value is an error, not a default.
+    ``BIRD_HARDNESS``; an unknown value is an error, not a default. ``tables`` maps each
+    ``db_id`` to its database's real table names, for ``expected_tables``.
     """
     cases: list[Case] = []
     for position, record in enumerate(dev):
@@ -136,20 +195,21 @@ def bird_to_cases(dev: list[dict[str, Any]], *, db_root: Path) -> list[Case]:
             raise SuiteError(
                 f"{BIRD_SUITE} source record {position}: field 'evidence' must be a string"
             )
+        case_id = str(question_id)
         cases.append(
             _to_case(
                 BIRD_SUITE,
                 position,
                 {
                     "suite": BIRD_SUITE,
-                    "id": str(question_id),
-                    "db_path": _db_path(BIRD_SUITE, db_root, db_id),
+                    "id": case_id,
+                    "db_path": database_path(db_root, db_id, suite=BIRD_SUITE),
                     "question": question,
                     "evidence": evidence,
                     "gold_sql": sql,
                     "hardness": BIRD_HARDNESS[difficulty],
                     "expected": "answerable",
-                    "expected_tables": [],
+                    "expected_tables": _expected_tables(BIRD_SUITE, case_id, db_id, sql, tables),
                 },
             )
         )

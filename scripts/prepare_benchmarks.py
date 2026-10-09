@@ -30,12 +30,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import urllib.request
 import zipfile
 from collections import Counter
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,10 +51,14 @@ if str(ROOT_DIR) not in sys.path:
 
 # Imports below must follow the sys.path insert above, hence E402.
 from text_to_sql_agent import is_safe_query  # noqa: E402
+from text_to_sql_agent.engines import Engine, open_engine  # noqa: E402
 from text_to_sql_agent.evaluation_v2 import Case, SuiteError, load_suite  # noqa: E402
 from text_to_sql_agent.evaluation_v2.adapters import (  # noqa: E402
     ADAPTER_VERSION,
+    BIRD_SUITE,
+    SPIDER_SUITE,
     bird_to_cases,
+    database_path,
     draw_subset,
     spider_to_cases,
 )
@@ -193,6 +201,17 @@ def fetch(download: Download, downloads: Path, *, override: Path | None = None) 
     return target
 
 
+@contextmanager
+def open_zip(path: Path) -> Iterator[zipfile.ZipFile]:
+    """``zipfile.ZipFile(path)``, with a corrupt archive reported as a ``PrepareError``."""
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise PrepareError(f"{path} is not a readable zip archive: {exc}") from exc
+    with archive:
+        yield archive
+
+
 def extract_member(archive: zipfile.ZipFile, member: str, target: Path) -> None:
     """Copy one named member out of ``archive``; names are built here, never taken from it."""
     try:
@@ -200,19 +219,50 @@ def extract_member(archive: zipfile.ZipFile, member: str, target: Path) -> None:
     except KeyError as exc:
         raise PrepareError(f"{archive.filename}: missing expected member {member}") from exc
     target.parent.mkdir(parents=True, exist_ok=True)
-    with archive.open(info) as source, target.open("wb") as out:
-        shutil.copyfileobj(source, out, _CHUNK)
+    try:
+        with archive.open(info) as source, target.open("wb") as out:
+            shutil.copyfileobj(source, out, _CHUNK)
+    except zipfile.BadZipFile as exc:
+        raise PrepareError(f"{archive.filename}: corrupt member {member}: {exc}") from exc
 
 
-def extract_databases(archive: zipfile.ZipFile, prefix: str, cases: list[Case]) -> None:
-    """Extract each case's SQLite file from ``<prefix>/<db_id>/<db_id>.sqlite``."""
-    for db_path in sorted({case.db_path for case in cases}):
+def database_paths(dev: list[Any], db_root: Path, suite: str) -> dict[str, str]:
+    """``db_id`` -> repo-relative ``db_path`` for every database the source records name.
+
+    Records without a usable ``db_id`` are skipped here; the adapter rejects them with a
+    message naming the record once the databases they do name are available.
+    """
+    db_ids = {
+        record["db_id"]
+        for record in dev
+        if isinstance(record, dict) and isinstance(record.get("db_id"), str) and record["db_id"]
+    }
+    return {db_id: database_path(db_root, db_id, suite=suite) for db_id in sorted(db_ids)}
+
+
+def extract_databases(
+    archive: zipfile.ZipFile, prefix: str, paths: dict[str, str]
+) -> dict[str, list[str]]:
+    """Extract ``<prefix>/<db_id>/<db_id>.sqlite`` for each database; return its table names."""
+    tables: dict[str, list[str]] = {}
+    for db_id, db_path in paths.items():
         target = ROOT_DIR / db_path
-        db_id = target.parent.name
         extract_member(archive, f"{prefix}/{db_id}/{db_id}.sqlite", target)
         with target.open("rb") as handle:
             if handle.read(len(SQLITE_MAGIC)) != SQLITE_MAGIC:
                 raise PrepareError(f"{target} is not a SQLite database")
+        tables[db_id] = table_names(target)
+    return tables
+
+
+def table_names(path: Path) -> list[str]:
+    """Every table and view name in a SQLite file, read through a read-only connection."""
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name"
+        ).fetchall()
+    return [str(name) for (name,) in rows]
 
 
 def relative_to_repo(path: Path) -> Path:
@@ -258,17 +308,20 @@ def source_block(download: Download, release: str, licence: str) -> dict[str, An
 def prepare_spider(dest: Path, archive: Path | None) -> tuple[list[Case], dict[str, Any]]:
     path = fetch(SPIDER_ARCHIVE, dest / "_downloads", override=archive)
     root = dest / "spider"
-    with zipfile.ZipFile(path) as zf:
+    with open_zip(path) as zf:
         try:
             raw = zf.read("spider_data/dev.json")
         except KeyError as exc:
             raise PrepareError(f"{path}: missing spider_data/dev.json") from exc
         dev = json.loads(raw)
-        hardness = {str(i): spider_hardness(record["sql"]) for i, record in enumerate(dev)}
-        cases = spider_to_cases(dev, db_root=relative_to_repo(root) / "database", hardness=hardness)
-        root.mkdir(parents=True, exist_ok=True)
-        (root / "dev.json").write_bytes(raw)
-        extract_databases(zf, "spider_data/database", cases)
+        db_root = relative_to_repo(root) / "database"
+        tables = extract_databases(
+            zf, "spider_data/database", database_paths(dev, db_root, SPIDER_SUITE)
+        )
+    hardness = {str(i): spider_hardness(record["sql"]) for i, record in enumerate(dev)}
+    cases = spider_to_cases(dev, db_root=db_root, hardness=hardness, tables=tables)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "dev.json").write_bytes(raw)
     source = source_block(SPIDER_ARCHIVE, SPIDER_RELEASE, SPIDER_LICENCE)
     source["licence_source"] = SPIDER_LICENCE_SOURCE
     return cases, source
@@ -282,35 +335,73 @@ def prepare_bird(dest: Path, archive: Path | None) -> tuple[list[Case], dict[str
     licence = read_card_licence(card)
     root = dest / "bird"
     dev = json.loads(questions.read_text(encoding="utf-8"))
-    cases = bird_to_cases(dev, db_root=relative_to_repo(root) / "dev_databases")
-    root.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(questions, root / BIRD_QUESTIONS.filename)
+    db_root = relative_to_repo(root) / "dev_databases"
+    paths = database_paths(dev, db_root, BIRD_SUITE)
     # The databases are a zip inside the zip; spill it to a temporary file next to the
     # cache (so it shares a filesystem with the destination), extract, and remove it.
-    with zipfile.ZipFile(path) as outer, tempfile.TemporaryDirectory(dir=downloads) as tmp:
+    with open_zip(path) as outer, tempfile.TemporaryDirectory(dir=downloads) as tmp:
         inner_path = Path(tmp) / "dev_databases.zip"
         extract_member(outer, BIRD_DATABASES_MEMBER, inner_path)
-        with zipfile.ZipFile(inner_path) as inner:
-            extract_databases(inner, "dev_databases", cases)
+        with open_zip(inner_path) as inner:
+            tables = extract_databases(inner, "dev_databases", paths)
+    cases = bird_to_cases(dev, db_root=db_root, tables=tables)
+    root.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(questions, root / BIRD_QUESTIONS.filename)
     source = source_block(BIRD_ARCHIVE, BIRD_RELEASE, licence)
     source["questions_url"] = BIRD_QUESTIONS.url
     source["questions_sha256"] = BIRD_QUESTIONS.sha256
     source["licence_source"] = BIRD_LICENCE_SOURCE
+    source["licence_source_sha256"] = BIRD_CARD.sha256
     return cases, source
 
 
+def write_atomically(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def write_suite(suite: str, cases: list[Case], source: dict[str, Any], suites: Path) -> Path:
+    """Write the suite and its source block; neither is touched unless both are sound.
+
+    The suite goes to ``<suite>.jsonl.tmp`` first and replaces ``<suite>.jsonl`` only after
+    loading back to exactly ``cases``, so a failed check never leaves a half-written suite.
+    """
     suites.mkdir(parents=True, exist_ok=True)
     path = suites / f"{suite}.jsonl"
+    tmp = path.with_name(path.name + ".tmp")
     text = "".join(json.dumps(asdict(case), ensure_ascii=False) + "\n" for case in cases)
-    path.write_text(text, encoding="utf-8")
-    loaded = load_suite(path)  # the same check every later run applies
-    if loaded != cases:
-        raise PrepareError(f"{path} does not load back to the cases that were written")
-    (suites / f"{suite}.source.json").write_text(
-        json.dumps(source, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        if load_suite(tmp) != cases:  # the same check every later run applies
+            raise PrepareError(f"{tmp} does not load back to the cases that were written")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    write_source(suites / f"{suite}.source.json", source)
     return path
+
+
+def write_source(path: Path, source: dict[str, Any]) -> None:
+    """Write ``source`` unless only ``unpacked_at`` differs from what is already there.
+
+    ``.source.json`` is tracked; rewriting it for a new timestamp alone would leave the tree
+    dirty after every byte-identical rerun. The kept timestamp is the first unpack that
+    produced this exact provenance.
+    """
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        existing = None
+    if isinstance(existing, dict):
+        stamp = "unpacked_at"
+        if {k: v for k, v in existing.items() if k != stamp} == {
+            k: v for k, v in source.items() if k != stamp
+        }:
+            print(f"source   {path} unchanged")
+            return
+    write_atomically(path, json.dumps(source, indent=2, ensure_ascii=False) + "\n")
+    print(f"source   {path} written")
 
 
 def write_subset(suite: str, cases: list[Case], size: int, seed: int, suites: Path) -> Path:
@@ -325,17 +416,35 @@ def write_subset(suite: str, cases: list[Case], size: int, seed: int, suites: Pa
             )
         print(f"subset   {path} reproduced")
     else:
-        path.write_text(text, encoding="utf-8")
+        write_atomically(path, text)
         print(f"subset   {path} written")
     by_id = {case.id: case.hardness for case in cases}
     print(f"         hardness {dict(sorted(Counter(by_id[i] for i in ids).items()))}")
     return path
 
 
+def refused_gold(cases: list[Case]) -> list[str]:
+    """IDs whose gold SQL ``is_safe_query`` refuses, checked as ``run_gold`` checks it.
+
+    ``run_gold`` passes the case's own engine, so this does too; nothing is executed.
+    """
+    engines: dict[str, Engine] = {}
+    refused: list[str] = []
+    for case in cases:
+        if case.db_path not in engines:
+            engines[case.db_path] = open_engine(str(ROOT_DIR / case.db_path))
+        if not is_safe_query(case.gold_sql, engine=engines[case.db_path]):
+            refused.append(case.id)
+    return refused
+
+
 def summarise(suite: str, cases: list[Case]) -> None:
     hardness = dict(sorted(Counter(case.hardness for case in cases).items()))
-    refused = [case.id for case in cases if not is_safe_query(case.gold_sql)]
+    refused = refused_gold(cases)
+    covered = sum(1 for case in cases if case.expected_tables)
+    widest = max(len(case.expected_tables) for case in cases)
     print(f"{suite}: {len(cases)} cases, hardness {hardness}")
+    print(f"         expected_tables: {covered} cases with >= 1 table, max {widest} per case")
     print(f"         gold refused by is_safe_query: {len(refused)} {refused[:10]}")
 
 

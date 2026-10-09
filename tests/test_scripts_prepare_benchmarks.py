@@ -247,3 +247,100 @@ def test_bird_card_without_a_licence_is_refused(
     place_bird_side_files(repo, monkeypatch, "---\ntask_categories: [qa]\n---\n")
     assert run("--suite", "bird_dev", "--archive", str(archive)) == 1
     assert "declares no license" in capsys.readouterr().err
+
+
+def test_bird_source_records_the_dataset_card_hash(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = bird_zip(tmp_path)
+    pin(monkeypatch, "BIRD_ARCHIVE", archive)
+    place_bird_side_files(repo, monkeypatch, "---\nlicense: cc-by-sa-4.0\n---\n")
+    assert run("--suite", "bird_dev", "--archive", str(archive)) == 0
+    source = json.loads((repo / "evaluation" / "suites" / "bird_dev.source.json").read_text())
+    assert source["licence_source_sha256"] == script.BIRD_CARD.sha256
+    cases = load_suite(repo / "evaluation" / "suites" / "bird_dev.jsonl")
+    assert [c.expected_tables for c in cases] == [
+        ("member",),
+        ("superhero",),
+        ("expense", "member"),
+    ]
+
+
+# --- Re-runs, atomic writes, corrupt archives, the safety count -----------------------------
+
+
+def test_a_byte_identical_rerun_leaves_source_json_untouched(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = spider_zip(tmp_path)
+    pin(monkeypatch, "SPIDER_ARCHIVE", archive)
+    source = repo / "evaluation" / "suites" / "spider_dev.source.json"
+    assert run("--suite", "spider_dev", "--archive", str(archive)) == 0
+    first = source.read_bytes()
+    monkeypatch.setattr(script, "now_utc", lambda: "2099-01-01T00:00:00+00:00")
+    assert run("--suite", "spider_dev", "--archive", str(archive)) == 0
+    assert source.read_bytes() == first  # the old unpacked_at is kept
+
+
+def test_a_changed_provenance_field_rewrites_source_json(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = spider_zip(tmp_path)
+    pin(monkeypatch, "SPIDER_ARCHIVE", archive)
+    source = repo / "evaluation" / "suites" / "spider_dev.source.json"
+    assert run("--suite", "spider_dev", "--archive", str(archive)) == 0
+    monkeypatch.setattr(script, "now_utc", lambda: "2099-01-01T00:00:00+00:00")
+    monkeypatch.setattr(script, "SPIDER_RELEASE", "spider-1.0 dev (re-released)")
+    assert run("--suite", "spider_dev", "--archive", str(archive)) == 0
+    written = json.loads(source.read_text())
+    assert written["release"] == "spider-1.0 dev (re-released)"
+    assert written["unpacked_at"] == "2099-01-01T00:00:00+00:00"
+
+
+def test_a_failed_load_back_leaves_the_previous_suite_and_no_temp_file(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = spider_zip(tmp_path)
+    pin(monkeypatch, "SPIDER_ARCHIVE", archive)
+    suites = repo / "evaluation" / "suites"
+    suites.mkdir(parents=True)
+    (suites / "spider_dev.jsonl").write_text("previous\n")
+
+    def broken_load(path: Path) -> list[Any]:
+        assert path.name == "spider_dev.jsonl.tmp"  # checked before it replaces anything
+        return []
+
+    monkeypatch.setattr(script, "load_suite", broken_load)
+    assert run("--suite", "spider_dev", "--archive", str(archive)) == 1
+    assert (suites / "spider_dev.jsonl").read_text() == "previous\n"
+    assert not (suites / "spider_dev.jsonl.tmp").exists()
+    assert not (suites / "spider_dev.source.json").exists()
+
+
+def test_a_corrupt_archive_is_an_error_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    archive = tmp_path / "spider_data.zip"
+    archive.write_bytes(b"this is not a zip archive")
+    pin(monkeypatch, "SPIDER_ARCHIVE", archive)  # the hash matches; the contents do not unzip
+    assert run("--suite", "spider_dev", "--archive", str(archive)) == 1
+    assert "is not a readable zip archive" in capsys.readouterr().err
+
+
+def test_the_refused_gold_count_passes_each_case_its_own_engine(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = spider_zip(tmp_path)
+    pin(monkeypatch, "SPIDER_ARCHIVE", archive)
+    seen: list[tuple[str, object]] = []
+
+    def recording_is_safe_query(sql: str, *, engine: object = None) -> bool:
+        seen.append((sql, engine))
+        return True
+
+    monkeypatch.setattr(script, "is_safe_query", recording_is_safe_query)
+    assert run("--suite", "spider_dev", "--archive", str(archive)) == 0
+    assert len(seen) == 3
+    assert all(engine is not None for _, engine in seen)
+    # One engine per database: records 1 and 2 share shop_mini.
+    assert seen[1][1] is seen[2][1] and seen[0][1] is not seen[1][1]

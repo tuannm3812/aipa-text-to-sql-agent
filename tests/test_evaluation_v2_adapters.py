@@ -7,7 +7,9 @@ which use each benchmark's real field names. No network, no real benchmark data.
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections import Counter
+from contextlib import closing
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,7 @@ from text_to_sql_agent.evaluation_v2.adapters import (
     BIRD_HARDNESS,
     bird_to_cases,
     draw_subset,
+    gold_tables,
     spider_to_cases,
 )
 
@@ -27,6 +30,21 @@ FIXTURES = Path("tests/fixtures")  # relative to REPO_ROOT, as a real db_root is
 SPIDER_ROOT = FIXTURES / "spider_mini" / "database"
 BIRD_ROOT = FIXTURES / "bird_mini" / "dev_databases"
 SPIDER_HARDNESS = {"0": "easy", "1": "medium", "2": "hard"}
+
+
+def real_tables(db_root: Path) -> dict[str, list[str]]:
+    """Each fixture database's table names, read the way the prepare script reads them."""
+    tables: dict[str, list[str]] = {}
+    for db in sorted((REPO_ROOT / db_root).iterdir()):
+        uri = f"{(db / f'{db.name}.sqlite').as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as conn:
+            rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        tables[db.name] = [name for (name,) in rows]
+    return tables
+
+
+SPIDER_TABLES = real_tables(SPIDER_ROOT)
+BIRD_TABLES = real_tables(BIRD_ROOT)
 
 
 def spider_dev() -> list[dict[str, Any]]:
@@ -38,11 +56,13 @@ def bird_dev() -> list[dict[str, Any]]:
 
 
 def spider_cases() -> list[Case]:
-    return spider_to_cases(spider_dev(), db_root=SPIDER_ROOT, hardness=SPIDER_HARDNESS)
+    return spider_to_cases(
+        spider_dev(), db_root=SPIDER_ROOT, hardness=SPIDER_HARDNESS, tables=SPIDER_TABLES
+    )
 
 
 def bird_cases() -> list[Case]:
-    return bird_to_cases(bird_dev(), db_root=BIRD_ROOT)
+    return bird_to_cases(bird_dev(), db_root=BIRD_ROOT, tables=BIRD_TABLES)
 
 
 def round_trip(tmp_path: Path, cases: list[Case]) -> list[Case]:
@@ -63,7 +83,6 @@ def test_spider_maps_each_record_to_the_contract() -> None:
         assert case.question == record["question"]
         assert case.gold_sql == record["query"]
         assert case.expected == "answerable"
-        assert case.expected_tables == ()
     assert [c.hardness for c in cases] == ["easy", "medium", "hard"]
 
 
@@ -87,13 +106,18 @@ def test_spider_cases_load_back_through_load_suite(tmp_path: Path) -> None:
 
 def test_spider_record_without_a_hardness_label_is_rejected() -> None:
     with pytest.raises(SuiteError, match="no hardness label"):
-        spider_to_cases(spider_dev(), db_root=SPIDER_ROOT, hardness={"0": "easy"})
+        spider_to_cases(
+            spider_dev(), db_root=SPIDER_ROOT, hardness={"0": "easy"}, tables=SPIDER_TABLES
+        )
 
 
 def test_spider_hardness_label_outside_the_contract_is_rejected() -> None:
     with pytest.raises(SuiteError, match="hardness"):
         spider_to_cases(
-            spider_dev(), db_root=SPIDER_ROOT, hardness={**SPIDER_HARDNESS, "1": "trivial"}
+            spider_dev(),
+            db_root=SPIDER_ROOT,
+            hardness={**SPIDER_HARDNESS, "1": "trivial"},
+            tables=SPIDER_TABLES,
         )
 
 
@@ -109,7 +133,6 @@ def test_bird_maps_each_record_to_the_contract() -> None:
         assert case.question == record["question"]
         assert case.gold_sql == record["SQL"]
         assert case.expected == "answerable"
-        assert case.expected_tables == ()
 
 
 def test_bird_difficulty_maps_to_contract_hardness() -> None:
@@ -142,14 +165,14 @@ def test_bird_unknown_difficulty_is_rejected_not_defaulted() -> None:
     dev = bird_dev()
     dev[1]["difficulty"] = "extreme"
     with pytest.raises(SuiteError, match="unknown difficulty 'extreme'"):
-        bird_to_cases(dev, db_root=BIRD_ROOT)
+        bird_to_cases(dev, db_root=BIRD_ROOT, tables=BIRD_TABLES)
 
 
 def test_bird_duplicate_question_id_is_rejected() -> None:
     dev = bird_dev()
     dev[2]["question_id"] = dev[0]["question_id"]
     with pytest.raises(SuiteError, match="duplicate case id '100'"):
-        bird_to_cases(dev, db_root=BIRD_ROOT)
+        bird_to_cases(dev, db_root=BIRD_ROOT, tables=BIRD_TABLES)
 
 
 @pytest.mark.parametrize("value", ["7", True, None])
@@ -157,7 +180,92 @@ def test_bird_question_id_must_be_an_integer(value: object) -> None:
     dev = bird_dev()
     dev[0]["question_id"] = value
     with pytest.raises(SuiteError, match="question_id"):
-        bird_to_cases(dev, db_root=BIRD_ROOT)
+        bird_to_cases(dev, db_root=BIRD_ROOT, tables=BIRD_TABLES)
+
+
+# --- expected_tables -----------------------------------------------------------------------
+
+
+def test_spider_expected_tables_come_from_the_gold_sql_including_subqueries() -> None:
+    # Record 2 reads employee only inside a NOT IN subquery; it still counts.
+    assert [c.expected_tables for c in spider_cases()] == [
+        ("pets",),
+        ("employee",),
+        ("employee", "shop"),
+    ]
+
+
+def test_bird_expected_tables_come_from_the_gold_sql() -> None:
+    assert [c.expected_tables for c in bird_cases()] == [
+        ("member",),
+        ("superhero",),
+        ("expense", "member"),
+    ]
+
+
+def bird_with_gold(sql: str) -> Case:
+    dev = bird_dev()
+    dev[0]["SQL"] = sql
+    return bird_to_cases(dev, db_root=BIRD_ROOT, tables=BIRD_TABLES)[0]
+
+
+def test_a_cte_name_is_not_an_expected_table() -> None:
+    case = bird_with_gold(
+        "WITH big_spenders AS (SELECT member_id FROM expense WHERE cost > 10) "
+        "SELECT COUNT(*) FROM big_spenders JOIN member USING (member_id)"
+    )
+    assert case.expected_tables == ("expense", "member")
+
+
+def test_a_self_join_yields_one_table() -> None:
+    case = bird_with_gold(
+        "SELECT a.name FROM member AS a JOIN member AS b ON a.member_id < b.member_id"
+    )
+    assert case.expected_tables == ("member",)
+
+
+def test_expected_tables_are_lowercased_deduplicated_and_sorted() -> None:
+    case = bird_with_gold(
+        "SELECT COUNT(*) FROM Member JOIN EXPENSE ON EXPENSE.member_id = Member.member_id "
+        "WHERE Member.member_id IN (SELECT member_id FROM member)"
+    )
+    assert case.expected_tables == ("expense", "member")
+
+
+def test_a_gold_query_reading_no_table_has_no_expected_tables() -> None:
+    assert bird_with_gold("SELECT 1").expected_tables == ()
+
+
+def test_a_table_the_database_does_not_have_is_a_conversion_error_naming_the_case() -> None:
+    with pytest.raises(SuiteError, match=r"bird_dev case 100: gold SQL reads \['members'\]"):
+        bird_with_gold("SELECT COUNT(*) FROM members")
+
+
+def test_a_table_from_another_database_is_a_conversion_error() -> None:
+    # superhero exists, but in hero_mini, not in this case's club_mini.
+    with pytest.raises(SuiteError, match="not tables of database 'club_mini'"):
+        bird_with_gold("SELECT COUNT(*) FROM superhero")
+
+
+def test_an_unparseable_gold_query_is_a_conversion_error_naming_the_case() -> None:
+    with pytest.raises(SuiteError, match="bird_dev case 100: gold SQL does not parse"):
+        bird_with_gold("SELECT FROM WHERE (")
+
+
+def test_a_multi_statement_gold_query_is_a_conversion_error() -> None:
+    with pytest.raises(SuiteError, match="must be one statement"):
+        bird_with_gold("SELECT 1 FROM member; SELECT 2 FROM member")
+
+
+def test_a_database_missing_from_the_table_map_is_a_conversion_error() -> None:
+    tables = {k: v for k, v in BIRD_TABLES.items() if k != "hero_mini"}
+    with pytest.raises(SuiteError, match="case 205: no table list for database 'hero_mini'"):
+        bird_to_cases(bird_dev(), db_root=BIRD_ROOT, tables=tables)
+
+
+def test_gold_tables_on_its_own() -> None:
+    assert gold_tables("WITH t AS (SELECT 1) SELECT * FROM t") == []
+    assert gold_tables("SELECT * FROM `Card Games` AS c") == ["card games"]
 
 
 # --- Shared source-record validation --------------------------------------------------------
@@ -169,12 +277,14 @@ def test_a_record_missing_db_id_raises_suite_error(adapter: str) -> None:
         dev = spider_dev()
         del dev[1]["db_id"]
         with pytest.raises(SuiteError, match="record 1: field 'db_id' is missing"):
-            spider_to_cases(dev, db_root=SPIDER_ROOT, hardness=SPIDER_HARDNESS)
+            spider_to_cases(
+                dev, db_root=SPIDER_ROOT, hardness=SPIDER_HARDNESS, tables=SPIDER_TABLES
+            )
     else:
         dev = bird_dev()
         del dev[1]["db_id"]
         with pytest.raises(SuiteError, match="record 1: field 'db_id' is missing"):
-            bird_to_cases(dev, db_root=BIRD_ROOT)
+            bird_to_cases(dev, db_root=BIRD_ROOT, tables=BIRD_TABLES)
 
 
 @pytest.mark.parametrize(
@@ -186,14 +296,16 @@ def test_a_blank_required_source_field_raises_suite_error(adapter: str, field: s
     dev[0][field] = "   "
     with pytest.raises(SuiteError, match=f"field '{field}' must be a non-empty string"):
         if adapter == "spider":
-            spider_to_cases(dev, db_root=SPIDER_ROOT, hardness=SPIDER_HARDNESS)
+            spider_to_cases(
+                dev, db_root=SPIDER_ROOT, hardness=SPIDER_HARDNESS, tables=SPIDER_TABLES
+            )
         else:
-            bird_to_cases(dev, db_root=BIRD_ROOT)
+            bird_to_cases(dev, db_root=BIRD_ROOT, tables=BIRD_TABLES)
 
 
 def test_an_absolute_db_root_is_rejected_so_suite_files_stay_portable() -> None:
     with pytest.raises(SuiteError, match="relative to the repository root"):
-        bird_to_cases(bird_dev(), db_root=REPO_ROOT / BIRD_ROOT)
+        bird_to_cases(bird_dev(), db_root=REPO_ROOT / BIRD_ROOT, tables=BIRD_TABLES)
 
 
 @pytest.mark.parametrize("db_id", ["..", "../etc", "a/b", "a\\b"])
@@ -201,12 +313,12 @@ def test_a_db_id_that_would_escape_db_root_is_rejected(db_id: str) -> None:
     dev = bird_dev()
     dev[0]["db_id"] = db_id
     with pytest.raises(SuiteError, match="not a plain directory name"):
-        bird_to_cases(dev, db_root=BIRD_ROOT)
+        bird_to_cases(dev, db_root=BIRD_ROOT, tables=BIRD_TABLES)
 
 
 def test_an_empty_source_is_rejected() -> None:
     with pytest.raises(SuiteError, match="no records"):
-        bird_to_cases([], db_root=BIRD_ROOT)
+        bird_to_cases([], db_root=BIRD_ROOT, tables=BIRD_TABLES)
 
 
 # --- draw_subset ----------------------------------------------------------------------------
