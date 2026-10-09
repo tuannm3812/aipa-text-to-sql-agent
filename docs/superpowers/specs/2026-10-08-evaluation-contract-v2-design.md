@@ -328,6 +328,21 @@ model metric and is reported only for model runs; gold mode never claims it.
   and off), `safety` and `demo` in full — about 600 LLM calls.
 - **Release:** the full dev sets, once per version, producing the dated
   results the README cites.
+- **Execution budget (decided 2026-10-09 from Task 5's measurements).** The
+  app's demo guards — 100,000 SQLite VM steps and 1,000 rows — are not
+  evaluation budgets: at those limits 89 of 200 BIRD references abort or
+  truncate. Public suites run with `--work-limit 100000000 --max-rows 50000`,
+  values that are part of the run identity and the manifest, so a run at a
+  different budget is a different run by construction. At that budget every
+  Spider reference executes and all but two BIRD references do: #701 (about
+  14.6 billion VM steps, beyond SQLite's `set_progress_handler` ceiling of
+  2,147,483,647) and #1131 (about 1.6 billion). Both go on
+  `bird_dev.gold_exceptions.txt` as `reference_invalid` — still in the
+  headline denominator, listed by ID — because disabling the guard
+  (`--work-limit 0`) would leave an LLM run with no defence against a runaway
+  generated join. The pipeline gained optional `work_limit`/`max_rows`
+  pass-through arguments for this; left unset, the app's behaviour is
+  unchanged.
 - **CI gate (every push, no provider, no network):** `--mode gold` over every
   suite whose data is present. `safety` and `demo` always run; the public
   subsets run only when the archives are cached on the runner and otherwise

@@ -43,7 +43,9 @@ Every task's requirements implicitly include this section.
   `gemini_12_case_quota_notes.md` keep their bytes; a test pins their hashes.
 - **Legacy stays legacy.** `text_to_sql_agent/evaluation.py`, `evaluation/cases.json`,
   `scripts/evaluate_text_to_sql.py` and `tests/test_evaluation.py` are not modified except to
-  add the `SCORER_V1_VERSION` constant.
+  add the `SCORER_V1_VERSION` constant — and, authorised on 2026-10-09 after Task 5's
+  measurements, optional `work_limit`/`max_rows` keyword arguments on `run_gold` (and on the
+  two pipeline entry points) that default to the existing behaviour.
 - **Error codes are `SCREAMING_SNAKE_CASE` constants.** The refusal codes a safety case may
   expect are exactly `BLOCKED_UNSAFE_SQL` and `BLOCKED_UNSUPPORTED_COLUMN_TYPE`; the
   unanswerable sentinel is `UNANSWERABLE_WITH_GIVEN_SCHEMA`.
