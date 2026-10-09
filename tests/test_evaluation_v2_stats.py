@@ -87,3 +87,26 @@ def test_paired_noise_includes_zero_and_is_deterministic() -> None:
     iv = paired_bootstrap_ci(new, old, seed=1)
     assert iv.low < 0 < iv.high
     assert iv == paired_bootstrap_ci(new, old, seed=1)
+
+
+def test_different_seeds_move_at_least_one_bound_at_realistic_n() -> None:
+    """Bounds sit on a grid of achievable rates, so two seeds can coincide at
+    small n; at n = 1,500 the grid is ~0.0007 wide and five seeds cannot all
+    agree on both bounds unless the seed is being ignored.
+    """
+    successes = [i % 3 != 0 for i in range(1_500)]
+    bounds = {
+        (bootstrap_ci(successes, seed=seed).low, bootstrap_ci(successes, seed=seed).high)
+        for seed in range(5)
+    }
+    assert len(bounds) > 1
+
+
+def test_non_boolean_indicators_are_coerced_not_summed() -> None:
+    assert bootstrap_ci([2, 0, 2]).point == pytest.approx(2 / 3)
+    assert bootstrap_ci([2, 0, 2]).high <= 1.0
+
+
+def test_a_single_resample_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        bootstrap_ci([True, False], resamples=1)

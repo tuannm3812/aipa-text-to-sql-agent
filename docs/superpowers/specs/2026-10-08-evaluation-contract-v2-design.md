@@ -225,7 +225,7 @@ Reported per run, overall and per hardness:
 
 Every rate carries a **bootstrap 95% confidence interval**: 10,000 resamples
 over cases, seed fixed, percentile method. Implemented in
-`text_to_sql_agent/evaluation.py` with no new dependency (`random` and the
+`text_to_sql_agent/evaluation_v2/stats.py` with no new dependency (`random` and the
 standard library suffice; NumPy is not added for one function).
 
 ### 4.4 Manifest and result files

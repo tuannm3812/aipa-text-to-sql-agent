@@ -55,8 +55,8 @@ def _interval(values: Sequence[float], *, resamples: int, seed: int) -> Interval
     n = len(values)
     if n == 0:
         raise ValueError("cannot compute an interval over zero cases")
-    if resamples < 1:
-        raise ValueError("resamples must be at least 1")
+    if resamples < 2:  # one resample is a point, not an interval
+        raise ValueError("resamples must be at least 2")
     rng = random.Random(seed)
     means = sorted(sum(rng.choices(values, k=n)) / n for _ in range(resamples))
     return Interval(
@@ -76,7 +76,9 @@ def bootstrap_ci(successes: Sequence[bool], *, resamples: int = 10_000, seed: in
     every case succeeds or none does, ``low == high == point``. Raises ``ValueError`` on empty
     input.
     """
-    return _interval([float(s) for s in successes], resamples=resamples, seed=seed)
+    # bool() first: a stray 2 or "False" must not become a rate of 2.0 or a ValueError
+    # from float() - the indicator is correct/not-correct, nothing else.
+    return _interval([float(bool(s)) for s in successes], resamples=resamples, seed=seed)
 
 
 def paired_bootstrap_ci(
@@ -91,5 +93,5 @@ def paired_bootstrap_ci(
     """
     if len(new) != len(old):
         raise ValueError(f"paired runs differ in length: {len(new)} vs {len(old)}")
-    diffs = [float(a) - float(b) for a, b in zip(new, old, strict=True)]
+    diffs = [float(bool(a)) - float(bool(b)) for a, b in zip(new, old, strict=True)]
     return _interval(diffs, resamples=resamples, seed=seed)
