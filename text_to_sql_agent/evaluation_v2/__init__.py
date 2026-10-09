@@ -19,6 +19,7 @@ from text_to_sql_agent.evaluation_v2.scoring import (
     Outcome,
     score_v2,
 )
+from text_to_sql_agent.evaluation_v2.stats import Interval, bootstrap_ci, paired_bootstrap_ci
 
 # Later tasks add their own names here.
 __all__ = [
@@ -28,10 +29,13 @@ __all__ = [
     "Case",
     "Expected",
     "Hardness",
+    "Interval",
     "Outcome",
     "SuiteError",
+    "bootstrap_ci",
     "gold_has_order_by",
     "load_suite",
+    "paired_bootstrap_ci",
     "rows_equal_v2",
     "score_v2",
     "suite_sha256",
