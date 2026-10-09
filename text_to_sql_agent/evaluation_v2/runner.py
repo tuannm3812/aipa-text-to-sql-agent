@@ -13,6 +13,15 @@
 4. writes ``report.md`` and the final manifest, ``complete`` only when every selected case
    has a terminal row and none is ``outage``.
 
+A session holds an exclusive lock file (``.lock``, created with ``O_CREAT | O_EXCL``, holding
+the pid) for the whole loop, so two concurrent ``--resume`` sessions on one run cannot both
+proceed; a lock left by a killed process is reported, naming its pid, never silently broken.
+
+Relative ``db_path`` values are resolved against the project root (``identity.REPO_ROOT``,
+the directory holding this package): every suite writes them repo-relative, so a run started
+from another working directory reads the same databases instead of failing to open any. Each
+distinct database is checked reachable before a directory is allocated.
+
 The full-file checkpoint rewrites ``cases.csv`` once per case. On BIRD dev's 1,534 cases
 that is 1,534 rewrites of a file that never exceeds a few hundred kilobytes - noise beside one
 LLM call per case, and it means a crash at any instant leaves either the previous checkpoint
@@ -25,14 +34,16 @@ import csv
 import dataclasses
 import hashlib
 import io
+import os
 import platform
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, get_args
 
 from text_to_sql_agent.config import DEFAULT_MAX_ROWS, DEFAULT_RAG_TOP_K
 from text_to_sql_agent.dsn import redact_dsn
@@ -40,6 +51,7 @@ from text_to_sql_agent.engines import Engine, open_engine
 from text_to_sql_agent.evaluation import run_gold
 from text_to_sql_agent.evaluation_v2.contract import Case, load_suite, suite_sha256
 from text_to_sql_agent.evaluation_v2.identity import (
+    REPO_ROOT,
     IdentityPayload,
     allocate_run_dir,
     config_label,
@@ -59,7 +71,12 @@ from text_to_sql_agent.evaluation_v2.manifest import (
     write_manifest,
 )
 from text_to_sql_agent.evaluation_v2.report import Row, write_report
-from text_to_sql_agent.evaluation_v2.scoring import SCORER_V2_VERSION, score_v2
+from text_to_sql_agent.evaluation_v2.scoring import (
+    SCORER_V2_VERSION,
+    UNANSWERABLE,
+    Outcome,
+    score_v2,
+)
 from text_to_sql_agent.llm import _assemble_prompt
 from text_to_sql_agent.pipeline import ask_database_with_sql
 from text_to_sql_agent.rag import retrieve_schema_context
@@ -68,6 +85,7 @@ from text_to_sql_agent.types import QueryResult
 MANIFEST_FILE = "manifest.json"
 CASES_FILE = "cases.csv"
 REPORT_FILE = "report.md"
+LOCK_FILE = ".lock"
 
 # Stable: the regression gate (Task 7) aligns two runs' rows by `id`, and the Streamlit tab
 # reads these names. Add columns at the end; never rename or reorder.
@@ -92,14 +110,29 @@ OUTAGE = "outage"
 # no model, so the case is neither correct nor wrong.
 NOT_APPLICABLE = "not_applicable"
 
+# The outcomes a saved row may carry, per mode. A gold run self-compares references, so it
+# can produce only these four; a model run can produce every `Outcome`, `outage` included.
+_ALLOWED_OUTCOMES: dict[str, frozenset[str]] = {
+    "llm": frozenset(get_args(Outcome)),
+    "gold": frozenset({"correct", "wrong", "reference_invalid", NOT_APPLICABLE}),
+}
+
+# The documented budget for public suites (README; Task 5 measurements): every Spider subset
+# reference and all but two BIRD subset references execute under it. Quoted when a public
+# suite is run without an explicit budget - it is a documented convention, not a code default.
+PUBLIC_SUITE_BUDGET = "--work-limit 100000000 --max-rows 50000"
+
 # Provider failures worth retrying, and - once the retries are spent - recorded as `outage`
 # rather than as a model failure: rate limits and quota (429), server errors (5xx),
 # overload, timeouts, and a provider that refused the connection (a local Ollama that is
-# down). The v1 script's markers, minus its bare "rate", which matched "generate".
+# down). The v1 script's markers, minus its bare "rate", which matched "generate". A bare
+# "unavailable" is deliberately absent: "model unavailable" can be permanent (a retired model)
+# and would then be an outage forever; a 503 or "overloaded" beside it is what makes it
+# transient, and those match on their own.
 _RETRYABLE = re.compile(
     r"\b(?:429|50[0-4])\b"
     r"|resource[_ ]exhausted|quota|rate[ _-]?limit|too many requests"
-    r"|unavailable|overloaded|timed? ?out|deadline"
+    r"|overloaded|timed? ?out|deadline"
     r"|connect(?:ion)?(?:error| refused| reset| aborted)",
     re.IGNORECASE,
 )
@@ -167,11 +200,15 @@ def select_cases(config: RunConfig) -> list[Case]:
     """The suite's cases, filtered to the subset when one is named, in suite order.
 
     Raises:
-        ValueError: If a subset ID is not in the suite, or ``subset`` and ``subset_path``
-            disagree about whether this is a full run.
+        ValueError: If the file's suite is not ``config.suite``, a subset ID is not in the
+            suite, or ``subset`` and ``subset_path`` disagree about whether this is a full run.
     """
     _check_subset_config(config)
     cases = load_suite(config.suite_path)
+    if cases[0].suite != config.suite:  # `load_suite` guarantees one suite per file
+        raise ValueError(
+            f"{config.suite_path} holds suite '{cases[0].suite}', not '{config.suite}'"
+        )
     if config.subset_path is None:
         return cases
     wanted = read_subset_ids(config.subset_path)
@@ -188,6 +225,17 @@ def select_cases(config: RunConfig) -> list[Case]:
 def _check_subset_config(config: RunConfig) -> None:
     if (config.subset == "full") != (config.subset_path is None):
         raise ValueError("subset must be 'full' exactly when no subset_path is given")
+
+
+def resolve_db_path(db_path: str) -> str:
+    """A suite's ``db_path`` made independent of the working directory.
+
+    A DSN (``scheme://...``) or an absolute path is returned unchanged; a relative path is
+    resolved against the project root, where every suite's relative paths are rooted.
+    """
+    if "://" in db_path or Path(db_path).is_absolute():
+        return db_path
+    return str(REPO_ROOT / db_path)
 
 
 def _prompt_sha256(engine: Engine) -> str:
@@ -226,8 +274,26 @@ def build_identity(
     if config.max_rows is not None and config.max_rows < 1:
         raise ValueError("max_rows must be >= 1")
     source = load_source(config.suite_path)
+    if source["kind"] == "download" and (config.work_limit is None or config.max_rows is None):
+        raise ValueError(
+            f"suite '{config.suite}' is a public benchmark: give an explicit execution budget "
+            f"({PUBLIC_SUITE_BUDGET} is the documented one). The engine defaults are the "
+            "hosted demo's guards and would abort valid references."
+        )
     commit, dirty = git_state()
-    engines = [open_engine(db_path) for db_path in sorted({case.db_path for case in cases})]
+    engines = []
+    for db_path in sorted({case.db_path for case in cases}):
+        engine = open_engine(db_path)
+        try:
+            engine.check_reachable()
+        except Exception as exc:
+            # Refused before any directory exists: otherwise every reference is
+            # `reference_invalid` and the run completes, citable, at EX 0 % under the same
+            # identity hash as a healthy run.
+            raise ValueError(
+                f"database {redact_dsn(db_path)} is unreachable: {_error_text(exc)}"
+            ) from exc
+        engines.append(engine)
     prompt_sha256 = _single({_prompt_sha256(e) for e in engines}, "system prompts")
     default_work_limit = _single({e.default_work_limit for e in engines}, "work limits")
     gold = config.mode == "gold"
@@ -313,6 +379,7 @@ def _ask_model(
     attempt = 0
     while True:
         started = time.perf_counter()
+        repair_errors: list[Exception] = []
         try:
             sql, result = ask_database_with_sql(
                 question,
@@ -324,6 +391,7 @@ def _ask_model(
                 max_repair_attempts=config.max_repair_attempts,
                 work_limit=config.work_limit,
                 max_rows=config.max_rows,
+                on_repair_error=repair_errors.append,
             )
         except Exception as exc:
             # A harness-side failure outside generation (unreachable database, schema
@@ -331,15 +399,24 @@ def _ask_model(
             elapsed = (time.perf_counter() - started) * 1000
             return "", QueryResult(columns=[], rows=[], error=_error_text(exc)), 1, False, elapsed
         elapsed = (time.perf_counter() - started) * 1000
-        if not _is_generation_failure(sql, result) or not _RETRYABLE.search(result.error or ""):
+        # A provider failure is either the first generation raising, or the *repair* call
+        # raising after the first SQL failed - the pipeline swallows the latter and returns
+        # the execution error, which would otherwise read as the model's fault.
+        provider_error: str | None = None
+        if _is_generation_failure(sql, result):
+            provider_error = result.error
+        elif repair_errors:
+            provider_error = f"repair: {_error_text(repair_errors[-1])}"
+        if provider_error is None or not _RETRYABLE.search(provider_error):
             # A provider error that does *not* look transient - an unknown provider, a missing
             # SDK, a rejected API key, an unknown model - is `error`, not `outage`. Retrying
             # or resuming would reproduce it identically, so as an outage it would keep the run
             # incomplete forever; as an error it is counted and visible in the outcome table,
-            # where a misconfigured run shows as every case failing.
+            # and a run in which no case produced SQL is not citable (`Manifest.citable`).
             return sql, result, attempt + 1, False, elapsed
         if attempt >= config.max_retries:
-            return sql, result, attempt + 1, True, elapsed
+            outage = QueryResult(columns=[], rows=[], sql=result.sql, error=provider_error)
+            return sql, outage, attempt + 1, True, elapsed
         time.sleep(config.retry_base_seconds * (2**attempt))
         attempt += 1
 
@@ -382,12 +459,14 @@ def evaluate_case(case: Case, config: RunConfig) -> Row:
             outcome = NOT_APPLICABLE
         else:
             generated_sql = case.gold_sql
-            outcome = score_v2(case, gold_result, gold_result)
+            outcome = score_v2(case, gold_result, gold_result, generated_sql=case.gold_sql)
             error = gold_result.error
             latency = f"{gold_ms:.2f}"
     else:
         generated_sql, result, tries, outage, ms = _ask_model(case, question, config)
-        outcome = OUTAGE if outage else score_v2(case, result, gold_result)
+        outcome = (
+            OUTAGE if outage else score_v2(case, result, gold_result, generated_sql=generated_sql)
+        )
         # For an invalid reference the reference's error is the one that explains the row.
         error = (
             gold_result.error
@@ -439,8 +518,52 @@ def read_rows(path: Path) -> list[Row]:
         return list(reader)
 
 
+@contextmanager
+def _session_lock(run_dir: Path) -> Iterator[None]:
+    """Hold ``run_dir/.lock`` for one session; refuse if another session holds it.
+
+    ``O_CREAT | O_EXCL`` makes taking the lock atomic. It is released on every exit path,
+    ``KeyboardInterrupt`` included; only a hard kill leaves it behind, and then the refusal
+    names the pid so a person can confirm the process is gone before deleting the file.
+    """
+    path = run_dir / LOCK_FILE
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        try:
+            holder = path.read_text(encoding="utf-8").strip() or "unknown"
+        except OSError:
+            holder = "unknown"
+        raise ResumeRefused(
+            f"{run_dir} is locked by another session (pid {holder}, {path}); if that process "
+            "is no longer running the lock is stale - delete the file and resume again"
+        ) from None
+    try:
+        os.write(fd, f"{os.getpid()}\n".encode())
+        os.close(fd)
+        yield
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def _check_saved_row(row: Row, case: Case, mode: str, cases_path: Path) -> None:
+    """Refuse a saved row that the runner could not have written for this case and mode."""
+    allowed = _ALLOWED_OUTCOMES[mode]
+    if row["outcome"] not in allowed:
+        raise ResumeRefused(
+            f"{cases_path}: row '{case.id}' has outcome {row['outcome']!r}, which a {mode} "
+            f"run never writes (allowed: {', '.join(sorted(allowed))})"
+        )
+    for field in ("suite", "expected", "hardness"):
+        if row[field] != getattr(case, field):
+            raise ResumeRefused(
+                f"{cases_path}: row '{case.id}' has {field} {row[field]!r}, but the case "
+                f"says {getattr(case, field)!r}"
+            )
+
+
 def _load_for_resume(
-    run_dir: Path, payload: IdentityPayload, config: RunConfig, selected: Sequence[str]
+    run_dir: Path, payload: IdentityPayload, config: RunConfig, cases: Sequence[Case]
 ) -> tuple[dict[str, Any], dict[str, Row]]:
     """The saved manifest and rows, after every check that makes resuming safe."""
     manifest_path = run_dir / MANIFEST_FILE
@@ -457,10 +580,13 @@ def _load_for_resume(
     ):
         raise ResumeRefused(f"{manifest_path}: 'started' or 'duration_s' is missing or ill-typed")
     differing = identity_diff(saved, payload)
-    if saved.get("mode") != config.mode:
-        differing.append("mode")
+    now: dict[str, Any] = {
+        **dataclasses.asdict(payload),
+        "mode": config.mode,
+        "case_count": len(cases),
+    }
+    differing += [name for name in ("mode", "case_count") if saved.get(name) != now[name]]
     if differing:
-        now = {**dataclasses.asdict(payload), "mode": config.mode}
         detail = "; ".join(
             f"{name} (saved {saved.get(name, '<missing>')!r}, now {now[name]!r})"
             for name in differing
@@ -474,17 +600,54 @@ def _load_for_resume(
             saved_rows = read_rows(cases_path)
         except (OSError, ValueError) as exc:
             raise ResumeRefused(f"{cases_path}: unreadable: {exc}") from exc
-        chosen = set(selected)
+        by_id = {case.id: case for case in cases}
         for row in saved_rows:
             if row["id"] in rows:
                 raise ResumeRefused(f"{cases_path}: case '{row['id']}' appears twice")
             rows[row["id"]] = row
-        unknown = [case_id for case_id in rows if case_id not in chosen]
+        unknown = [case_id for case_id in rows if case_id not in by_id]
         if unknown:
             raise ResumeRefused(
                 f"{cases_path}: saved rows are not in the selected cases: {', '.join(unknown[:10])}"
             )
+        for case_id, row in rows.items():
+            _check_saved_row(row, by_id[case_id], config.mode, cases_path)
     return saved, rows
+
+
+def _check_selection(cases: Sequence[Case], config: RunConfig) -> None:
+    """Refuse ``cases`` unless they are exactly ``select_cases(config)``, in order.
+
+    The identity names a suite and a subset; a caller-supplied list that differs from that
+    selection would be recorded - and could complete, citable - under a name it does not match.
+    """
+    expected = select_cases(config)
+    if list(cases) == expected:
+        return
+    given_ids = [case.id for case in cases]
+    expected_ids = [case.id for case in expected]
+    if given_ids != expected_ids:
+        missing = [i for i in expected_ids if i not in set(given_ids)]
+        extra = [i for i in given_ids if i not in set(expected_ids)]
+        raise ValueError(
+            f"cases are not the selection for suite '{config.suite}' subset '{config.subset}': "
+            f"{len(given_ids)} given, {len(expected_ids)} selected; missing "
+            f"{', '.join(missing[:10]) or 'none'}; extra {', '.join(extra[:10]) or 'none'}"
+            + ("; same IDs in a different order" if not missing and not extra else "")
+        )
+    changed = [g.id for g, e in zip(cases, expected, strict=True) if g != e]
+    raise ValueError(f"cases differ from the suite file's records: {', '.join(changed[:10])}")
+
+
+def _validator_reached(rows: Sequence[Row]) -> int:
+    """Terminal rows whose SQL reached the validator: non-blank and not the sentinel."""
+    return sum(
+        1
+        for row in rows
+        if row["outcome"] != OUTAGE
+        and row["generated_sql"].strip()
+        and row["error"] != UNANSWERABLE
+    )
 
 
 def run_suite(
@@ -496,48 +659,69 @@ def run_suite(
 ) -> RunResult:
     """Run ``cases`` into a new directory under ``out_root``, or resume ``resume_dir``.
 
-    On resume: every saved terminal row is kept, and the cases that are unattempted or
-    ``outage`` are run, each exactly once.
+    ``cases`` must be exactly ``select_cases(config)``. On resume: every saved terminal row is
+    kept, and the cases that are unattempted or ``outage`` are run, each exactly once.
 
     Raises:
-        ResumeRefused: If ``resume_dir`` is not an incomplete run of the same identity, or
-            holds rows for cases outside ``cases``. Nothing is written.
-        ValueError: If ``cases`` is empty, repeats an ID, belongs to another suite, or the
-            suite's ``.source.json`` is missing or malformed. Nothing is written.
+        ResumeRefused: If ``resume_dir`` is locked by another session, is not an incomplete
+            run of the same identity and case count, or holds rows that are foreign to
+            ``cases`` or that this mode never writes. Nothing is written.
+        ValueError: If ``cases`` is not the configured selection, the budget is unusable or
+            missing for a public suite, a database is unreachable, or the suite's
+            ``.source.json`` is missing or malformed. Nothing is written.
     """
     cases = list(cases)
     if not cases:
         raise ValueError("no cases selected")
-    foreign = sorted({case.suite for case in cases if case.suite != config.suite})
-    if foreign:
-        raise ValueError(f"cases belong to suite(s) {foreign}, not '{config.suite}'")
-    ids = [case.id for case in cases]
-    if len(set(ids)) != len(ids):
-        raise ValueError("selected cases repeat an ID")
+    _check_selection(cases, config)
+    cases = [dataclasses.replace(case, db_path=resolve_db_path(case.db_path)) for case in cases]
 
     payload, source = build_identity(cases, config)
     # From here on the budget is explicit: the identity's resolved values are the ones passed
     # to every reference and model query, never a default looked up again later.
     config = dataclasses.replace(config, work_limit=payload.work_limit, max_rows=payload.max_rows)
-    session_started = time.monotonic()
     if resume_dir is None:
         started = datetime.now(UTC).replace(microsecond=0)
         label = config_label(
             use_rag=config.use_rag, rag_top_k=config.rag_top_k, evidence=config.evidence
         )
         run_dir = allocate_run_dir(out_root, payload, started=started, config=label)
-        started_iso = started.isoformat()
-        prior_duration = 0.0
-        rows: dict[str, Row] = {}
     else:
         run_dir = resume_dir
-        saved, rows = _load_for_resume(run_dir, payload, config, ids)
-        started_iso = str(saved["started"])
-        prior_duration = float(saved["duration_s"])
+        if not run_dir.is_dir():
+            raise ResumeRefused(f"{run_dir}: not a directory")
 
+    with _session_lock(run_dir):
+        if resume_dir is None:
+            started_iso = started.isoformat()
+            prior_duration = 0.0
+            rows: dict[str, Row] = {}
+        else:
+            saved, rows = _load_for_resume(run_dir, payload, config, cases)
+            started_iso = str(saved["started"])
+            prior_duration = float(saved["duration_s"])
+        return _run_locked(
+            cases, config, payload, source, run_dir, rows, started_iso, prior_duration
+        )
+
+
+def _run_locked(
+    cases: list[Case],
+    config: RunConfig,
+    payload: IdentityPayload,
+    source: dict[str, Any],
+    run_dir: Path,
+    rows: dict[str, Row],
+    started_iso: str,
+    prior_duration: float,
+) -> RunResult:
+    """The case loop and the final writes, run while ``_session_lock`` is held."""
+    ids = [case.id for case in cases]
+    session_started = time.monotonic()
     python, packages = platform.python_version(), package_versions()
 
-    def manifest(status: Status, outages: int) -> Manifest:
+    def manifest(status: Status) -> Manifest:
+        done = [rows[i] for i in ids if i in rows]
         return Manifest(
             identity=payload,
             run_id=run_dir.name,
@@ -546,17 +730,15 @@ def run_suite(
             source=source,
             started=started_iso,
             duration_s=round(prior_duration + time.monotonic() - session_started, 3),
-            outage_count=outages,
+            outage_count=sum(1 for row in done if row["outcome"] == OUTAGE),
             status=status,
+            validator_reached=_validator_reached(done),
             python=python,
             packages=packages,
         )
 
-    def outage_count() -> int:
-        return sum(1 for row in rows.values() if row["outcome"] == OUTAGE)
-
     manifest_path = run_dir / MANIFEST_FILE
-    write_manifest(manifest_path, manifest("incomplete", outage_count()))
+    write_manifest(manifest_path, manifest("incomplete"))
 
     for case in cases:
         saved_row = rows.get(case.id)
@@ -566,11 +748,11 @@ def run_suite(
         write_rows(run_dir / CASES_FILE, [rows[i] for i in ids if i in rows])
         # Still `incomplete`: refreshed only so an interrupted session keeps its elapsed time
         # and outage count for the resume that follows.
-        write_manifest(manifest_path, manifest("incomplete", outage_count()))
+        write_manifest(manifest_path, manifest("incomplete"))
 
     ordered = [rows[i] for i in ids]
     outages = sum(1 for row in ordered if row["outcome"] == OUTAGE)
-    final = manifest("complete" if outages == 0 else "incomplete", outages)
+    final = manifest("complete" if outages == 0 else "incomplete")
     write_report(run_dir / REPORT_FILE, final, ordered)
     write_manifest(manifest_path, final)
     return RunResult(run_dir=run_dir, manifest=final, rows=ordered)

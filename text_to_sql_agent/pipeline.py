@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from .config import DEFAULT_MAX_ROWS, DEFAULT_MODEL_NAME, DEFAULT_RAG_TOP_K
@@ -121,6 +122,7 @@ def ask_database_with_sql(
     max_repair_attempts: int = 1,
     work_limit: int | None = None,
     max_rows: int | None = None,
+    on_repair_error: Callable[[Exception], None] | None = None,
 ) -> tuple[str, QueryResult]:
     """Same as `ask_database`, but also returns the generated SQL for UI display.
 
@@ -136,6 +138,12 @@ def ask_database_with_sql(
             that failed execution. `0` disables repair.
         work_limit: See `ask_database`.
         max_rows: See `ask_database`.
+        on_repair_error: Called with the exception when the *repair* call to
+            the model raises. The repair failure is still swallowed - the
+            result is the first attempt's execution error, as always - so
+            this changes nothing for a caller that omits it. The evaluation
+            runner passes it to tell a provider outage during repair (a 429
+            on the second call) from a model that wrote bad SQL.
 
     Returns:
         A `(sql, QueryResult)` tuple. `sql` is `""` if generation itself
@@ -190,6 +198,7 @@ def ask_database_with_sql(
             provider=provider,
             max_repair_attempts=max_repair_attempts,
             engine=engine,
+            on_repair_error=on_repair_error,
         )
         if repaired_sql:
             # Same contract as `ask_database`: a refused repair is reported as
@@ -302,6 +311,7 @@ def _repair_sql(
     provider: str | None,
     max_repair_attempts: int,
     engine: Engine,
+    on_repair_error: Callable[[Exception], None] | None = None,
 ) -> str | None:
     if max_repair_attempts < 1:
         return None
@@ -324,5 +334,7 @@ Return only one corrected {dialect_name} SELECT query.
         return generate_sql(
             repair_question, schema_text, model_name=model_name, provider=provider, engine=engine
         )
-    except Exception:
+    except Exception as exc:
+        if on_repair_error is not None:
+            on_repair_error(exc)
         return None

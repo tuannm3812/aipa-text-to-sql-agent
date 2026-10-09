@@ -500,3 +500,25 @@ def test_a_disabled_guard_lets_the_runaway_query_finish(tmp_path: Path) -> None:
         _, unlimited = agent.ask_database_with_sql("count pairs", db_path=db_path, work_limit=0)
     assert default.error == "QUERY_ABORTED_AFTER_100000_VM_STEPS"
     assert unlimited.ok and unlimited.rows == [(60_000,)]
+
+
+def test_a_failed_repair_call_is_reported_to_the_callback_and_still_swallowed(
+    customers_db: str,
+) -> None:
+    """The callback observes the repair failure; the returned result is what it always was."""
+    boom = RuntimeError("429 Too Many Requests")
+
+    def generate(question: str, schema_text: str, **_: object) -> str:
+        if question.startswith("Repair"):
+            raise boom
+        return "SELECT no_such_column FROM customers"
+
+    seen: list[Exception] = []
+    with patch("text_to_sql_agent.pipeline.generate_sql", side_effect=generate):
+        without = agent.ask_database_with_sql("q", db_path=customers_db)
+        with_callback = agent.ask_database_with_sql(
+            "q", db_path=customers_db, on_repair_error=seen.append
+        )
+    assert seen == [boom]
+    assert with_callback == without
+    assert without[1].error is not None and "no_such_column" in without[1].error

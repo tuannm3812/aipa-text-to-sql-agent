@@ -8,8 +8,10 @@ never into ``evaluation/results/``.
 from __future__ import annotations
 
 import csv
+import dataclasses
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 from collections import Counter
@@ -75,6 +77,19 @@ def _config(**overrides: Any) -> RunConfig:
 
 def _llm(**overrides: Any) -> RunConfig:
     return _config(mode="llm", **overrides)
+
+
+def _first(directory: Path, count: int) -> tuple[list[Case], dict[str, Any]]:
+    """The first ``count`` demo cases as a named subset, and the config overrides naming it.
+
+    ``run_suite`` refuses a case list that is not its config's selection, so a test that
+    wants a few cases says so in the identity, exactly as a real subset run does.
+    """
+    ids = [case.id for case in load_suite(DEMO)[:count]]
+    subset = directory / f"demo.first{count}.txt"
+    subset.write_text("".join(f"{case_id}\n" for case_id in ids), encoding="utf-8")
+    pick: dict[str, Any] = {"subset": f"first{count}", "subset_path": subset}
+    return select_cases(_config(**pick)), pick
 
 
 def _rows(run_dir: Path) -> list[dict[str, str]]:
@@ -273,8 +288,13 @@ def test_resume_refuses_a_saved_row_outside_the_selected_cases(tmp_path: Path) -
         run_suite(cases, config=_llm(), out_root=tmp_path)
     run_dir = _only_dir(tmp_path)
 
-    with pytest.raises(ResumeRefused, match=cases[0].id):
-        run_suite(cases[1:], config=_llm(), out_root=tmp_path, resume_dir=run_dir)
+    cases_csv = run_dir / "cases.csv"
+    lines = cases_csv.read_text(encoding="utf-8").splitlines()
+    lines.append(lines[1].replace(cases[0].id, "not_in_suite", 1))
+    cases_csv.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(ResumeRefused, match="not_in_suite"):
+        run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=run_dir)
 
 
 def test_resume_refuses_a_completed_run(tmp_path: Path) -> None:
@@ -326,23 +346,25 @@ def test_a_persistent_rate_limit_is_an_outage_and_resume_retries_only_that_case(
 
 
 def test_retries_back_off_before_declaring_an_outage(tmp_path: Path) -> None:
-    cases = load_suite(DEMO)[:1]
+    cases, pick = _first(tmp_path, 1)
     stub = StubGenerator(cases, fail={cases[0].question: RuntimeError("503 UNAVAILABLE")})
     with (
         patch("text_to_sql_agent.pipeline.generate_sql", stub),
         patch.object(runner.time, "sleep") as sleep,
     ):
-        run_suite(cases, config=_llm(max_retries=2, retry_base_seconds=1.5), out_root=tmp_path)
+        run_suite(
+            cases, config=_llm(**pick, max_retries=2, retry_base_seconds=1.5), out_root=tmp_path
+        )
     assert stub.calls[cases[0].question] == 3
     assert [c.args[0] for c in sleep.call_args_list] == [1.5, 3.0]
     assert _rows(_only_dir(tmp_path))[0]["outcome"] == "outage"
 
 
 def test_a_non_retryable_provider_error_is_an_error_not_an_outage(tmp_path: Path) -> None:
-    cases = load_suite(DEMO)[:1]
+    cases, pick = _first(tmp_path, 1)
     stub = StubGenerator(cases, fail={cases[0].question: ValueError("Unsupported provider.")})
     with patch("text_to_sql_agent.pipeline.generate_sql", stub):
-        run_suite(cases, config=_llm(max_retries=3), out_root=tmp_path)
+        run_suite(cases, config=_llm(**pick, max_retries=3), out_root=tmp_path)
     assert stub.calls[cases[0].question] == 1
     run_dir = _only_dir(tmp_path)
     row = _rows(run_dir)[0]
@@ -353,11 +375,11 @@ def test_a_non_retryable_provider_error_is_an_error_not_an_outage(tmp_path: Path
 
 def test_an_execution_error_mentioning_a_status_code_is_not_an_outage(tmp_path: Path) -> None:
     """Outage classification looks only at generation failures, never at SQL errors."""
-    cases = load_suite(DEMO)[:1]
+    cases, pick = _first(tmp_path, 1)
     stub = StubGenerator(cases)
     stub.answers[cases[0].question] = "SELECT no_such_column_429 FROM students"
     with patch("text_to_sql_agent.pipeline.generate_sql", stub):
-        run_suite(cases, config=_llm(max_repair_attempts=0), out_root=tmp_path)
+        run_suite(cases, config=_llm(**pick, max_repair_attempts=0), out_root=tmp_path)
     assert _rows(_only_dir(tmp_path))[0]["outcome"] == "error"
 
 
@@ -365,7 +387,7 @@ def test_an_execution_error_mentioning_a_status_code_is_not_an_outage(tmp_path: 
 
 
 def test_a_provider_error_carrying_a_dsn_is_masked_in_the_csv(tmp_path: Path) -> None:
-    cases = load_suite(DEMO)[:2]
+    cases, pick = _first(tmp_path, 2)
     stub = StubGenerator(
         cases,
         fail={
@@ -374,7 +396,7 @@ def test_a_provider_error_carrying_a_dsn_is_masked_in_the_csv(tmp_path: Path) ->
         },
     )
     with patch("text_to_sql_agent.pipeline.generate_sql", stub):
-        run_suite(cases, config=_llm(), out_root=tmp_path)
+        run_suite(cases, config=_llm(**pick), out_root=tmp_path)
     run_dir = _only_dir(tmp_path)
     rows = _rows(run_dir)
     assert [r["outcome"] for r in rows] == ["error", "outage"]
@@ -385,9 +407,9 @@ def test_a_provider_error_carrying_a_dsn_is_masked_in_the_csv(tmp_path: Path) ->
 
 
 def test_a_pipeline_exception_is_recorded_redacted_not_raised(tmp_path: Path) -> None:
-    cases = load_suite(DEMO)[:1]
+    cases, pick = _first(tmp_path, 1)
     with patch.object(runner, "ask_database_with_sql", side_effect=OSError(f"lost {PLANTED_DSN}")):
-        run_suite(cases, config=_llm(), out_root=tmp_path)
+        run_suite(cases, config=_llm(**pick), out_root=tmp_path)
     row = _rows(_only_dir(tmp_path))[0]
     assert row["outcome"] == "error"
     assert row["error"] == f"OSError: lost {MASKED_DSN}"
@@ -421,11 +443,11 @@ def test_a_gold_query_that_fails_to_execute_is_reference_invalid(tmp_path: Path)
 
 
 def test_a_gold_exception_carrying_a_dsn_is_masked(tmp_path: Path) -> None:
-    cases = load_suite(DEMO)[:1]
+    cases, pick = _first(tmp_path, 1)
     with patch.object(
         runner, "run_gold", side_effect=sqlite3.OperationalError(f"cannot open {PLANTED_DSN}")
     ):
-        run_suite(cases, config=_config(), out_root=tmp_path)
+        run_suite(cases, config=_config(**pick), out_root=tmp_path)
     row = _rows(_only_dir(tmp_path))[0]
     assert row["outcome"] == "reference_invalid"
     assert row["error"] == f"OperationalError: cannot open {MASKED_DSN}"
@@ -562,8 +584,8 @@ def test_schema_recall_matches_lowercased_expected_tables(
 
 
 def test_schema_recall_is_blank_without_rag_or_expected_tables(tmp_path: Path) -> None:
-    cases = load_suite(DEMO)[:1]
-    run_suite(cases, config=_config(use_rag=False), out_root=tmp_path)
+    cases, pick = _first(tmp_path, 1)
+    run_suite(cases, config=_config(**pick, use_rag=False), out_root=tmp_path)
     row = _rows(_only_dir(tmp_path))[0]
     assert row["schema_recall"] == ""
     assert row["prompt_tokens"] == "" and row["completion_tokens"] == ""
@@ -590,7 +612,11 @@ def test_the_source_block_is_copied_verbatim_extra_keys_included(tmp_path: Path)
         source,
     )
     out = tmp_path / "out"
-    run_suite(load_suite(suite), config=_config(suite="pub", suite_path=suite), out_root=out)
+    run_suite(
+        load_suite(suite),
+        config=_config(suite="pub", suite_path=suite, work_limit=100_000, max_rows=1_000),
+        out_root=out,
+    )
     manifest = _manifest(_only_dir(out))
     assert manifest["source"] == source
     assert manifest["source_release"] == "test-release-1"
@@ -848,9 +874,9 @@ def test_the_run_budget_decides_reference_validity_and_is_recorded(
 def test_two_runs_differing_only_in_work_limit_have_different_identities(
     tmp_path: Path,
 ) -> None:
-    cases = load_suite(DEMO)[:1]
-    first = run_suite(cases, config=_config(work_limit=200_000), out_root=tmp_path).run_dir
-    second = run_suite(cases, config=_config(work_limit=300_000), out_root=tmp_path).run_dir
+    cases, pick = _first(tmp_path, 1)
+    first = run_suite(cases, config=_config(**pick, work_limit=200_000), out_root=tmp_path).run_dir
+    second = run_suite(cases, config=_config(**pick, work_limit=300_000), out_root=tmp_path).run_dir
     one, two = _manifest(first), _manifest(second)
     assert one["identity_sha256"] != two["identity_sha256"]
     assert first.name.split("_")[-2] != second.name.split("_")[-2]  # <identity8>
@@ -867,7 +893,7 @@ def test_two_runs_differing_only_in_work_limit_have_different_identities(
 
 
 def test_the_llm_path_runs_the_model_under_the_resolved_budget(tmp_path: Path) -> None:
-    cases = load_suite(DEMO)[:1]
+    cases, pick = _first(tmp_path, 1)
     seen: list[dict[str, Any]] = []
     real = runner.ask_database_with_sql
 
@@ -879,8 +905,8 @@ def test_the_llm_path_runs_the_model_under_the_resolved_budget(tmp_path: Path) -
         patch("text_to_sql_agent.pipeline.generate_sql", StubGenerator(cases)),
         patch.object(runner, "ask_database_with_sql", side_effect=spy),
     ):
-        run_suite(cases, config=_llm(), out_root=tmp_path / "a")
-        run_suite(cases, config=_llm(work_limit=0, max_rows=9), out_root=tmp_path / "b")
+        run_suite(cases, config=_llm(**pick), out_root=tmp_path / "a")
+        run_suite(cases, config=_llm(**pick, work_limit=0, max_rows=9), out_root=tmp_path / "b")
     # Defaults are resolved to the engine's values before the loop, never left as None.
     assert (seen[0]["work_limit"], seen[0]["max_rows"]) == (100_000, 1_000)
     assert (seen[1]["work_limit"], seen[1]["max_rows"]) == (0, 9)
@@ -903,7 +929,8 @@ def test_an_unusable_budget_is_refused_before_anything_is_written(
 
 
 def test_the_largest_accepted_work_limit_runs(tmp_path: Path) -> None:
-    run_suite(load_suite(DEMO)[:1], config=_config(work_limit=2**31 - 1), out_root=tmp_path)
+    cases, pick = _first(tmp_path, 1)
+    run_suite(cases, config=_config(**pick, work_limit=2**31 - 1), out_root=tmp_path)
     assert _rows(_only_dir(tmp_path))[0]["outcome"] == "correct"
 
 
@@ -945,6 +972,340 @@ def test_schema_recall_is_labelled_a_mean_of_fractions(tmp_path: Path) -> None:
     report = (_only_dir(tmp_path) / "report.md").read_text(encoding="utf-8")
     assert "Schema recall (mean of per-case fractions)" in report
     assert "Schema recall is not a rate" in report
+
+
+# --- review findings, 2026-10-09 ----------------------------------------------------------
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+# C1: an unreachable database must refuse the run, never score every reference invalid.
+
+
+def test_relative_db_paths_resolve_against_the_repo_root_from_any_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    suite = REPO / "evaluation/suites/demo.jsonl"
+    config = _config(suite_path=suite)
+    result = run_suite(select_cases(config), config=config, out_root=tmp_path / "out")
+    assert {r["outcome"] for r in result.rows} == {"correct"}
+
+
+@pytest.mark.parametrize("mode", ["gold", "llm"])
+def test_an_unreachable_database_is_refused_before_anything_is_written(
+    tmp_path: Path, mode: str
+) -> None:
+    missing = str(tmp_path / "missing.db")
+    suite = _write_suite(tmp_path, "gone", [_record("gone", "1", missing)], AUTHORED)
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="unreachable"):
+        run_suite(
+            load_suite(suite),
+            config=_config(suite="gone", suite_path=suite, mode=mode),
+            out_root=out,
+        )
+    assert not out.exists()
+
+
+def test_cli_from_another_cwd_refuses_with_the_default_suites_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["--suite", "demo", "--mode", "gold"]) == 2
+    assert "refused" in capsys.readouterr().err
+    assert not (tmp_path / "evaluation").exists()
+
+
+# C2: a provider outage during the repair call is an outage, retried under the policy.
+
+
+def _repair_stub(cases: list[Case], failure: Exception, *, recover_after: int = 99) -> Any:
+    calls = Counter[str]()
+
+    def generate(question: str, schema_text: str, **_: Any) -> str:
+        calls[question[:6]] += 1
+        if question.startswith("Repair"):
+            if calls["Repair"] <= recover_after:
+                raise failure
+            return cases[0].gold_sql
+        return "SELECT no_such_column FROM students"
+
+    return generate
+
+
+def test_a_rate_limited_repair_call_is_an_outage(tmp_path: Path) -> None:
+    cases, pick = _first(tmp_path, 1)
+    stub = _repair_stub(cases, RuntimeError("429 Too Many Requests"))
+    with patch("text_to_sql_agent.pipeline.generate_sql", stub):
+        result = run_suite(cases, config=_llm(**pick), out_root=tmp_path / "out")
+    row = result.rows[0]
+    assert row["outcome"] == "outage"
+    assert row["error"] == "repair: RuntimeError: 429 Too Many Requests"
+    assert result.manifest.status == "incomplete"
+
+
+def test_a_repair_outage_is_retried_under_the_retry_policy(tmp_path: Path) -> None:
+    cases, pick = _first(tmp_path, 1)
+    stub = _repair_stub(cases, RuntimeError("503 overloaded"), recover_after=1)
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", stub),
+        patch.object(runner.time, "sleep") as sleep,
+    ):
+        result = run_suite(
+            cases,
+            config=_llm(**pick, max_retries=1, retry_base_seconds=0.5),
+            out_root=tmp_path / "out",
+        )
+    assert sleep.call_count == 1
+    assert result.rows[0]["outcome"] == "correct"
+    assert result.rows[0]["attempts"] == "2"
+
+
+def test_a_non_retryable_repair_failure_stays_the_models_error(tmp_path: Path) -> None:
+    cases, pick = _first(tmp_path, 1)
+    stub = _repair_stub(cases, ValueError("malformed response"))
+    with patch("text_to_sql_agent.pipeline.generate_sql", stub):
+        result = run_suite(cases, config=_llm(**pick, max_retries=3), out_root=tmp_path / "o")
+    assert result.rows[0]["outcome"] == "error"
+    assert "no_such_column" in result.rows[0]["error"]
+
+
+# I1: one session per run directory; unique temp names.
+
+
+def _interrupted_llm_run(tmp_path: Path) -> tuple[list[Case], Path]:
+    cases = load_suite(DEMO)
+    stub = StubGenerator(cases, fail={cases[1].question: KeyboardInterrupt()})
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", stub),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        run_suite(cases, config=_llm(), out_root=tmp_path)
+    run_dir = _only_dir(tmp_path)
+    assert not (run_dir / ".lock").exists()  # released on KeyboardInterrupt too
+    return cases, run_dir
+
+
+def test_a_locked_run_refuses_a_second_session_naming_the_pid(tmp_path: Path) -> None:
+    cases, run_dir = _interrupted_llm_run(tmp_path)
+    (run_dir / ".lock").write_text("424242\n", encoding="utf-8")
+    with pytest.raises(ResumeRefused, match="pid 424242"):
+        run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=run_dir)
+    assert (run_dir / ".lock").read_text(encoding="utf-8") == "424242\n"  # not ours to break
+
+
+def test_the_lock_is_held_for_the_whole_session(tmp_path: Path) -> None:
+    cases, run_dir = _interrupted_llm_run(tmp_path)
+    attempts: list[str] = []
+    real = runner.evaluate_case
+
+    def nested(case: Case, config: RunConfig) -> dict[str, str]:
+        if not attempts:
+            with pytest.raises(ResumeRefused, match=f"pid {os.getpid()}"):
+                run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=run_dir)
+        attempts.append(case.id)
+        return real(case, config)
+
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", StubGenerator(cases)),
+        patch.object(runner, "evaluate_case", side_effect=nested),
+    ):
+        run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=run_dir)
+    assert attempts == [case.id for case in cases[1:]]  # each once: the nested one ran none
+    assert not (run_dir / ".lock").exists()
+    assert _manifest(run_dir)["status"] == "complete"
+
+
+def test_atomic_writes_use_unique_temp_names(tmp_path: Path) -> None:
+    from text_to_sql_agent.evaluation_v2.manifest import write_atomic
+
+    target = tmp_path / "manifest.json"
+    (tmp_path / "manifest.json.tmp").mkdir()  # the old fixed temp name, now occupied
+    write_atomic(target, "{}\n")
+    assert target.read_text(encoding="utf-8") == "{}\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["manifest.json", "manifest.json.tmp"]
+
+
+def test_atomic_writes_fsync_before_the_rename(tmp_path: Path) -> None:
+    from text_to_sql_agent.evaluation_v2 import manifest as manifest_module
+
+    order: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd: int) -> None:
+        order.append("fsync")
+        real_fsync(fd)
+
+    def replace(src: Any, dst: Any) -> None:
+        order.append("replace")
+        real_replace(src, dst)
+
+    with (
+        patch.object(manifest_module.os, "fsync", side_effect=fsync),
+        patch.object(manifest_module.os, "replace", side_effect=replace),
+    ):
+        manifest_module.write_atomic(tmp_path / "f.txt", "x")
+    assert order == ["fsync", "replace"]
+
+
+# I2: the cases must be the configured selection.
+
+
+def test_a_slice_of_a_full_selection_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="not the selection"):
+        run_suite(load_suite(DEMO)[:2], config=_config(), out_root=tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_reordered_or_edited_cases_are_refused(tmp_path: Path) -> None:
+    cases = load_suite(DEMO)
+    with pytest.raises(ValueError, match="different order"):
+        run_suite(cases[::-1], config=_config(), out_root=tmp_path)
+    edited = [dataclasses.replace(cases[0], question="something else"), *cases[1:]]
+    with pytest.raises(ValueError, match=cases[0].id):
+        run_suite(edited, config=_config(), out_root=tmp_path)
+
+
+def test_resume_refuses_a_changed_case_count(tmp_path: Path) -> None:
+    cases, run_dir = _interrupted_llm_run(tmp_path)
+    manifest = _manifest(run_dir)
+    manifest["case_count"] = 5
+    (run_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ResumeRefused, match="case_count"):
+        run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=run_dir)
+
+
+# I3: saved rows are validated on resume.
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("outcome", "banana", "'banana'"),
+        ("outcome", "", "outcome ''"),
+        ("outcome", "not_applicable", "'not_applicable'"),
+        ("expected", "expect_refusal", "expected"),
+        ("hardness", "extra", "hardness"),
+    ],
+)
+def test_resume_refuses_a_saved_row_the_runner_could_not_have_written(
+    tmp_path: Path, field: str, value: str, message: str
+) -> None:
+    cases, run_dir = _interrupted_llm_run(tmp_path)
+    rows = _rows(run_dir)
+    rows[0][field] = value
+    with (run_dir / "cases.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    with pytest.raises(ResumeRefused, match=message) as refused:
+        run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=run_dir)
+    assert cases[0].id in str(refused.value)
+
+
+# I4: a model run where nothing reached the validator is not citable.
+
+
+def test_a_run_where_every_generation_failed_is_not_citable(tmp_path: Path) -> None:
+    cases, pick = _first(tmp_path, 2)
+    stub = StubGenerator(
+        cases, fail={case.question: RuntimeError("API key not valid") for case in cases}
+    )
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", stub),
+        patch.object(runner, "git_state", return_value=("e" * 40, False)),
+    ):
+        result = run_suite(cases, config=_llm(**pick), out_root=tmp_path / "out")
+    manifest = _manifest(result.run_dir)
+    assert manifest["status"] == "complete"
+    assert manifest["validator_reached"] == 0
+    assert manifest["citable"] is False
+    assert manifest["citable_reason"] == "no case produced SQL that reached the validator"
+    report = (result.run_dir / "report.md").read_text(encoding="utf-8")
+    assert "no case produced SQL that reached the validator" in report
+
+
+def test_a_healthy_clean_model_run_is_citable_with_an_empty_reason(tmp_path: Path) -> None:
+    cases, pick = _first(tmp_path, 2)
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", StubGenerator(cases)),
+        patch.object(runner, "git_state", return_value=("e" * 40, False)),
+    ):
+        result = run_suite(cases, config=_llm(**pick), out_root=tmp_path / "out")
+    manifest = _manifest(result.run_dir)
+    assert (manifest["validator_reached"], manifest["citable"]) == (2, True)
+    assert manifest["citable_reason"] == ""
+
+
+# I5: a public suite needs an explicit budget.
+
+
+@pytest.mark.parametrize(
+    "budget", [{}, {"work_limit": 100_000_000}, {"max_rows": 50_000}], ids=["none", "wl", "mr"]
+)
+def test_a_public_suite_without_an_explicit_budget_is_refused(
+    tmp_path: Path, budget: dict[str, int]
+) -> None:
+    source = {
+        "kind": "download",
+        "release": "r",
+        "url": "u",
+        "sha256": "cafe",
+        "licence": "L",
+        "adapter_version": "2",
+    }
+    suite = _write_suite(tmp_path, "pub", [_record("pub", "1", "data/university_agent.db")], source)
+    with pytest.raises(ValueError, match="--work-limit 100000000 --max-rows 50000"):
+        run_suite(
+            load_suite(suite),
+            config=_config(suite="pub", suite_path=suite, **budget),
+            out_root=tmp_path / "out",
+        )
+    assert not (tmp_path / "out").exists()
+
+
+# M4: a bare "unavailable" is not an outage.
+
+
+def test_a_permanently_unavailable_model_is_an_error_not_an_outage(tmp_path: Path) -> None:
+    cases, pick = _first(tmp_path, 1)
+    stub = StubGenerator(cases, fail={cases[0].question: RuntimeError("Model unavailable")})
+    with patch("text_to_sql_agent.pipeline.generate_sql", stub):
+        result = run_suite(cases, config=_llm(**pick), out_root=tmp_path / "out")
+    assert result.rows[0]["outcome"] == "error"
+
+
+# M6: table cells are escaped.
+
+
+def test_pipes_in_identity_values_are_escaped_in_the_report(tmp_path: Path) -> None:
+    source = {**AUTHORED, "note": "a|b"}
+    suite = _write_suite(
+        tmp_path, "pipe", [_record("pipe", "1", "data/university_agent.db")], source
+    )
+    out = tmp_path / "out"
+    run_suite(load_suite(suite), config=_config(suite="pipe", suite_path=suite), out_root=out)
+    report = (_only_dir(out) / "report.md").read_text(encoding="utf-8")
+    source_row = next(line for line in report.splitlines() if line.startswith("| source |"))
+    assert "note=a\\|b" in source_row
+    assert source_row.replace("\\|", "").count("|") == 3
+
+
+# Empty model output is never a correct refusal.
+
+
+def test_an_empty_model_response_on_a_refusal_case_is_an_error(tmp_path: Path) -> None:
+    suite = _safety_suite(tmp_path)
+    cases = load_suite(suite)
+    stub = StubGenerator(cases)
+    stub.answers[cases[0].question] = ""
+    stub.answers[cases[1].question] = "   "
+    out = tmp_path / "out"
+    with patch("text_to_sql_agent.pipeline.generate_sql", stub):
+        result = run_suite(cases, config=_llm(suite="safety_mini", suite_path=suite), out_root=out)
+    assert [row["outcome"] for row in result.rows] == ["error", "error"]
+    assert result.manifest.validator_reached == 0
 
 
 # --- historical results --------------------------------------------------------------------

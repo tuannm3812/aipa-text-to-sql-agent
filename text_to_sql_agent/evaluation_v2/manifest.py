@@ -3,9 +3,10 @@
 ``manifest.json`` is written ``incomplete`` before a run's first case and rewritten when the
 run ends. Its keys, in order: the identity payload's fields, ``identity_sha256``, ``run_id``,
 ``mode``, ``case_count``, the ``source`` block (verbatim from the suite's ``.source.json``),
-``started``, ``duration_s``, ``outage_count``, ``status``, ``citable``, ``python``,
-``packages``, and ``manifest_sha256`` - a checksum of the whole manifest computed with that
-one field blank, separate from the identity hash.
+``started``, ``duration_s``, ``outage_count``, ``status``, ``validator_reached``,
+``citable``, ``citable_reason``, ``python``, ``packages``, and ``manifest_sha256`` - a
+checksum of the whole manifest computed with that one field blank, separate from the
+identity hash.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
@@ -65,13 +67,29 @@ class Manifest:
     duration_s: float
     outage_count: int
     status: Status
+    validator_reached: int
     python: str
     packages: dict[str, str]
 
     @property
+    def citable_reason(self) -> str:
+        """Why the run may not be cited, ``""`` when it may."""
+        reasons: list[str] = []
+        if self.identity.dirty:
+            reasons.append("the working tree was dirty, so the commit does not pin the code")
+        if self.status != "complete":
+            reasons.append(f"the run is incomplete ({self.outage_count} outage(s))")
+        # A model run in which no case produced SQL that reached the validator measured the
+        # provider's failure (a rejected key, a missing SDK), not the model: every case is an
+        # `error` and EX reads 0 %. A gold run is exempt - a safety-only suite has no SQL at all.
+        if self.mode != "gold" and self.validator_reached == 0:
+            reasons.append("no case produced SQL that reached the validator")
+        return "; ".join(reasons)
+
+    @property
     def citable(self) -> bool:
-        """Only a run of committed code that finished every case may be cited."""
-        return not self.identity.dirty and self.status == "complete"
+        """Committed code, every case finished, and (for a model run) some SQL produced."""
+        return not self.citable_reason
 
     def to_dict(self) -> dict[str, Any]:
         """The manifest as written, ``manifest_sha256`` included."""
@@ -86,7 +104,9 @@ class Manifest:
             duration_s=self.duration_s,
             outage_count=self.outage_count,
             status=self.status,
+            validator_reached=self.validator_reached,
             citable=self.citable,
+            citable_reason=self.citable_reason,
             python=self.python,
             packages=self.packages,
             manifest_sha256="",
@@ -108,6 +128,7 @@ class Manifest:
             duration_s=data["duration_s"],
             outage_count=data["outage_count"],
             status=data["status"],
+            validator_reached=data["validator_reached"],
             python=data["python"],
             packages=data["packages"],
         )
@@ -119,14 +140,23 @@ def manifest_sha256(data: dict[str, Any]) -> str:
 
 
 def write_atomic(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` via a sibling temp file and ``os.replace``.
+    """Write ``text`` to ``path`` via a uniquely named sibling temp file and ``os.replace``.
 
     A reader - or a resume after a crash - sees either the old file or the new one, never a
-    half-written one.
+    half-written one. The temp file comes from ``mkstemp`` in the same directory (so the
+    rename stays on one filesystem), never a fixed name two writers could share, and is
+    fsynced before the rename so a power loss cannot leave the new name on empty data.
     """
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
 
 
 def write_manifest(path: Path, manifest: Manifest) -> None:

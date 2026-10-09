@@ -65,6 +65,11 @@ COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _cell(value: object) -> str:
+    """A value made safe for one Markdown table cell: ``|`` escaped, newlines flattened."""
+    return str(value).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
 def _pct(value: float) -> str:
     return f"{value * 100:.1f}"
 
@@ -173,29 +178,28 @@ def render_report(manifest: Manifest, rows: Sequence[Row]) -> str:
         status_line,
         "",
     ]
-    reasons: list[str] = []
-    if identity.dirty:
-        reasons.append("the working tree was dirty, so the commit does not pin the code")
+    if manifest.citable_reason:
+        lines += [f"**Not citable:** {manifest.citable_reason}.", ""]
     if manifest.status != "complete":
-        reasons.append(
-            "the run is incomplete - resume it with `--resume` on this directory, which runs "
-            "only the unattempted and `outage` cases"
-        )
-    if reasons:
-        lines += [f"**Not citable:** {'; '.join(reasons)}.", ""]
+        lines += [
+            "Resume with `--resume` on this directory; it runs only the unattempted and "
+            "`outage` cases.",
+            "",
+        ]
 
     lines += ["## Identity", "", "| Field | Value |", "|---|---|"]
-    lines.append(f"| run_id | `{manifest.run_id}` |")
+    lines.append(f"| run_id | `{_cell(manifest.run_id)}` |")
     lines.append(f"| identity_sha256 | `{data['identity_sha256']}` |")
     for name in IDENTITY_FIELDS:
-        lines.append(f"| {name} | `{data[name]}` |")
+        lines.append(f"| {name} | `{_cell(data[name])}` |")
     source = ", ".join(f"{key}={value}" for key, value in manifest.source.items())
     lines += [
-        f"| mode | `{manifest.mode}` |",
-        f"| source | {source} |",
-        f"| started | `{manifest.started}` |",
+        f"| mode | `{_cell(manifest.mode)}` |",
+        f"| source | {_cell(source)} |",
+        f"| started | `{_cell(manifest.started)}` |",
         f"| duration_s | `{manifest.duration_s}` |",
         f"| outage_count | `{manifest.outage_count}` |",
+        f"| validator_reached | `{manifest.validator_reached}` |",
         "",
         "## Metrics",
         "",
@@ -224,7 +228,7 @@ def render_report(manifest: Manifest, rows: Sequence[Row]) -> str:
         "|---|---:|",
     ]
     for outcome, count in sorted(Counter(r["outcome"] for r in rows).items()):
-        lines.append(f"| {outcome} | {count} |")
+        lines.append(f"| {_cell(outcome)} | {count} |")
 
     invalid = _ids(rows, "reference_invalid")
     lines += ["", "## Reference-invalid cases", ""]
