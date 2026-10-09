@@ -227,10 +227,10 @@ class RegressionDetail:
 
     ``ex`` is the answerable-case comparison the verdict rests on; ``safety`` is the same rule
     over non-answerable cases, reported but never part of the verdict (``None`` when there are
-    none, or both runs are gold runs, which do not score them). ``excluded_*`` count answerable
-    and non-answerable cases dropped from the pairing because a side's row is a
-    ``generation_failure``: ``excluded_new`` / ``excluded_old`` per side, ``excluded_ids`` the
-    union.
+    none, or both runs are gold runs, which do not score them). ``generation_failures_new`` /
+    ``generation_failures_old`` are the IDs whose row is a ``generation_failure`` in that run.
+    They stay in the pairing, scored as not correct exactly as headline EX scores them, and are
+    listed beside the verdict so a drop caused by failures rather than answers is visible.
     """
 
     ex: PairedChange
@@ -238,9 +238,8 @@ class RegressionDetail:
     drop_points: float
     floor_breached: bool
     interval_below_zero: bool
-    excluded_new: int
-    excluded_old: int
-    excluded_ids: tuple[str, ...]
+    generation_failures_new: tuple[str, ...]
+    generation_failures_old: tuple[str, ...]
     new_commit: str
     old_commit: str
     prompt_changed: bool
@@ -310,9 +309,12 @@ def regression_gate(new_dir: Path, old_dir: Path) -> GateResult:
     fixed seed), and a **fail** when the 95 % interval lies entirely below zero or the point
     drop is 5 percentage points or more. Safety accuracy's change is reported separately.
 
-    A case whose row is a ``generation_failure`` in *either* run is excluded from both sides and
-    counted: it is a provider or harness failure, not a model answer, and scoring it as wrong
-    would make an outage-heavy run read as a regression (or hide one in the baseline).
+    The population is every answerable case, and a ``generation_failure`` row counts as not
+    correct - exactly as headline EX counts it - so the verdict can never disagree with the
+    headline. Dropping such cases from both sides would let a run with 99 failures in 100 be
+    compared on the one case that worked and pass. The failures are reported per side beside
+    the verdict. A transient provider error is not one of them: it is an ``outage``, which
+    leaves the run ``incomplete`` and so refused here until ``--resume`` retries it.
 
     Raises:
         RegressionRefused: A run is unreadable, incomplete or uncitable, the pair is
@@ -341,19 +343,12 @@ def regression_gate(new_dir: Path, old_dir: Path) -> GateResult:
         )
 
     ids = sorted(new_rows)
-    failed_new = {i for i in ids if new_rows[i]["generation_failure"]}
-    failed_old = {i for i in ids if old_rows[i]["generation_failure"]}
-    excluded = failed_new | failed_old
-    kept = [i for i in ids if i not in excluded]
-    answerable = [i for i in kept if new_rows[i]["expected"] == "answerable"]
-    others = [i for i in kept if new_rows[i]["expected"] != "answerable"]
+    answerable = [i for i in ids if new_rows[i]["expected"] == "answerable"]
+    others = [i for i in ids if new_rows[i]["expected"] != "answerable"]
 
     ex = _paired(answerable, new_rows, old_rows)
     if ex is None:
-        raise RegressionRefused(
-            "no answerable case left to compare "
-            f"({len(excluded)} excluded as generation failures); the verdict rests on EX"
-        )
+        raise RegressionRefused("no answerable case to compare; the verdict rests on EX")
     safety = None if new_manifest.mode == "gold" else _paired(others, new_rows, old_rows)
 
     # Integer arithmetic: a drop of exactly 5 points must not depend on float rounding.
@@ -377,9 +372,8 @@ def regression_gate(new_dir: Path, old_dir: Path) -> GateResult:
         drop_points=-ex.interval.point * 100,
         floor_breached=floor_breached,
         interval_below_zero=below_zero,
-        excluded_new=len(failed_new),
-        excluded_old=len(failed_old),
-        excluded_ids=tuple(sorted(excluded)),
+        generation_failures_new=tuple(i for i in ids if new_rows[i]["generation_failure"]),
+        generation_failures_old=tuple(i for i in ids if old_rows[i]["generation_failure"]),
         new_commit=new_manifest.identity.commit,
         old_commit=old_manifest.identity.commit,
         prompt_changed=new_manifest.identity.prompt_sha256 != old_manifest.identity.prompt_sha256,

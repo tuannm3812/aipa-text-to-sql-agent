@@ -518,7 +518,11 @@ def test_differing_id_sets_are_rejected(tmp_path: Path) -> None:
         _gate(tmp_path, old, new)
 
 
-def test_generation_failures_are_excluded_from_both_sides_and_counted(tmp_path: Path) -> None:
+def test_generation_failures_count_as_not_correct_and_are_reported_per_side(
+    tmp_path: Path,
+) -> None:
+    # Headline EX counts a generation failure as not correct, so the verdict does too: every
+    # answerable case stays in the pairing. The failures are still reported, per side.
     old, new = _outcomes(100)
     new["c000"] = new["c001"] = "error"  # failed in the new run only
     old["c002"] = "error"  # failed in the baseline only
@@ -529,11 +533,47 @@ def test_generation_failures_are_excluded_from_both_sides_and_counted(tmp_path: 
     )
     detail = result.regression
     assert detail is not None and result.passed
-    assert (detail.excluded_new, detail.excluded_old) == (3, 2)
-    assert detail.excluded_ids == ("c000", "c001", "c002", "c050")
-    assert detail.ex.interval.n == 96 and result.answerable == 96
-    # Scored as wrong instead, the two dead cases would read as a 2-point regression.
-    assert detail.drop_points == pytest.approx(0.0)
+    assert detail.generation_failures_new == ("c000", "c001", "c050")
+    assert detail.generation_failures_old == ("c002", "c050")
+    assert detail.ex.interval.n == 100 and result.answerable == 100
+    assert (detail.ex.new_correct, detail.ex.old_correct) == (97, 98)
+    assert detail.drop_points == pytest.approx(1.0)
+
+
+def test_ninety_nine_generation_failures_fail_as_the_headline_regression_they_are(
+    tmp_path: Path,
+) -> None:
+    # Codex's reproduction: baseline 100/100, candidate 1/100 with 99 generation failures.
+    # The headline drop is 99 points, so the verdict must be FAIL, not PASS over one survivor.
+    old, new = _outcomes(100)
+    dead = frozenset(f"c{i:03d}" for i in range(1, 100))
+    for case_id in dead:
+        new[case_id] = "error"
+    result = regression_gate(
+        make_run(tmp_path, "new", new, failures=dead), make_run(tmp_path, "old", old)
+    )
+    detail = result.regression
+    assert detail is not None and not result.passed
+    assert detail.ex.interval.n == 100
+    assert (detail.ex.new_correct, detail.ex.old_correct) == (1, 100)
+    assert detail.drop_points == pytest.approx(99.0)
+    assert detail.floor_breached and detail.interval_below_zero
+    assert len(detail.generation_failures_new) == 99 and detail.generation_failures_old == ()
+
+
+def test_generation_failures_in_the_baseline_only_read_as_an_improvement(tmp_path: Path) -> None:
+    old, new = _outcomes(100)
+    dead = frozenset(f"c{i:03d}" for i in range(20))
+    for case_id in dead:
+        old[case_id] = "error"
+    result = regression_gate(
+        make_run(tmp_path, "new", new), make_run(tmp_path, "old", old, failures=dead)
+    )
+    detail = result.regression
+    assert detail is not None and result.passed
+    assert (detail.ex.new_correct, detail.ex.old_correct) == (100, 80)
+    assert detail.drop_points == pytest.approx(-20.0)
+    assert detail.generation_failures_new == () and len(detail.generation_failures_old) == 20
 
 
 def test_safety_is_reported_separately_and_does_not_decide_the_verdict(tmp_path: Path) -> None:
@@ -613,3 +653,18 @@ def test_the_cli_regression_exit_codes_and_output(
     with pytest.raises(SystemExit) as usage:  # argparse's own usage error
         cli.main(["--gate", "regression", "--new", str(ok_dir)])
     assert usage.value.code == 2
+
+
+def test_the_cli_reports_each_sides_generation_failures_beside_the_verdict(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    old, new = _outcomes(100)
+    new["c007"] = old["c009"] = "error"
+    new_dir = make_run(tmp_path, "new", new, failures=frozenset({"c007"}))
+    old_dir = make_run(tmp_path, "old", old, failures=frozenset({"c009"}))
+    assert (
+        cli.main(["--gate", "regression", "--baseline", str(old_dir), "--new", str(new_dir)]) == 0
+    )
+    out = capsys.readouterr().out
+    assert "new run: 1 generation failure(s), scored as not correct" in out and "c007" in out
+    assert "baseline: 1 generation failure(s)" in out and "c009" in out

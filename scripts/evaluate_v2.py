@@ -196,12 +196,15 @@ def _print_regression(result: GateResult) -> None:
         print(
             _change_line("safety accuracy (reported only, not part of the verdict)", detail.safety)
         )
-    if detail.excluded_ids:
-        print(
-            f"  excluded {len(detail.excluded_ids)} generation-failure case(s) from both sides "
-            f"(new run: {detail.excluded_new}, baseline: {detail.excluded_old}): "
-            f"{', '.join(detail.excluded_ids)}"
-        )
+    for label, failed in (
+        ("new run", detail.generation_failures_new),
+        ("baseline", detail.generation_failures_old),
+    ):
+        if failed:
+            print(
+                f"  {label}: {len(failed)} generation failure(s), scored as not correct as in "
+                f"headline EX: {', '.join(failed)}"
+            )
     for failure in result.failures:
         print(f"  FAILURE {failure}")
 
