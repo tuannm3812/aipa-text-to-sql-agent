@@ -16,9 +16,11 @@ Remaining, in order:
    (the harness resumes after any interruption) from a clean tree. Only then
    may the README carry Spider/BIRD headline tables.
 2. **Gate G8, the RAG on/off ablation.** Runs on the frozen contract with the
-   paired regression machinery. Note: v2 does not yet compute prompt-token
-   savings (`prompt_tokens` is blank for Ollama); add that before G8 or the
-   ablation can report accuracy but not cost.
+   paired regression machinery. Since 2026-10-10 `cases.csv` records the
+   provider's prompt and completion tokens per case (summed over generation,
+   repairs and retries), so the ablation can report cost as well as accuracy.
+   Ollama's prompt count was checked to stay the same when a prompt prefix is
+   served from its cache, so counts are comparable across cases.
 3. **Carried forward, not fixed:** a database changed *during* an uninterrupted
    session is not detected (the fingerprint is taken at start and resume), and
    SQLite `-wal`/`-shm` side files are not hashed; schema recall uses a second
@@ -26,20 +28,6 @@ Remaining, in order:
    hash is rebuilt through a private `llm` helper; "same hostname and dead pid"
    is not proof across pid namespaces sharing a hostname. The v1 script
    (`scripts/evaluate_text_to_sql.py`) and the May tables remain as history.
-4. **A control statement followed by prose gets the wrong code.** Since
-   2026-10-10 the pipeline recognises the model's two control statements
-   (`SELECT 'BLOCKED_UNSAFE_SQL' AS error;`, `SELECT
-   'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error;`) structurally, so a read that
-   merely mentions a code in a comment or literal runs normally (Codex,
-   2026-10-09). If the model appends prose *after* an unfenced control
-   statement, `llm._extract_sql_from_text` keeps it, the text no longer parses
-   as one statement, and the validator refuses it as `BLOCKED_UNSAFE_SQL` —
-   safe, but an "unanswerable" answer would be mis-coded. It occurred in 0 of
-   the 627 committed v2 cases. Fix it in the extractor (stop at the end of a
-   recognised control statement), never by widening detection back to
-   substring matching, and never by truncating at the first `;` in general,
-   which would hide a stacked statement from the validator.
-
 ## Phase 4 — Real RAG (next)
 
 Decompose `retrieve_schema_context`'s 182-line body into named, individually

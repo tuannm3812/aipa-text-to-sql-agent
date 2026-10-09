@@ -3621,3 +3621,37 @@ prompt asks for; they now return the statement. Known edge, left to the cleaner:
 unfenced control statement followed by prose is not a sentinel (the validator then
 refuses it as `BLOCKED_UNSAFE_SQL`, so nothing runs, but an UNANSWERABLE answer
 would carry the blocked code). Suite: 1178 passed, 350 skipped.
+
+## 2026-10-10 — Claude: token accounting, and prose after a control statement
+
+Two changes ahead of the full release runs, plus one review fix.
+
+- **Token usage (07ef1bf).** `llm.usage_scope()` is a `ContextVar` accumulator that
+  sums provider-reported tokens over every call inside it. The v2 runner wraps each
+  case, so `prompt_tokens` and `completion_tokens` in `cases.csv` now carry the totals
+  over generation, repairs and retries. A cell stays blank, never `0`, when the
+  provider reported nothing; gold runs stay blank. Field names were verified against
+  the installed packages: Ollama via `AIMessage.usage_metadata` (`input_tokens`,
+  `output_tokens`); google-genai via `prompt_token_count` and `candidates_token_count`,
+  with `thoughts_token_count` added to completion. The legacy Gemini SDK is not
+  installed and is read with the same names, unverified. Token capture changes no
+  outcome, so it is not part of the run identity. `report.md` now shows total and mean
+  per direction over the cases that reported.
+- **Ollama cache check.** Three calls with the same 1,068-token system prompt reported
+  the same prompt count each time, so prompt-prefix caching does not shrink the
+  counts and cases stay comparable.
+- **Trailing prose (2a246a1).** The structural recogniser moved to
+  `text_to_sql_agent/control.py` so `llm` and `pipeline` share it. The unfenced
+  extractor path now cuts after a leading control statement only when the remainder
+  is judged not to be SQL, with every doubt going to SQL. Closes next-steps item 4.
+- **Review fix (36cdcc4).** Probing 24 stacked tails found that `REINDEX ...` and
+  `INSTALL ...` parse as a bare column in sqlglot and were cut as prose. Nothing
+  executes in that case, because a control statement is reported, not run, but the
+  code could read UNANSWERABLE where the validator would say BLOCKED. An explicit
+  statement-word list is now checked first. Both new cases fail without it.
+
+Verified: extraction of all 627 committed 2026-10-09 `generated_sql` values is
+unchanged (0 differ), so the published numbers stand. The assembled SQLite system
+prompt hash is unchanged. Suite: 1205 passed, 350 skipped; ruff, ruff format and
+mypy clean. Next: start the full Spider and BIRD release runs, detached, from a
+clean tree.
