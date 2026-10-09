@@ -187,7 +187,8 @@ def _print_regression(result: GateResult) -> None:
     )
     print(_change_line("EX (answerable cases; the verdict rests on this)", detail.ex))
     print(
-        f"  point drop {detail.drop_points:+.1f} points (floor {FLOOR_POINTS}); "
+        f"  point drop {detail.drop_points + 0.0:.1f} points (floor {FLOOR_POINTS}; negative is an "
+        "improvement); "
         f"interval below zero: {detail.interval_below_zero}; "
         f"floor breached: {detail.floor_breached}"
     )
