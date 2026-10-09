@@ -19,6 +19,9 @@ from .types import QueryResult
 
 DEFAULT_CASES_PATH = Path("evaluation/cases.json")
 
+# Names this comparator and `score_case` in v2 run manifests; v2 is `SCORER_V2_VERSION`.
+SCORER_V1_VERSION = "1"
+
 
 def canonical_value(value: Any) -> str:
     """Normalise one cell so equivalent values compare equal.
