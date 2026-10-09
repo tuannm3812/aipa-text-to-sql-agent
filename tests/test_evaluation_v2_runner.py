@@ -280,6 +280,57 @@ def test_resume_refuses_a_changed_identity_naming_the_field(tmp_path: Path) -> N
     assert {p.name: p.read_bytes() for p in run_dir.iterdir()} == before
 
 
+def _facts_suite(tmp_path: Path) -> tuple[Path, Path]:
+    """Two gold cases over one temporary database holding ``facts.n = 1``."""
+    db = tmp_path / "facts.db"
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("CREATE TABLE facts (n INTEGER)")
+        conn.execute("INSERT INTO facts VALUES (1)")
+        conn.commit()
+    records = [
+        _record("facts", "f1", str(db), gold_sql="SELECT n FROM facts"),
+        _record("facts", "f2", str(db), gold_sql="SELECT n + 0 AS n FROM facts"),
+    ]
+    return _write_suite(tmp_path, "facts", records, AUTHORED), db
+
+
+def test_the_manifest_records_each_databases_fingerprint(tmp_path: Path) -> None:
+    run_suite(load_suite(DEMO), config=_config(), out_root=tmp_path)
+    fingerprint = _manifest(_only_dir(tmp_path))["database_fingerprint"]
+    paths = sorted({case.db_path for case in load_suite(DEMO)})
+    assert fingerprint == [
+        [path, hashlib.sha256(Path(path).read_bytes()).hexdigest()] for path in paths
+    ]
+
+
+def test_resume_refuses_when_only_the_database_contents_changed(tmp_path: Path) -> None:
+    # Codex's reproduction: run f1 against facts.n = 1, interrupt before f2, change the file to
+    # facts.n = 2, resume. Before the fingerprint the run completed citable with mixed results.
+    suite, db = _facts_suite(tmp_path)
+    config = RunConfig(suite="facts", suite_path=suite, mode="gold", provider="gold", model="gold")
+    real = runner.evaluate_case
+
+    def interrupt_second(case: Case, run_config: RunConfig) -> dict[str, str]:
+        if case.id == "f2":
+            raise KeyboardInterrupt
+        return real(case, run_config)
+
+    out = tmp_path / "out"
+    with patch.object(runner, "evaluate_case", interrupt_second), pytest.raises(KeyboardInterrupt):
+        run_suite(select_cases(config), config=config, out_root=out)
+    run_dir = _only_dir(out)
+    assert [row["id"] for row in _rows(run_dir)] == ["f1"]
+    before = {p.name: p.read_bytes() for p in run_dir.iterdir()}
+
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("UPDATE facts SET n = 2")
+        conn.commit()
+
+    with pytest.raises(ResumeRefused, match="database_fingerprint"):
+        run_suite(select_cases(config), config=config, out_root=out, resume_dir=run_dir)
+    assert {p.name: p.read_bytes() for p in run_dir.iterdir()} == before
+
+
 def test_resume_refuses_a_saved_row_outside_the_selected_cases(tmp_path: Path) -> None:
     cases = load_suite(DEMO)
     stub = StubGenerator(cases, fail={cases[1].question: KeyboardInterrupt()})

@@ -3,7 +3,8 @@
 The identity payload holds exactly the fields that define *what is being measured*. Mutable
 execution metadata - start time, duration, outage count, status - is deliberately outside it,
 so finishing or resuming a run never changes its directory name, and a resume can refuse to
-mix results from different code, prompt, suite or settings by comparing payloads.
+mix results from different code, prompt, suite, database contents or settings by comparing
+payloads.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +35,9 @@ class IdentityPayload:
     """The spec's immutable identity fields, in the spec's order.
 
     ``subset`` is the subset's name or ``"full"``; ``subset_sha256`` is ``""`` for a full run.
+    ``database_fingerprint`` is ``database_fingerprint(...)`` over the databases the selected
+    cases query: the bytes actually read, which the suite hash and the source archive's
+    hash do not pin (an extracted benchmark database is gitignored and can change in place).
     ``retry_policy`` is ``retry_policy(max_retries, retry_base_seconds)``.
     """
 
@@ -44,6 +48,7 @@ class IdentityPayload:
     subset: str
     subset_sha256: str
     source_release: str
+    database_fingerprint: tuple[tuple[str, str], ...]
     adapter_version: str
     scorer_version: str
     prompt_sha256: str
@@ -75,10 +80,57 @@ def identity_diff(saved: Mapping[str, Any], current: IdentityPayload) -> list[st
     """Names of the identity fields where ``saved`` differs from ``current``, sorted.
 
     A field missing from ``saved`` counts as different, so a manifest written by an older
-    runner with fewer identity fields can never be silently resumed.
+    runner with fewer identity fields can never be silently resumed. Values are compared in
+    their canonical JSON spelling, because a saved manifest is JSON: the fingerprint's tuples
+    come back as lists and must still compare equal.
     """
     now = dataclasses.asdict(current)
-    return sorted(name for name in IDENTITY_FIELDS if name not in saved or saved[name] != now[name])
+    return sorted(
+        name
+        for name in IDENTITY_FIELDS
+        if name not in saved or canonical_json(saved[name]) != canonical_json(now[name])
+    )
+
+
+def fingerprint_from_json(value: Any) -> tuple[tuple[str, str], ...]:
+    """A ``database_fingerprint`` read back from JSON (a list of ``[path, sha256]`` lists)."""
+    return tuple((str(path), str(digest)) for path, digest in value)
+
+
+def database_fingerprint(
+    db_paths: Iterable[str], *, root: Path = REPO_ROOT
+) -> tuple[tuple[str, str], ...]:
+    """``(path, sha256)`` for each distinct database file, sorted by path.
+
+    ``path`` is relative to ``root`` (POSIX separators) when the file is under it - so two
+    checkouts holding identical copies get the same fingerprint - and absolute otherwise. A
+    relative ``db_path`` is resolved against ``root``. Each file is streamed through SHA-256
+    (``hashlib.file_digest``), never read whole: BIRD dev's databases total about 1.4 GB.
+
+    Raises:
+        ValueError: If a ``db_path`` is a ``scheme://`` DSN. A server database has no file to
+            hash, and an identity that silently skipped it would bind nothing.
+        OSError: If a file cannot be read.
+    """
+    digests: dict[str, str] = {}
+    for db_path in db_paths:
+        if "://" in db_path:
+            scheme = db_path.split("://", 1)[0]
+            raise ValueError(
+                f"cannot fingerprint a '{scheme}://' database: the run identity binds each "
+                "database file's contents, and only file-backed SQLite databases are supported"
+            )
+        path = Path(db_path)
+        full = path if path.is_absolute() else root / path
+        try:
+            key = full.relative_to(root).as_posix()
+        except ValueError:
+            key = full.as_posix()
+        if key in digests:
+            continue
+        with full.open("rb") as handle:
+            digests[key] = hashlib.file_digest(handle, "sha256").hexdigest()
+    return tuple(sorted(digests.items()))
 
 
 def retry_policy(max_retries: int, retry_base_seconds: float) -> str:

@@ -346,6 +346,7 @@ _BASE_IDENTITY: dict[str, Any] = {
     "subset": "full",
     "subset_sha256": "",
     "source_release": "n/a",
+    "database_fingerprint": (("data/x.db", "f" * 64),),
     "adapter_version": "n/a",
     "scorer_version": "v2.0",
     "prompt_sha256": "p" * 64,
@@ -423,7 +424,18 @@ def _gate(tmp_path: Path, old: dict[str, str], new: dict[str, str], **kw: Any): 
 
 def test_compatibility_fields_are_the_identity_minus_the_three_that_may_differ() -> None:
     assert set(COMPATIBILITY_FIELDS) == set(IDENTITY_FIELDS) - {"commit", "dirty", "prompt_sha256"}
-    assert len(COMPATIBILITY_FIELDS) == len(IDENTITY_FIELDS) - 3 == 16
+    assert len(COMPATIBILITY_FIELDS) == len(IDENTITY_FIELDS) - 3 == 17
+    assert "database_fingerprint" in COMPATIBILITY_FIELDS
+
+
+def test_runs_over_different_database_contents_are_incompatible(tmp_path: Path) -> None:
+    old, new = _outcomes(20)
+    with pytest.raises(RegressionRefused, match="database_fingerprint") as caught:
+        regression_gate(
+            make_run(tmp_path, "new", new, database_fingerprint=(("data/x.db", "0" * 64),)),
+            make_run(tmp_path, "old", old),
+        )
+    assert [name for name, _, _ in caught.value.differences] == ["database_fingerprint"]
 
 
 def test_twenty_of_two_hundred_flipping_fails_with_the_interval_below_zero(

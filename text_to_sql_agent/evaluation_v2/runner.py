@@ -58,6 +58,7 @@ from text_to_sql_agent.evaluation_v2.identity import (
     IdentityPayload,
     allocate_run_dir,
     config_label,
+    database_fingerprint,
     git_state,
     identity_diff,
     retry_policy,
@@ -268,6 +269,11 @@ def build_identity(
     exact values to ``run_gold`` and the pipeline, so the manifest records the budget actually
     used. A suite whose cases span engines with different prompts or default limits (and so,
     possibly, different work-limit units) is refused rather than summarised by one of them.
+
+    Every database the cases query is hashed into ``database_fingerprint``, after the
+    reachability check, so a resume - which recomputes this payload - refuses a database whose
+    contents changed since the run started, and two runs over different contents are
+    incompatible in the regression gate.
     """
     _check_subset_config(config)
     if config.work_limit is not None and not 0 <= config.work_limit <= MAX_WORK_LIMIT:
@@ -298,6 +304,7 @@ def build_identity(
                 f"database {redact_dsn(db_path)} is unreachable: {_error_text(exc)}"
             ) from exc
         engines.append(engine)
+    fingerprint = database_fingerprint(case.db_path for case in cases)
     prompt_sha256 = _single({_prompt_sha256(e) for e in engines}, "system prompts")
     default_work_limit = _single({e.default_work_limit for e in engines}, "work limits")
     gold = config.mode == "gold"
@@ -313,6 +320,7 @@ def build_identity(
             else ""
         ),
         source_release=source_release(source),
+        database_fingerprint=fingerprint,
         adapter_version=source_adapter_version(source),
         scorer_version=SCORER_V2_VERSION,
         prompt_sha256=prompt_sha256,

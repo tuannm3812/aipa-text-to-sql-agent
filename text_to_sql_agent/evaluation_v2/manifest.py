@@ -25,6 +25,7 @@ from text_to_sql_agent.evaluation_v2.identity import (
     IDENTITY_FIELDS,
     IdentityPayload,
     canonical_json,
+    fingerprint_from_json,
     identity_hash,
 )
 
@@ -125,7 +126,9 @@ class Manifest:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Manifest:
         """Rebuild a manifest from its ``to_dict`` form (derived fields are recomputed)."""
-        identity = IdentityPayload(**{name: data[name] for name in IDENTITY_FIELDS})
+        fields = {name: data[name] for name in IDENTITY_FIELDS}
+        fields["database_fingerprint"] = fingerprint_from_json(fields["database_fingerprint"])
+        identity = IdentityPayload(**fields)
         return cls(
             identity=identity,
             run_id=data["run_id"],

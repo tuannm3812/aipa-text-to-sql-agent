@@ -9,6 +9,7 @@ random nonce, so two identical runs never share - or overwrite - a directory.
 from __future__ import annotations
 
 import dataclasses
+import json
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from text_to_sql_agent.evaluation_v2.identity import (
     IdentityPayload,
     allocate_run_dir,
     config_label,
+    database_fingerprint,
     git_state,
     identity_diff,
     identity_hash,
@@ -39,6 +41,7 @@ SPEC_FIELDS = (
     "subset",
     "subset_sha256",
     "source_release",
+    "database_fingerprint",
     "adapter_version",
     "scorer_version",
     "prompt_sha256",
@@ -63,6 +66,7 @@ def _payload(**overrides: object) -> IdentityPayload:
         "subset": "full",
         "subset_sha256": "",
         "source_release": "n/a",
+        "database_fingerprint": (("data/demo.db", "d" * 64),),
         "adapter_version": "n/a",
         "scorer_version": "2",
         "prompt_sha256": "c" * 64,
@@ -119,6 +123,7 @@ def test_identity_hash_is_sha256_hex_and_deterministic() -> None:
         ("dirty", True),
         ("prompt_sha256", "d" * 64),
         ("retry_policy", "3x20.0"),
+        ("database_fingerprint", (("data/demo.db", "e" * 64),)),
     ],
 )
 def test_identity_hash_changes_with_every_immutable_field(field: str, value: object) -> None:
@@ -241,6 +246,73 @@ def test_manifest_sha256_is_computed_with_its_own_field_blank() -> None:
 def test_manifest_round_trips_through_its_dict() -> None:
     manifest = _manifest(_payload(), source={"kind": "download", "x": [1, {"y": 2}]})
     assert Manifest.from_dict(manifest.to_dict()) == manifest
+
+
+def test_the_fingerprint_survives_a_json_round_trip() -> None:
+    # JSON turns the fingerprint's tuples into lists; a resume or a regression gate reading the
+    # manifest back must still see the same identity.
+    payload = _payload(database_fingerprint=(("data/a.db", "1" * 64), ("data/b.db", "2" * 64)))
+    saved = json.loads(json.dumps(_manifest(payload).to_dict()))
+    assert identity_diff(saved, payload) == []
+    assert Manifest.from_dict(saved).identity == payload
+
+
+# --- database fingerprint ------------------------------------------------------------------
+
+
+def _db(root: Path, relative: str, content: bytes) -> str:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return str(path)
+
+
+def test_the_fingerprint_is_each_files_sha256_keyed_by_repo_relative_path(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+
+    a = _db(tmp_path, "data/a.db", b"alpha")
+    b = _db(tmp_path, "data/sub/b.db", b"beta")
+    # Relative and absolute spellings of one file are one database; output is sorted.
+    fingerprint = database_fingerprint([b, a, "data/a.db"], root=tmp_path)
+    assert fingerprint == (
+        ("data/a.db", hashlib.sha256(b"alpha").hexdigest()),
+        ("data/sub/b.db", hashlib.sha256(b"beta").hexdigest()),
+    )
+
+
+def test_the_fingerprint_changes_when_one_database_byte_changes(tmp_path: Path) -> None:
+    path = _db(tmp_path, "data/a.db", b"\x00" * 5000)
+    before = database_fingerprint([path], root=tmp_path)
+    with open(path, "r+b") as handle:
+        handle.seek(4321)
+        handle.write(b"\x01")
+    after = database_fingerprint([path], root=tmp_path)
+    assert before != after
+    assert identity_hash(_payload(database_fingerprint=before)) != identity_hash(
+        _payload(database_fingerprint=after)
+    )
+
+
+def test_identical_copies_in_two_checkouts_have_the_same_fingerprint(tmp_path: Path) -> None:
+    one = _db(tmp_path / "checkout-1", "data/a.db", b"same bytes")
+    two = _db(tmp_path / "checkout-2", "data/a.db", b"same bytes")
+    assert database_fingerprint([one], root=tmp_path / "checkout-1") == database_fingerprint(
+        [two], root=tmp_path / "checkout-2"
+    )
+
+
+def test_a_database_outside_the_root_is_keyed_by_its_absolute_path(tmp_path: Path) -> None:
+    outside = _db(tmp_path / "elsewhere", "x.db", b"x")
+    ((key, _),) = database_fingerprint([outside], root=tmp_path / "repo")
+    assert key == Path(outside).as_posix()
+
+
+def test_a_server_dsn_cannot_be_fingerprinted_and_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="cannot fingerprint") as caught:
+        database_fingerprint(["postgresql://u:secret@h/db"], root=tmp_path)
+    assert "secret" not in str(caught.value)
 
 
 def test_git_state_reports_this_checkout_head() -> None:

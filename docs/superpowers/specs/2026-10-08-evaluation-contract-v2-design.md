@@ -254,10 +254,15 @@ One run writes one directory named by a **unique run ID**:
 - `<identity8>` is the first eight hex digits of the SHA-256 of the
   **identity payload**: the immutable fields that define what is being
   measured — commit, dirty flag, suite hash, subset hash, source release,
-  adapter version, scorer version, prompt hash, provider, model, `evidence`,
-  `use_rag`, `rag_top_k`, `work_limit`, `max_rows`, `max_repair_attempts`,
-  retry policy. Mutable execution metadata — start time, duration, outage
-  count, status — is **outside** the identity payload, so finishing or
+  **database fingerprint**, adapter version, scorer version, prompt hash,
+  provider, model, `evidence`, `use_rag`, `rag_top_k`, `work_limit`,
+  `max_rows`, `max_repair_attempts`, retry policy. The database fingerprint
+  (added 2026-10-09 after Codex's implementation review) is a sorted list of
+  `(repo-relative path, SHA-256 of the file's bytes)` for each distinct
+  database the selected cases query, so a resume refuses a database whose
+  contents changed after the run started, and two runs over different
+  contents are incompatible. Mutable execution metadata — start time,
+  duration, outage count, status — is **outside** the identity payload, so finishing or
   resuming a run never changes its name.
 - `<nonce4>` is four hex digits from `os.urandom`, and the directory is
   allocated atomically with `mkdir` (exclusive); on collision a new nonce is
@@ -362,9 +367,9 @@ model metric and is reported only for model runs; gold mode never claims it.
   proves the harness, not the model.
 - **Accuracy regression gate (on demand, needs a model):** compares a new
   `complete` run with a named baseline run. The two are **compatible** only if
-  their manifests agree on suite hash, subset hash, source release, scorer
-  version, adapter version, provider, model, `evidence`, `use_rag`,
-  `rag_top_k`, `work_limit`, `max_rows`, `max_repair_attempts` and retry
+  their manifests agree on suite hash, subset hash, source release, database
+  fingerprint, scorer version, adapter version, provider, model, `evidence`,
+  `use_rag`, `rag_top_k`, `work_limit`, `max_rows`, `max_repair_attempts` and retry
   policy — so the only things allowed to differ are the commit and the prompt
   hash, which is what the gate exists to test. An incompatible or incomplete
   pair is rejected with the differing fields named, never compared.
