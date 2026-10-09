@@ -91,7 +91,7 @@ def _manifest(payload: IdentityPayload, **overrides: object) -> Manifest:
         "duration_s": 1.5,
         "outage_count": 0,
         "status": "complete",
-        "validator_reached": 12,
+        "generation_failures": 0,
         "python": "3.12.0",
         "packages": {"sqlglot": "27.0.0"},
     }

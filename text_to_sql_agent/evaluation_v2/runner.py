@@ -30,6 +30,7 @@ or the next one on disk, never a torn row.
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import dataclasses
 import hashlib
@@ -37,7 +38,9 @@ import io
 import os
 import platform
 import re
+import socket
 import time
+import warnings
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -72,8 +75,8 @@ from text_to_sql_agent.evaluation_v2.manifest import (
 )
 from text_to_sql_agent.evaluation_v2.report import Row, write_report
 from text_to_sql_agent.evaluation_v2.scoring import (
+    EMPTY_GENERATED_SQL,
     SCORER_V2_VERSION,
-    UNANSWERABLE,
     Outcome,
     score_v2,
 )
@@ -103,6 +106,7 @@ CSV_COLUMNS: tuple[str, ...] = (
     "attempts",
     "prompt_tokens",
     "completion_tokens",
+    "generation_failure",
 )
 
 OUTAGE = "outage"
@@ -369,8 +373,12 @@ def _is_generation_failure(sql: str, result: QueryResult) -> bool:
 
 def _ask_model(
     case: Case, question: str, config: RunConfig
-) -> tuple[str, QueryResult, int, bool, float]:
-    """Run the pipeline under the retry policy: ``(sql, result, attempts, outage, ms)``.
+) -> tuple[str, QueryResult, int, bool, bool, float]:
+    """Run the pipeline under the retry policy.
+
+    Returns ``(sql, result, attempts, outage, generation_failure, ms)``. ``generation_failure``
+    is true when the case ended without the model answering: generation raised (and the
+    error was not an outage), or the harness raised around the pipeline.
 
     ``ms`` is the latency of the final attempt alone - backoff sleeps and earlier failed
     attempts are excluded, so latency describes the pipeline rather than the provider's
@@ -397,7 +405,8 @@ def _ask_model(
             # A harness-side failure outside generation (unreachable database, schema
             # retrieval): recorded as the case's error, never retried, never an outage.
             elapsed = (time.perf_counter() - started) * 1000
-            return "", QueryResult(columns=[], rows=[], error=_error_text(exc)), 1, False, elapsed
+            failed = QueryResult(columns=[], rows=[], error=_error_text(exc))
+            return "", failed, 1, False, True, elapsed
         elapsed = (time.perf_counter() - started) * 1000
         # A provider failure is either the first generation raising, or the *repair* call
         # raising after the first SQL failed - the pipeline swallows the latter and returns
@@ -413,10 +422,11 @@ def _ask_model(
             # or resuming would reproduce it identically, so as an outage it would keep the run
             # incomplete forever; as an error it is counted and visible in the outcome table,
             # and a run in which no case produced SQL is not citable (`Manifest.citable`).
-            return sql, result, attempt + 1, False, elapsed
+            generation_failed = _is_generation_failure(sql, result)
+            return sql, result, attempt + 1, False, generation_failed, elapsed
         if attempt >= config.max_retries:
             outage = QueryResult(columns=[], rows=[], sql=result.sql, error=provider_error)
-            return sql, outage, attempt + 1, True, elapsed
+            return sql, outage, attempt + 1, True, False, elapsed
         time.sleep(config.retry_base_seconds * (2**attempt))
         attempt += 1
 
@@ -454,6 +464,7 @@ def evaluate_case(case: Case, config: RunConfig) -> Row:
     error: str | None = None
     attempts = ""
     latency = ""
+    generation_failure = False
     if config.mode == "gold":
         if gold_result is None:
             outcome = NOT_APPLICABLE
@@ -463,7 +474,9 @@ def evaluate_case(case: Case, config: RunConfig) -> Row:
             error = gold_result.error
             latency = f"{gold_ms:.2f}"
     else:
-        generated_sql, result, tries, outage, ms = _ask_model(case, question, config)
+        generated_sql, result, tries, outage, generation_failure, ms = _ask_model(
+            case, question, config
+        )
         outcome = (
             OUTAGE if outage else score_v2(case, result, gold_result, generated_sql=generated_sql)
         )
@@ -473,6 +486,10 @@ def evaluate_case(case: Case, config: RunConfig) -> Row:
             if outcome == "reference_invalid" and gold_result is not None
             else result.error
         )
+        if outcome == "error" and not generation_failure and not generated_sql.strip():
+            # The model answered with nothing. Not the BLOCKED_UNSAFE_SQL that
+            # `query_refusal("")` put in the result: that code means a refusal.
+            error = EMPTY_GENERATED_SQL
         attempts = str(tries)
         latency = f"{ms:.2f}"
 
@@ -494,6 +511,7 @@ def evaluate_case(case: Case, config: RunConfig) -> Row:
         # interface yet. Blank means "not reported", never zero.
         "prompt_tokens": "",
         "completion_tokens": "",
+        "generation_failure": "1" if generation_failure else "",
     }
 
 
@@ -518,28 +536,103 @@ def read_rows(path: Path) -> list[Row]:
         return list(reader)
 
 
+class StaleLockWarning(UserWarning):
+    """A run's lock was left by a process that no longer exists and was taken over."""
+
+
+def _lock_text() -> str:
+    return f"{os.getpid()} {socket.gethostname()}\n"
+
+
+def _holder_is_dead(text: str) -> bool:
+    """Whether a lock's holder is provably gone: same host, and its pid does not exist.
+
+    Anything unprovable - another host, an unparseable or old-format lock, a pid owned by
+    another user (``PermissionError``) - counts as alive, so the lock is never broken on a
+    guess.
+    """
+    parts = text.split()
+    if len(parts) != 2 or parts[1] != socket.gethostname() or not parts[0].isdigit():
+        return False
+    pid = int(parts[0])
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _take_over_stale_lock(path: Path, seen: str) -> Literal["taken", "gone", "live"]:
+    """Move a dead holder's lock aside.
+
+    Returns ``"taken"`` when the lock moved aside was the ``seen`` one, ``"gone"`` when it had
+    already disappeared, and ``"live"`` when a live session had replaced it.
+
+    The lock is renamed to a unique name first (atomic), then re-read: if a live session
+    replaced it in between, its lock is put back (``os.link`` never overwrites) and the
+    takeover is abandoned, so two takers can never both proceed.
+    """
+    aside = path.with_name(f"{path.name}.stale-{os.getpid()}-{os.urandom(2).hex()}")
+    try:
+        os.rename(path, aside)
+    except FileNotFoundError:
+        return "gone"
+    try:
+        if aside.read_text(encoding="utf-8") != seen:
+            with contextlib.suppress(FileExistsError):
+                os.link(aside, path)
+            return "live"
+        return "taken"
+    finally:
+        aside.unlink(missing_ok=True)
+
+
 @contextmanager
 def _session_lock(run_dir: Path) -> Iterator[None]:
-    """Hold ``run_dir/.lock`` for one session; refuse if another session holds it.
+    """Hold ``run_dir/.lock`` for one session; refuse if a live session holds it.
 
-    ``O_CREAT | O_EXCL`` makes taking the lock atomic. It is released on every exit path,
-    ``KeyboardInterrupt`` included; only a hard kill leaves it behind, and then the refusal
-    names the pid so a person can confirm the process is gone before deleting the file.
+    ``O_CREAT | O_EXCL`` makes taking the lock atomic. The lock records ``<pid> <host>``. It is
+    released on every exit path, ``KeyboardInterrupt`` included; a lock left by a hard kill is
+    taken over - with a ``StaleLockWarning`` - only when its holder is provably gone (same
+    host, pid not running). Otherwise the refusal names the pid.
     """
     path = run_dir / LOCK_FILE
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
+    for _ in range(3):
         try:
-            holder = path.read_text(encoding="utf-8").strip() or "unknown"
-        except OSError:
-            holder = "unknown"
-        raise ResumeRefused(
-            f"{run_dir} is locked by another session (pid {holder}, {path}); if that process "
-            "is no longer running the lock is stale - delete the file and resume again"
-        ) from None
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            break
+        except FileExistsError:
+            try:
+                holder = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                continue  # released between our open and our read: try again
+            except OSError:
+                holder = ""
+            outcome = _take_over_stale_lock(path, holder) if _holder_is_dead(holder) else "live"
+            if outcome == "gone":
+                continue
+            if outcome == "taken":
+                warnings.warn(
+                    f"{path}: took over a stale lock left by pid {holder.split()[0]}, which "
+                    "is no longer running on this host",
+                    StaleLockWarning,
+                    stacklevel=3,
+                )
+                continue
+            pid = holder.split()[0] if holder.split() else "unknown"
+            raise ResumeRefused(
+                f"{run_dir} is locked by another session (pid {pid}, {path}); if that "
+                "process is no longer running the lock is stale - delete the file and "
+                "resume again"
+            ) from None
+    else:
+        raise ResumeRefused(f"{run_dir}: could not take the lock {path}; try again")
     try:
-        os.write(fd, f"{os.getpid()}\n".encode())
+        os.write(fd, _lock_text().encode())
         os.close(fd)
         yield
     finally:
@@ -553,6 +646,12 @@ def _check_saved_row(row: Row, case: Case, mode: str, cases_path: Path) -> None:
         raise ResumeRefused(
             f"{cases_path}: row '{case.id}' has outcome {row['outcome']!r}, which a {mode} "
             f"run never writes (allowed: {', '.join(sorted(allowed))})"
+        )
+    allowed_flags = {""} if mode == "gold" else {"", "1"}
+    if row["generation_failure"] not in allowed_flags:
+        raise ResumeRefused(
+            f"{cases_path}: row '{case.id}' has generation_failure "
+            f"{row['generation_failure']!r}, which a {mode} run never writes"
         )
     for field in ("suite", "expected", "hardness"):
         if row[field] != getattr(case, field):
@@ -639,15 +738,9 @@ def _check_selection(cases: Sequence[Case], config: RunConfig) -> None:
     raise ValueError(f"cases differ from the suite file's records: {', '.join(changed[:10])}")
 
 
-def _validator_reached(rows: Sequence[Row]) -> int:
-    """Terminal rows whose SQL reached the validator: non-blank and not the sentinel."""
-    return sum(
-        1
-        for row in rows
-        if row["outcome"] != OUTAGE
-        and row["generated_sql"].strip()
-        and row["error"] != UNANSWERABLE
-    )
+def _generation_failures(rows: Sequence[Row]) -> int:
+    """Terminal rows that ended before the model answered (``generation_failure`` set)."""
+    return sum(1 for row in rows if row["outcome"] != OUTAGE and row["generation_failure"])
 
 
 def run_suite(
@@ -732,7 +825,7 @@ def _run_locked(
             duration_s=round(prior_duration + time.monotonic() - session_started, 3),
             outage_count=sum(1 for row in done if row["outcome"] == OUTAGE),
             status=status,
-            validator_reached=_validator_reached(done),
+            generation_failures=_generation_failures(done),
             python=python,
             packages=packages,
         )

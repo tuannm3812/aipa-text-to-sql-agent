@@ -47,6 +47,10 @@ _ERROR_MESSAGES = {
         "The question could not be answered from this database's schema. "
         "Try rephrasing it, or pick a database that holds the relevant tables."
     ),
+    "EMPTY_GENERATED_SQL": (
+        "The model returned no SQL at all, so there was nothing to run. "
+        "This is a model failure, not a refusal; try asking again."
+    ),
 }
 
 _TRUNCATED_PREFIX = "RESULT_TRUNCATED_TO_"

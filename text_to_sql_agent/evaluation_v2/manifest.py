@@ -3,7 +3,7 @@
 ``manifest.json`` is written ``incomplete`` before a run's first case and rewritten when the
 run ends. Its keys, in order: the identity payload's fields, ``identity_sha256``, ``run_id``,
 ``mode``, ``case_count``, the ``source`` block (verbatim from the suite's ``.source.json``),
-``started``, ``duration_s``, ``outage_count``, ``status``, ``validator_reached``,
+``started``, ``duration_s``, ``outage_count``, ``status``, ``generation_failures``,
 ``citable``, ``citable_reason``, ``python``, ``packages``, and ``manifest_sha256`` - a
 checksum of the whole manifest computed with that one field blank, separate from the
 identity hash.
@@ -67,7 +67,7 @@ class Manifest:
     duration_s: float
     outage_count: int
     status: Status
-    validator_reached: int
+    generation_failures: int
     python: str
     packages: dict[str, str]
 
@@ -79,11 +79,19 @@ class Manifest:
             reasons.append("the working tree was dirty, so the commit does not pin the code")
         if self.status != "complete":
             reasons.append(f"the run is incomplete ({self.outage_count} outage(s))")
-        # A model run in which no case produced SQL that reached the validator measured the
-        # provider's failure (a rejected key, a missing SDK), not the model: every case is an
-        # `error` and EX reads 0 %. A gold run is exempt - a safety-only suite has no SQL at all.
-        if self.mode != "gold" and self.validator_reached == 0:
-            reasons.append("no case produced SQL that reached the validator")
+        # A model run in which *every* case failed before the model answered - generation
+        # raised (a rejected key, a missing SDK) or the harness did - measured that failure,
+        # not the model: every case is an `error` and EX reads 0 %. Any SQL, or the
+        # UNANSWERABLE sentinel, is a real answer and makes the run measurable. Partial
+        # failures stay citable and are visible as `generation_failures`. Gold runs are exempt.
+        if (
+            self.mode != "gold"
+            and self.status == "complete"
+            and self.generation_failures >= self.case_count
+        ):
+            reasons.append(
+                "every case failed before the model answered (provider or harness failure)"
+            )
         return "; ".join(reasons)
 
     @property
@@ -104,7 +112,7 @@ class Manifest:
             duration_s=self.duration_s,
             outage_count=self.outage_count,
             status=self.status,
-            validator_reached=self.validator_reached,
+            generation_failures=self.generation_failures,
             citable=self.citable,
             citable_reason=self.citable_reason,
             python=self.python,
@@ -128,7 +136,7 @@ class Manifest:
             duration_s=data["duration_s"],
             outage_count=data["outage_count"],
             status=data["status"],
-            validator_reached=data["validator_reached"],
+            generation_failures=data["generation_failures"],
             python=data["python"],
             packages=data["packages"],
         )

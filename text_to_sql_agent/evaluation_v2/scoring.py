@@ -35,6 +35,11 @@ from text_to_sql_agent.types import QueryResult
 
 SCORER_V2_VERSION = "2"
 
+# Written by the runner in place of the result's error when the model's SQL was empty or
+# whitespace (scored `error`). Without it the cell would read BLOCKED_UNSAFE_SQL - what
+# `query_refusal("")` returns - and anything branching on the code would count a refusal.
+EMPTY_GENERATED_SQL = "EMPTY_GENERATED_SQL"
+
 Outcome = Literal[
     "correct", "wrong", "error", "refused", "unanswerable", "reference_invalid", "outage"
 ]

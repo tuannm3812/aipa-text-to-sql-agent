@@ -11,7 +11,15 @@ KNOWN_CODES = [
     "RESULT_TRUNCATED_TO_1000_ROWS",
     "QUERY_ABORTED_AFTER_100000_VM_STEPS",
     "QUERY_ABORTED_AFTER_5000_MS",
+    "EMPTY_GENERATED_SQL",
 ]
+
+
+def test_the_empty_sql_code_is_not_described_as_a_refusal() -> None:
+    message = results.describe_error("EMPTY_GENERATED_SQL")
+    assert "no SQL" in message
+    assert "not a refusal" in message
+    assert "read-only" not in message
 
 
 @pytest.mark.parametrize("code", KNOWN_CODES)

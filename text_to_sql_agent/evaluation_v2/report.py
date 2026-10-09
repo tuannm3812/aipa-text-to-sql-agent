@@ -199,7 +199,7 @@ def render_report(manifest: Manifest, rows: Sequence[Row]) -> str:
         f"| started | `{_cell(manifest.started)}` |",
         f"| duration_s | `{manifest.duration_s}` |",
         f"| outage_count | `{manifest.outage_count}` |",
-        f"| validator_reached | `{manifest.validator_reached}` |",
+        f"| generation_failures | `{manifest.generation_failures}` |",
         "",
         "## Metrics",
         "",
@@ -247,6 +247,17 @@ def render_report(manifest: Manifest, rows: Sequence[Row]) -> str:
             *[f"- `{case_id}`" for case_id in outages],
         ]
 
+    if not gold:
+        lines += [
+            "",
+            "## Generation failures",
+            "",
+            f"{manifest.generation_failures} of {len(terminal(rows))} terminal case(s) failed "
+            "before the model answered - generation raised a non-retryable provider error, or "
+            "the harness did - and are scored `error` (their IDs are the rows with "
+            "`generation_failure` set in `cases.csv`). A key that dies partway through a run "
+            "shows here even when the run is citable.",
+        ]
     lines += ["", "## Latency and tokens", "", *_latency_and_tokens(rows), ""]
     return "\n".join(lines)
 

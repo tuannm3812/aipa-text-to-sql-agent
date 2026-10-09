@@ -28,6 +28,7 @@ from text_to_sql_agent.evaluation_v2.runner import (
     select_cases,
 )
 from text_to_sql_agent.evaluation_v2.scoring import (
+    EMPTY_GENERATED_SQL,
     REFUSAL_CODES,
     SCORER_V2_VERSION,
     UNANSWERABLE,
@@ -44,6 +45,7 @@ from text_to_sql_agent.evaluation_v2.stats import (
 # Later tasks add their own names here.
 __all__ = [
     "CSV_COLUMNS",
+    "EMPTY_GENERATED_SQL",
     "REFUSAL_CODES",
     "SCORER_V2_VERSION",
     "UNANSWERABLE",

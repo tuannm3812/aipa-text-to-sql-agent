@@ -12,6 +12,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import socket
 import sqlite3
 import subprocess
 from collections import Counter
@@ -34,6 +35,7 @@ from text_to_sql_agent.evaluation_v2.runner import (
     CSV_COLUMNS,
     ResumeRefused,
     RunConfig,
+    RunResult,
     run_suite,
     select_cases,
 )
@@ -1207,35 +1209,119 @@ def test_resume_refuses_a_saved_row_the_runner_could_not_have_written(
 # I4: a model run where nothing reached the validator is not citable.
 
 
+def _clean_llm_run(
+    tmp_path: Path, cases: list[Case], stub: Any, config: RunConfig
+) -> tuple[RunResult, dict[str, Any]]:
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", stub),
+        patch.object(runner, "git_state", return_value=("e" * 40, False)),
+    ):
+        result = run_suite(cases, config=config, out_root=tmp_path / "out")
+    return result, _manifest(result.run_dir)
+
+
 def test_a_run_where_every_generation_failed_is_not_citable(tmp_path: Path) -> None:
     cases, pick = _first(tmp_path, 2)
     stub = StubGenerator(
         cases, fail={case.question: RuntimeError("API key not valid") for case in cases}
     )
-    with (
-        patch("text_to_sql_agent.pipeline.generate_sql", stub),
-        patch.object(runner, "git_state", return_value=("e" * 40, False)),
-    ):
-        result = run_suite(cases, config=_llm(**pick), out_root=tmp_path / "out")
-    manifest = _manifest(result.run_dir)
+    result, manifest = _clean_llm_run(tmp_path, cases, stub, _llm(**pick))
     assert manifest["status"] == "complete"
-    assert manifest["validator_reached"] == 0
+    assert manifest["generation_failures"] == 2
     assert manifest["citable"] is False
-    assert manifest["citable_reason"] == "no case produced SQL that reached the validator"
+    assert manifest["citable_reason"] == (
+        "every case failed before the model answered (provider or harness failure)"
+    )
+    assert [row["generation_failure"] for row in result.rows] == ["1", "1"]
     report = (result.run_dir / "report.md").read_text(encoding="utf-8")
-    assert "no case produced SQL that reached the validator" in report
+    assert "every case failed before the model answered" in report
 
 
 def test_a_healthy_clean_model_run_is_citable_with_an_empty_reason(tmp_path: Path) -> None:
     cases, pick = _first(tmp_path, 2)
+    _, manifest = _clean_llm_run(tmp_path, cases, StubGenerator(cases), _llm(**pick))
+    assert (manifest["generation_failures"], manifest["citable"]) == (0, True)
+    assert manifest["citable_reason"] == ""
+
+
+def test_a_model_answering_only_the_sentinel_is_citable(tmp_path: Path) -> None:
+    """The sentinel is a real answer: 3/3 correct on an unanswerable suite must be citable."""
+    db = "data/university_agent.db"
+    suite = _write_suite(
+        tmp_path,
+        "unans",
+        [
+            _record("unans", f"u{i}", db, question=f"Weather on day {i}?", gold_sql="")
+            | {"expected": "expect_unanswerable"}
+            for i in range(3)
+        ],
+        AUTHORED,
+    )
+    cases = load_suite(suite)
+    stub = StubGenerator(cases)
+    for case in cases:
+        stub.answers[case.question] = "UNANSWERABLE_WITH_GIVEN_SCHEMA"
+    result, manifest = _clean_llm_run(tmp_path, cases, stub, _llm(suite="unans", suite_path=suite))
+    assert [row["outcome"] for row in result.rows] == ["correct"] * 3
+    assert (manifest["generation_failures"], manifest["citable"]) == (0, True)
+    assert "100.0% [100.0, 100.0] (3/3)" in (result.run_dir / "report.md").read_text("utf-8")
+
+
+def test_a_key_dying_partway_is_recorded_but_the_run_stays_citable(tmp_path: Path) -> None:
+    cases, pick = _first(tmp_path, 3)
+    stub = StubGenerator(
+        cases, fail={case.question: RuntimeError("API key not valid") for case in cases[1:]}
+    )
+    result, manifest = _clean_llm_run(tmp_path, cases, stub, _llm(**pick))
+    assert [row["generation_failure"] for row in result.rows] == ["", "1", "1"]
+    assert (manifest["generation_failures"], manifest["citable"]) == (2, True)
+    report = (result.run_dir / "report.md").read_text(encoding="utf-8")
+    assert "2 of 3 terminal case(s) failed before the model answered" in report
+
+
+def test_resume_refuses_an_invalid_generation_failure_flag(tmp_path: Path) -> None:
+    cases, run_dir = _interrupted_llm_run(tmp_path)
+    rows = _rows(run_dir)
+    rows[0]["generation_failure"] = "yes"
+    with (run_dir / "cases.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+    with pytest.raises(ResumeRefused, match="generation_failure 'yes'"):
+        run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=run_dir)
+
+
+def _dead_pid() -> int:
+    process = subprocess.Popen(["true"])
+    process.wait()
+    return process.pid
+
+
+def test_a_stale_lock_on_this_host_is_taken_over_with_a_warning(tmp_path: Path) -> None:
+    cases, run_dir = _interrupted_llm_run(tmp_path)
+    dead = _dead_pid()
+    (run_dir / ".lock").write_text(f"{dead} {socket.gethostname()}\n", encoding="utf-8")
     with (
         patch("text_to_sql_agent.pipeline.generate_sql", StubGenerator(cases)),
-        patch.object(runner, "git_state", return_value=("e" * 40, False)),
+        pytest.warns(runner.StaleLockWarning, match=f"pid {dead}"),
     ):
-        result = run_suite(cases, config=_llm(**pick), out_root=tmp_path / "out")
-    manifest = _manifest(result.run_dir)
-    assert (manifest["validator_reached"], manifest["citable"]) == (2, True)
-    assert manifest["citable_reason"] == ""
+        result = run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=run_dir)
+    assert result.manifest.status == "complete"
+    assert sorted(p.name for p in run_dir.iterdir()) == ["cases.csv", "manifest.json", "report.md"]
+
+
+@pytest.mark.parametrize("holder", ["live", "other-host", "old-format"])
+def test_a_lock_that_is_not_provably_stale_still_refuses(tmp_path: Path, holder: str) -> None:
+    cases, run_dir = _interrupted_llm_run(tmp_path)
+    text = {
+        "live": f"{os.getppid()} {socket.gethostname()}\n",
+        "other-host": f"{_dead_pid()} not-{socket.gethostname()}\n",
+        "old-format": f"{_dead_pid()}\n",
+    }[holder]
+    (run_dir / ".lock").write_text(text, encoding="utf-8")
+    with pytest.raises(ResumeRefused, match="locked by another session"):
+        run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=run_dir)
+    assert (run_dir / ".lock").read_text(encoding="utf-8") == text
 
 
 # I5: a public suite needs an explicit budget.
@@ -1305,7 +1391,10 @@ def test_an_empty_model_response_on_a_refusal_case_is_an_error(tmp_path: Path) -
     with patch("text_to_sql_agent.pipeline.generate_sql", stub):
         result = run_suite(cases, config=_llm(suite="safety_mini", suite_path=suite), out_root=out)
     assert [row["outcome"] for row in result.rows] == ["error", "error"]
-    assert result.manifest.validator_reached == 0
+    # The code says what happened - not BLOCKED_UNSAFE_SQL, which would read as a refusal.
+    assert [row["error"] for row in result.rows] == ["EMPTY_GENERATED_SQL"] * 2
+    # The model did answer (with nothing): not a generation failure.
+    assert result.manifest.generation_failures == 0
 
 
 # --- historical results --------------------------------------------------------------------
