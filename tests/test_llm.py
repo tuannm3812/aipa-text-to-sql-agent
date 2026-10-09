@@ -267,3 +267,89 @@ def test_known_engine_classes_covers_every_registry_scheme(scheme: str) -> None:
         f"{class_name} is registered for scheme {scheme!r} in _ENGINES but is "
         "missing from _known_engine_classes()"
     )
+
+
+# --- token usage ---------------------------------------------------------------------------
+
+
+def test_a_usage_scope_sums_a_generation_and_a_repair() -> None:
+    from text_to_sql_agent.llm import _record_usage, usage_scope
+
+    with usage_scope() as usage:
+        _record_usage(100, 20)  # the generation
+        _record_usage(150, 30)  # the repair
+    assert (usage.prompt_tokens, usage.completion_tokens) == (250, 50)
+
+
+def test_recording_outside_a_scope_is_a_no_op_and_an_empty_scope_stays_unknown() -> None:
+    from text_to_sql_agent.llm import _record_usage, usage_scope
+
+    _record_usage(5, 5)  # no scope: must not raise or leak into the next one
+    with usage_scope() as usage:
+        pass
+    assert (usage.prompt_tokens, usage.completion_tokens) == (None, None)
+
+
+def test_nested_scopes_count_separately_and_roll_up_into_the_outer() -> None:
+    from text_to_sql_agent.llm import _record_usage, usage_scope
+
+    with usage_scope() as outer:
+        _record_usage(1, 1)
+        with usage_scope() as inner:
+            _record_usage(10, 10)
+        _record_usage(100, 100)
+    assert (inner.prompt_tokens, inner.completion_tokens) == (10, 10)
+    assert (outer.prompt_tokens, outer.completion_tokens) == (111, 111)
+
+
+def test_concurrent_scopes_in_two_threads_are_isolated() -> None:
+    import threading
+
+    from text_to_sql_agent.llm import TokenUsage, _record_usage, usage_scope
+
+    barrier = threading.Barrier(2)
+    seen: dict[str, TokenUsage] = {}
+
+    def work(name: str, per_call: int) -> None:
+        with usage_scope() as usage:
+            barrier.wait()
+            for _ in range(50):
+                _record_usage(per_call, per_call)
+            barrier.wait()
+        seen[name] = usage
+
+    threads = [
+        threading.Thread(target=work, args=("a", 1)),
+        threading.Thread(target=work, args=("b", 1000)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert seen["a"].prompt_tokens == 50 and seen["b"].prompt_tokens == 50_000
+
+
+def test_ollama_usage_is_read_from_the_ai_message_usage_metadata() -> None:
+    from types import SimpleNamespace
+
+    from text_to_sql_agent.llm import _record_ollama_usage, usage_scope
+
+    message = SimpleNamespace(
+        usage_metadata={"input_tokens": 12, "output_tokens": 16, "total_tokens": 28}
+    )
+    with usage_scope() as usage:
+        _record_ollama_usage(message)
+        _record_ollama_usage(SimpleNamespace(usage_metadata=None))
+    assert (usage.prompt_tokens, usage.completion_tokens) == (12, 16)
+
+
+def test_gemini_usage_counts_thoughts_as_completion() -> None:
+    from types import SimpleNamespace
+
+    from text_to_sql_agent.llm import _record_gemini_usage, usage_scope
+
+    meta = SimpleNamespace(prompt_token_count=40, candidates_token_count=7, thoughts_token_count=5)
+    with usage_scope() as usage:
+        _record_gemini_usage(SimpleNamespace(usage_metadata=meta))
+        _record_gemini_usage(SimpleNamespace(usage_metadata=None))
+    assert (usage.prompt_tokens, usage.completion_tokens) == (40, 12)

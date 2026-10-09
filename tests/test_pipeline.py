@@ -592,6 +592,26 @@ def test_a_repair_that_returns_the_blocked_sentinel_is_reported_not_executed(
     assert sql == BLOCKED_SENTINEL_SQL
 
 
+def test_a_usage_scope_around_ask_database_with_sql_sums_generation_and_repair(
+    customers_db: str,
+) -> None:
+    from text_to_sql_agent.llm import _record_usage, usage_scope
+
+    answers = iter(["SELECT nope FROM customers", "SELECT 1"])
+
+    def fake_generate(*_a: object, **_k: object) -> str:
+        _record_usage(100, 10)
+        return next(answers)
+
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", side_effect=fake_generate),
+        usage_scope() as usage,
+    ):
+        sql, result = agent.ask_database_with_sql("list", db_path=customers_db)
+    assert (sql, result.error) == ("SELECT 1", None)
+    assert (usage.prompt_tokens, usage.completion_tokens) == (200, 20)
+
+
 @pytest.fixture
 def events_db(tmp_path: Path) -> str:
     """`events(id, status)` whose rows hold the control codes as ordinary data."""

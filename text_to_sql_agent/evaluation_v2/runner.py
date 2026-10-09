@@ -84,7 +84,7 @@ from text_to_sql_agent.evaluation_v2.scoring import (
     Outcome,
     score_v2,
 )
-from text_to_sql_agent.llm import _assemble_prompt
+from text_to_sql_agent.llm import TokenUsage, _assemble_prompt, usage_scope
 from text_to_sql_agent.pipeline import ask_database_with_sql
 from text_to_sql_agent.rag import retrieve_schema_context
 from text_to_sql_agent.types import QueryResult
@@ -476,6 +476,7 @@ def evaluate_case(case: Case, config: RunConfig) -> Row:
     attempts = ""
     latency = ""
     generation_failure = False
+    usage = TokenUsage()
     if config.mode == "gold":
         if gold_result is None:
             outcome = NOT_APPLICABLE
@@ -485,9 +486,12 @@ def evaluate_case(case: Case, config: RunConfig) -> Row:
             error = gold_result.error
             latency = f"{gold_ms:.2f}"
     else:
-        generated_sql, result, tries, outage, generation_failure, ms = _ask_model(
-            case, question, config
-        )
+        # One scope over every attempt: a retried call is still spent tokens, and so are the
+        # ones counted before a failure.
+        with usage_scope() as usage:
+            generated_sql, result, tries, outage, generation_failure, ms = _ask_model(
+                case, question, config
+            )
         outcome = (
             OUTAGE if outage else score_v2(case, result, gold_result, generated_sql=generated_sql)
         )
@@ -518,10 +522,12 @@ def evaluate_case(case: Case, config: RunConfig) -> Row:
         "schema_recall": recall,
         "retrieved_tables": retrieved,
         "attempts": attempts,
-        # `generate_sql` returns text only, so no provider reports usage through this
-        # interface yet. Blank means "not reported", never zero.
-        "prompt_tokens": "",
-        "completion_tokens": "",
+        # Summed by `usage_scope` over the generation, every repair and every retry. Blank
+        # means "not reported" (gold runs, or a provider that gave no usage), never zero.
+        "prompt_tokens": "" if usage.prompt_tokens is None else str(usage.prompt_tokens),
+        "completion_tokens": (
+            "" if usage.completion_tokens is None else str(usage.completion_tokens)
+        ),
         "generation_failure": "1" if generation_failure else "",
     }
 
