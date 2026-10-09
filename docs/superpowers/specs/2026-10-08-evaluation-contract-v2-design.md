@@ -333,19 +333,24 @@ model metric and is reported only for model runs; gold mode never claims it.
   and off), `safety` and `demo` in full — about 600 LLM calls.
 - **Release:** the full dev sets, once per version, producing the dated
   results the README cites.
-- **Execution budget (decided 2026-10-09 from Task 5's measurements).** The
-  app's demo guards — 100,000 SQLite VM steps and 1,000 rows — are not
-  evaluation budgets: at those limits 89 of 200 BIRD references abort or
-  truncate. Public suites run with `--work-limit 100000000 --max-rows 50000`,
-  values that are part of the run identity and the manifest, so a run at a
-  different budget is a different run by construction. At that budget every
-  Spider reference executes and all but two BIRD references do: #701 (about
-  14.6 billion VM steps, beyond SQLite's `set_progress_handler` ceiling of
-  2,147,483,647) and #1131 (about 1.6 billion). Both go on
-  `bird_dev.gold_exceptions.txt` as `reference_invalid` — still in the
-  headline denominator, listed by ID — because disabling the guard
-  (`--work-limit 0`) would leave an LLM run with no defence against a runaway
-  generated join. The pipeline gained optional `work_limit`/`max_rows`
+- **Execution budget (decided 2026-10-09; revised the same day on the full
+  sets).** The app's demo guards — 100,000 SQLite VM steps and 1,000 rows —
+  are not evaluation budgets: at those limits 89 of 200 BIRD references abort
+  or truncate. A first budget of 100M steps / 50,000 rows, chosen on
+  `subset200`, left seven more BIRD references over budget once the full set
+  ran (Task 6), so public suites run with **`--work-limit 1000000000
+  --max-rows 100000`** — values that are part of the run identity and the
+  manifest, so a run at a different budget is a different run by
+  construction. A runaway generated join costs at most about a minute at that
+  level, which is why the guard is not disabled outright (`--work-limit 0`
+  would leave an LLM run with no defence). References that still exceed it —
+  BIRD #701 (about 14.6 billion VM steps, beyond SQLite's
+  `set_progress_handler` ceiling of 2,147,483,647) and whatever else Task 6
+  measures — go on `bird_dev.gold_exceptions.txt` as `reference_invalid`,
+  still in the headline denominator, listed by ID with the measured cost.
+  Spider #455 and #456 are excepted for a different reason: `wta_1.sqlite`
+  holds non-UTF-8 text that `sqlite3` cannot decode, so they cannot run at
+  any budget. The pipeline gained optional `work_limit`/`max_rows`
   pass-through arguments for this; left unset, the app's behaviour is
   unchanged.
 - **CI gate (every push, no provider, no network):** `--mode gold` over every
