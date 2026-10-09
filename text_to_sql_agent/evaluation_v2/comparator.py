@@ -1,10 +1,12 @@
 """The v2 result-set comparator: typed cells, multiset rows, one-to-one unordered matching.
 
 Policy (spec §4.3): ``NULL`` equals only ``NULL``; ``bool`` is its own type; numbers compare
-across ``int``/``float``/``Decimal`` - exactly when both are integral (``1 == 1.0 ==
-Decimal("1.00")``, ``10_000_000 != 10_000_001``), otherwise under
-``abs(a - b) <= 1e-6 * max(1, abs(a), abs(b))``; text compares exactly after trimming; text
-never equals a number. Column count must match and
+across ``int``/``float``/``Decimal`` - exactly when at least one side is an ``int`` or a
+``Decimal`` and both are integral (``1 == 1.0 == Decimal("1.00")``,
+``10_000_000 != 10_000_001``), otherwise under ``abs(a - b) <= 1e-6 * max(1, abs(a), abs(b))``
+(always for a float/float pair: every float at or above 2^52 is "integral" yet still carries
+rounding noise); ``NaN`` equals nothing, and a finite value never equals an infinity. Text
+compares exactly after trimming; text never equals a number. Column count must match and
 columns compare positionally. Rows are a multiset.
 
 Unordered equality is a **perfect one-to-one matching** between generated and gold rows under
@@ -77,6 +79,15 @@ def _kind(value: Any) -> str:
     return _OTHER
 
 
+def _is_nan(value: Any) -> bool:
+    if isinstance(value, Decimal):
+        return value.is_nan()  # quiet and signalling; float() would raise on sNaN
+    try:
+        return math.isnan(value)
+    except OverflowError:  # an integer too large for a float is not NaN
+        return False
+
+
 def _is_integral(value: Any) -> bool:
     if isinstance(value, Integral):
         return True
@@ -84,21 +95,38 @@ def _is_integral(value: Any) -> bool:
         return value.is_finite() and value == value.to_integral_value()
     try:
         return bool(value == int(value))
-    except (OverflowError, ValueError):  # inf, nan
+    except (OverflowError, ValueError):  # inf
         return False
+
+
+def _is_exact_number(value: Any) -> bool:
+    """An int or a Decimal: a number that carries no binary rounding noise."""
+    return isinstance(value, (Integral, Decimal))
+
+
+def _finite_float(value: Any) -> float | None:
+    """``float(value)``, or ``None`` for a finite value too large to represent as one."""
+    try:
+        number = float(value)
+    except OverflowError:  # a huge int or Fraction
+        return None
+    if math.isinf(number) and isinstance(value, Decimal) and value.is_finite():
+        return None  # a finite Decimal past 1e308: float() overflows silently to inf
+    return number
 
 
 def _num_equal(a: Any, b: Any) -> bool:
-    if _is_integral(a) and _is_integral(b):
-        # Exact: integers carry no rounding noise, so COUNT(*) 10_000_001 is not 10_000_000.
-        # int() rather than ==, so a float past 2^53 compares by the integer it holds.
-        return int(a) == int(b)
-    try:
-        x_f, y_f = float(a), float(b)
-    except OverflowError:  # an integer too large for a float, against a non-integer
+    if _is_nan(a) or _is_nan(b):
         return False
-    if not (math.isfinite(x_f) and math.isfinite(y_f)):
-        return x_f == y_f or (math.isnan(x_f) and math.isnan(y_f))
+    if (_is_exact_number(a) or _is_exact_number(b)) and _is_integral(a) and _is_integral(b):
+        # Exact: COUNT(*) 10_000_001 is not 10_000_000. int() rather than ==, so an integral
+        # float compares by the integer it holds. A float/float pair never comes here.
+        return int(a) == int(b)
+    x_f, y_f = _finite_float(a), _finite_float(b)
+    if x_f is None or y_f is None:
+        return False  # only reachable against a non-integral or infinite partner
+    if math.isinf(x_f) or math.isinf(y_f):
+        return x_f == y_f
     return abs(x_f - y_f) <= RELATIVE_TOLERANCE * max(1.0, abs(x_f), abs(y_f))
 
 
@@ -140,11 +168,13 @@ def _row_key(row: Row) -> tuple[tuple[Any, ...], ...]:
 def _sort_cell(value: Any) -> tuple[int, float, str]:
     if _kind(value) != _NUM:
         return (2, 0.0, repr(value))
+    if _is_nan(value):
+        return (1, 0.0, "")
     try:
         number = float(value)
     except OverflowError:
         number = math.inf if value > 0 else -math.inf
-    return (1, 0.0, "") if math.isnan(number) else (0, number, "")
+    return (0, number, "")
 
 
 def _sort_key(row: Row) -> tuple[tuple[int, float, str], ...]:

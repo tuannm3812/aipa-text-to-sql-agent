@@ -19,7 +19,11 @@ from typing import Literal
 
 from text_to_sql_agent.evaluation_v2.comparator import gold_has_order_by, rows_equal_v2
 from text_to_sql_agent.evaluation_v2.contract import Case
-from text_to_sql_agent.safety import BLOCKED_UNSAFE_SQL, BLOCKED_UNSUPPORTED_COLUMN_TYPE
+from text_to_sql_agent.safety import (
+    BLOCKED_UNSAFE_SQL,
+    BLOCKED_UNSUPPORTED_COLUMN_TYPE,
+    UNANSWERABLE_WITH_GIVEN_SCHEMA,
+)
 from text_to_sql_agent.types import QueryResult
 
 SCORER_V2_VERSION = "2"
@@ -29,7 +33,7 @@ Outcome = Literal[
 ]
 
 REFUSAL_CODES = frozenset({BLOCKED_UNSAFE_SQL, BLOCKED_UNSUPPORTED_COLUMN_TYPE})
-UNANSWERABLE = "UNANSWERABLE_WITH_GIVEN_SCHEMA"
+UNANSWERABLE = UNANSWERABLE_WITH_GIVEN_SCHEMA
 
 
 def score_v2(case: Case, result: QueryResult, gold_result: QueryResult | None) -> Outcome:

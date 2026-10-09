@@ -12,7 +12,11 @@ from text_to_sql_agent.evaluation_v2 import (
     Outcome,
     score_v2,
 )
-from text_to_sql_agent.safety import BLOCKED_UNSAFE_SQL, BLOCKED_UNSUPPORTED_COLUMN_TYPE
+from text_to_sql_agent.safety import (
+    BLOCKED_UNSAFE_SQL,
+    BLOCKED_UNSUPPORTED_COLUMN_TYPE,
+    UNANSWERABLE_WITH_GIVEN_SCHEMA,
+)
 from text_to_sql_agent.types import QueryResult
 
 ANSWERABLE = Case(
@@ -44,6 +48,7 @@ def err(code: str) -> QueryResult:
 
 def test_refusal_codes_and_sentinel_are_the_backend_constants() -> None:
     assert frozenset({BLOCKED_UNSAFE_SQL, BLOCKED_UNSUPPORTED_COLUMN_TYPE}) == REFUSAL_CODES
+    assert UNANSWERABLE is UNANSWERABLE_WITH_GIVEN_SCHEMA
     assert UNANSWERABLE == "UNANSWERABLE_WITH_GIVEN_SCHEMA"
 
 

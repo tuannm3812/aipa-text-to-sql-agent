@@ -28,6 +28,9 @@ _ALLOWED_PREFIX = re.compile(r"(?is)^(select|with)\b")
 # (`docs/0_coding_standards.md` §3).
 BLOCKED_UNSAFE_SQL = "BLOCKED_UNSAFE_SQL"
 BLOCKED_UNSUPPORTED_COLUMN_TYPE = "BLOCKED_UNSUPPORTED_COLUMN_TYPE"
+# Not a refusal: the sentinel the model emits when the schema cannot answer the question.
+# Defined beside the refusal codes so the evaluation harness imports one spelling.
+UNANSWERABLE_WITH_GIVEN_SCHEMA = "UNANSWERABLE_WITH_GIVEN_SCHEMA"
 
 
 def _no_table_names() -> frozenset[str]:

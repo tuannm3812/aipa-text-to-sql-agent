@@ -91,10 +91,53 @@ def test_integral_numbers_compare_exactly_otherwise_tolerantly(
     assert rows_equal_v2([(generated,)], [(gold,)], ordered=True) is equal
 
 
-def test_non_finite_numbers_are_not_integral() -> None:
-    assert rows_equal_v2([(math.inf,)], [(math.inf,)], ordered=False)
-    assert not rows_equal_v2([(math.inf,)], [(10**400,)], ordered=False)
-    assert rows_equal_v2([(math.nan,)], [(Decimal("NaN"),)], ordered=False)
+@pytest.mark.parametrize(
+    ("generated", "gold", "equal"),
+    [
+        # A float/float pair is always tolerant: past 2^52 every float is "integral", but a
+        # large SUM still differs by an ulp with summation order.
+        (float(2**53), float(2**53 + 2), True),
+        (4.6e15, 4.6e15 + 1, True),
+        (1e300, 1e300 * (1 + 1e-9), True),
+        (float(2**53), float(2**53 + 2**40), False),  # tolerant still means within 1e-6
+        # An int or Decimal side keeps an integral pair exact.
+        (10_000_000, 10_000_001, False),
+        (10_000_000, 10_000_001.0, False),
+        (Decimal("10000000"), 10_000_001.0, False),
+        (2**53, float(2**53), True),
+        (1, 1.0, True),
+    ],
+)
+def test_exactness_needs_an_int_or_decimal_side(generated: Any, gold: Any, equal: bool) -> None:
+    assert rows_equal_v2([(generated,)], [(gold,)], ordered=False) is equal
+    assert rows_equal_v2([(gold,)], [(generated,)], ordered=True) is equal
+
+
+@pytest.mark.parametrize(
+    ("generated", "gold", "equal"),
+    [
+        (math.inf, math.inf, True),
+        (Decimal("Infinity"), math.inf, True),
+        (math.inf, -math.inf, False),
+        (math.inf, 10**400, False),  # an int too large for a float is still finite
+        (Decimal("1E+400"), math.inf, False),  # float() overflows silently to inf
+        (Decimal("1E+400"), Decimal("1E+400"), True),
+        (Decimal("1E+400"), 10**400, True),
+        (Decimal("1.5E+400"), 1.5, False),
+        (math.nan, math.nan, False),  # NaN equals nothing, itself included
+        (math.nan, Decimal("NaN"), False),
+        (Decimal("sNaN"), Decimal("sNaN"), False),  # float() would raise on sNaN
+        (Decimal("sNaN"), 1.0, False),
+    ],
+)
+def test_non_finite_and_overflowing_numbers(generated: Any, gold: Any, equal: bool) -> None:
+    assert rows_equal_v2([(generated,)], [(gold,)], ordered=False) is equal
+    assert rows_equal_v2([(gold,)], [(generated,)], ordered=True) is equal
+
+
+def test_nan_rows_never_match_but_do_not_crash_the_sort() -> None:
+    rows: Rows = [(Decimal("sNaN"), 1.0), (math.nan, 2.0)]
+    assert not rows_equal_v2(rows, rows, ordered=False)
 
 
 def test_bool_is_its_own_type() -> None:
@@ -209,6 +252,43 @@ def test_matching_agrees_with_brute_force_on_random_near_ties(second: str) -> No
         expected = _brute_force(generated, gold)
         assert rows_equal_v2(generated, gold, ordered=False) is expected
         assert comparator._perfect_matching_exists(generated, gold) is expected
+
+
+# Groups of values that are near or exactly equal, plus confusers of another kind, so
+# random rows land on both sides of every type rule.
+_MIXED_GROUPS: list[list[Any]] = [
+    [None, "None", ""],
+    [True, False, 1, 0],
+    [1, 1.0, Decimal("1.00"), True, "1"],
+    [1.0, 1.0000006, 1.0000012, 1.0000019, Decimal("1.0000006")],
+    [2**53, float(2**53), float(2**53 + 2), 2**53 + 1],
+    [10_000_000, 10_000_000.5, 10_000_001, Decimal("10000000.5"), 10_000_001.0],
+    ["A", "a", " A ", "A  "],
+]
+
+
+def _mixed_row(rng: random.Random, groups: list[list[Any]]) -> tuple[Any, ...]:
+    return tuple(rng.choice(group) for group in groups)
+
+
+def test_matching_agrees_with_brute_force_on_mixed_types() -> None:
+    rng = random.Random(9006805)
+    outcomes = {True: 0, False: 0}
+    for _ in range(400):
+        n = rng.randint(1, 5)
+        shapes = [rng.sample(_MIXED_GROUPS, rng.randint(1, 2)) for _ in range(n)]
+        gold = [_mixed_row(rng, shape) for shape in shapes]
+        # Mostly the same shapes (so equal sets occur), sometimes a different row length.
+        generated = [
+            _mixed_row(rng, shape if rng.random() < 0.9 else rng.sample(_MIXED_GROUPS, 1))
+            for shape in shapes
+        ]
+        rng.shuffle(generated)
+        expected = _brute_force(generated, gold)
+        outcomes[expected] += 1
+        assert rows_equal_v2(generated, gold, ordered=False) is expected
+        assert comparator._perfect_matching_exists(generated, gold) is expected
+    assert min(outcomes.values()) >= 20  # the fixture exercises both answers
 
 
 def test_large_dense_bucket_goes_through_the_matcher() -> None:
