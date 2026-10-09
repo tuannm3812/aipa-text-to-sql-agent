@@ -1,6 +1,11 @@
 import pytest
 
-from text_to_sql_agent.evaluation_v2 import Interval, bootstrap_ci, paired_bootstrap_ci
+from text_to_sql_agent.evaluation_v2 import (
+    Interval,
+    bootstrap_ci,
+    bootstrap_mean_ci,
+    paired_bootstrap_ci,
+)
 from text_to_sql_agent.evaluation_v2.stats import percentile
 
 
@@ -110,3 +115,13 @@ def test_non_boolean_indicators_are_coerced_not_summed() -> None:
 def test_a_single_resample_is_rejected() -> None:
     with pytest.raises(ValueError):
         bootstrap_ci([True, False], resamples=1)
+
+
+def test_bootstrap_mean_ci_keeps_fractional_values() -> None:
+    """Schema recall is a per-case fraction; `bootstrap_ci` would coerce 0.5 to True."""
+    interval = bootstrap_mean_ci([1.0, 0.5])
+    assert interval.point == 0.75
+    assert (interval.low, interval.high) == (0.5, 1.0)
+    assert bootstrap_mean_ci([0.25] * 5).width == 0.0
+    with pytest.raises(ValueError):
+        bootstrap_mean_ci([])

@@ -81,6 +81,18 @@ def bootstrap_ci(successes: Sequence[bool], *, resamples: int = 10_000, seed: in
     return _interval([float(bool(s)) for s in successes], resamples=resamples, seed=seed)
 
 
+def bootstrap_mean_ci(
+    values: Sequence[float], *, resamples: int = 10_000, seed: int = 0
+) -> Interval:
+    """95 % percentile-bootstrap interval for the mean of per-case values in [0, 1].
+
+    For a per-case fraction such as schema recall, which ``bootstrap_ci`` would coerce to a
+    bool. Same resampling, same meaning: sampling uncertainty over cases, for a fixed model and
+    prompt. Raises ``ValueError`` on empty input.
+    """
+    return _interval([float(v) for v in values], resamples=resamples, seed=seed)
+
+
 def paired_bootstrap_ci(
     new: Sequence[bool], old: Sequence[bool], *, resamples: int = 10_000, seed: int = 0
 ) -> Interval:
