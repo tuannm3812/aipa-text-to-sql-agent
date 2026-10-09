@@ -193,9 +193,11 @@ def test_the_loader_ignores_comments_and_blank_lines(tmp_path: Path) -> None:
 def test_the_committed_exception_lists() -> None:
     for suite in ("demo", "safety"):
         assert load_exceptions(SUITES / f"{suite}.gold_exceptions.txt") == frozenset()
-    # Unrunnable references: non-UTF-8 data in wta_1 (Spider), and BIRD's two beyond the budget.
+    # Unrunnable references, each with a measured reason in the file: non-UTF-8 data in
+    # wta_1 (Spider); BIRD #701 and #518 past SQLite's 2^31-1 progress-handler ceiling,
+    # #1131 past the 1B-step budget, #384 returning 228,765 rows against a 100k cap.
     assert load_exceptions(SUITES / "spider_dev.gold_exceptions.txt") == {"455", "456"}
-    assert load_exceptions(SUITES / "bird_dev.gold_exceptions.txt") == {"701", "1131"}
+    assert load_exceptions(SUITES / "bird_dev.gold_exceptions.txt") == {"701", "1131", "518", "384"}
 
 
 # --- the command line --------------------------------------------------------------------------
