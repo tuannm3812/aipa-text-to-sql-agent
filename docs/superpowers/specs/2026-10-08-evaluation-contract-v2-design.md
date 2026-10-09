@@ -165,9 +165,15 @@ legacy `rows_match`:
   text `'None'` or `''`.
 - Text compares **exactly** after trimming surrounding whitespace — case is
   preserved, because `'A'` and `'a'` are different answers.
-- Numbers compare as numbers across `int`/`float`/`Decimal`, equal when
-  `abs(a - b) <= 1e-6 * max(1, abs(a), abs(b))`. An integer-valued float
-  equals its integer. Text never equals a number.
+- Numbers compare as numbers across `int`/`float`/`Decimal`. When **both**
+  values are integral (`int`, or a float/Decimal with no fractional part)
+  they compare **exactly** — a count of `10,000,000` is not a count of
+  `10,000,001`, whatever the relative tolerance would allow (implementer's
+  finding, 2026-10-09). Otherwise they are equal when
+  `abs(a - b) <= 1e-6 * max(1, abs(a), abs(b))`, so a float `SUM()` of
+  `100.00000001` still matches an integral gold `100`. An integer-valued
+  float equals its integer. Text never equals a number; `bool` is its own
+  type and never equals `1` or `0`.
 - Rows are a **multiset**: duplicates count. A result with an extra duplicate
   row is wrong (as it already is under v1, which keeps multiplicity).
 - Unordered equality is a **one-to-one matching** of rows under the cell
