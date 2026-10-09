@@ -191,8 +191,10 @@ def test_the_loader_ignores_comments_and_blank_lines(tmp_path: Path) -> None:
 
 
 def test_the_committed_exception_lists() -> None:
-    for suite in ("demo", "safety", "spider_dev"):
+    for suite in ("demo", "safety"):
         assert load_exceptions(SUITES / f"{suite}.gold_exceptions.txt") == frozenset()
+    # Unrunnable references: non-UTF-8 data in wta_1 (Spider), and BIRD's two beyond the budget.
+    assert load_exceptions(SUITES / "spider_dev.gold_exceptions.txt") == {"455", "456"}
     assert load_exceptions(SUITES / "bird_dev.gold_exceptions.txt") == {"701", "1131"}
 
 

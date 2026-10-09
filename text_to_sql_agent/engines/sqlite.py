@@ -235,8 +235,11 @@ SQLITE DIALECT (must follow):
                 # SQLite's own error code identifies the interrupt directly, so
                 # this is immune to any future change in the error message's
                 # wording (`sqlite_errorcode` is populated on Python >= 3.11,
-                # which this project requires).
-                if exc.sqlite_errorcode != sqlite3.SQLITE_INTERRUPT:
+                # which this project requires). Errors raised by the sqlite3
+                # module itself rather than by SQLite - "Could not decode to
+                # UTF-8 column" - carry no code, so read it with a default and
+                # let the real error propagate.
+                if getattr(exc, "sqlite_errorcode", None) != sqlite3.SQLITE_INTERRUPT:
                     raise
                 return QueryResult(
                     columns=[],

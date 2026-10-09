@@ -121,10 +121,10 @@ _ALLOWED_OUTCOMES: dict[str, frozenset[str]] = {
     "gold": frozenset({"correct", "wrong", "reference_invalid", NOT_APPLICABLE}),
 }
 
-# The documented budget for public suites (README; Task 5 measurements): every Spider subset
-# reference and all but two BIRD subset references execute under it. Quoted when a public
+# The documented budget for public suites, raised on 2026-10-09 from 100,000,000 steps and
+# 50,000 rows once the full BIRD dev set (not just subset200) was gated. Quoted when a public
 # suite is run without an explicit budget - it is a documented convention, not a code default.
-PUBLIC_SUITE_BUDGET = "--work-limit 100000000 --max-rows 50000"
+PUBLIC_SUITE_BUDGET = "--work-limit 1000000000 --max-rows 100000"
 
 # Provider failures worth retrying, and - once the retries are spent - recorded as `outage`
 # rather than as a model failure: rate limits and quota (429), server errors (5xx),

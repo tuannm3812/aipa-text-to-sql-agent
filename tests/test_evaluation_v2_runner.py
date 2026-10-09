@@ -1342,7 +1342,7 @@ def test_a_public_suite_without_an_explicit_budget_is_refused(
         "adapter_version": "2",
     }
     suite = _write_suite(tmp_path, "pub", [_record("pub", "1", "data/university_agent.db")], source)
-    with pytest.raises(ValueError, match="--work-limit 100000000 --max-rows 50000"):
+    with pytest.raises(ValueError, match="--work-limit 1000000000 --max-rows 100000"):
         run_suite(
             load_suite(suite),
             config=_config(suite="pub", suite_path=suite, **budget),

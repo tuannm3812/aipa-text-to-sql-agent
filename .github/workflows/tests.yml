@@ -71,7 +71,7 @@ jobs:
           for suite in spider_dev bird_dev; do
             if [ -f "evaluation/suites/${suite}.jsonl" ]; then
               uv run --python ${{ matrix.python-version }} python scripts/evaluate_v2.py \
-                --gate gold --suite "$suite" --work-limit 100000000 --max-rows 50000
+                --gate gold --suite "$suite" --work-limit 1000000000 --max-rows 100000
             else
               echo "::notice::gold gate skipped for ${suite}: evaluation/suites/${suite}.jsonl is missing (run scripts/prepare_benchmarks.py)"
             fi
