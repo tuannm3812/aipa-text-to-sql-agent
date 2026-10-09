@@ -1,0 +1,65 @@
+{
+  "commit": "7c1aaa4749b19da8a12ff4b5da0eb665a0fe2672",
+  "dirty": false,
+  "suite": "demo",
+  "suite_sha256": "3b92ec3016801f53d324d60003fd71f020cf230f92b542cee669d38c004b629d",
+  "subset": "full",
+  "subset_sha256": "",
+  "source_release": "n/a",
+  "database_fingerprint": [
+    [
+      "data/healthcare_analytics.db",
+      "87fb173637a5e294dacdf3b889e9c4b362732f54a9aae304f4365731e3c22cc2"
+    ],
+    [
+      "data/retail_analytics.db",
+      "a7da556d5d23044ca55a0b3147684ad671ba2172a358452017dab215d5713275"
+    ],
+    [
+      "data/university_agent.db",
+      "e4e9400e104e81c709421fc6c5e4de956f8a4317d7d9387f4cb1a74eaec0078b"
+    ]
+  ],
+  "adapter_version": "n/a",
+  "scorer_version": "2",
+  "prompt_sha256": "89d91cbac0ecc8b32b0af647d3d1238f513249cf6cdcc9bf4ff7eb597be333c3",
+  "provider": "ollama",
+  "model": "qwen3.5:9b-q4_K_M",
+  "evidence": false,
+  "use_rag": true,
+  "rag_top_k": 6,
+  "work_limit": 100000,
+  "max_rows": 1000,
+  "max_repair_attempts": 1,
+  "retry_policy": "2x10.0",
+  "identity_sha256": "bdbb6f00e2c50c46621d50f7a65a16785962c8b7aaf574ad69d7404690bb61ca",
+  "run_id": "2026-10-09T052607_demo_full_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off_bdbb6f00_5980",
+  "mode": "llm",
+  "case_count": 12,
+  "source": {
+    "kind": "authored",
+    "author": "repository",
+    "licence": "MIT",
+    "adapter_version": "n/a"
+  },
+  "started": "2026-10-09T05:26:07+00:00",
+  "duration_s": 264.547,
+  "outage_count": 0,
+  "status": "complete",
+  "generation_failures": 0,
+  "citable": true,
+  "citable_reason": "",
+  "python": "3.13.14",
+  "packages": {
+    "duckdb": "1.5.5",
+    "google-genai": "1.75.0",
+    "langchain-core": "0.3.86",
+    "langchain-ollama": "0.2.3",
+    "pandas": "2.3.3",
+    "psycopg": "3.3.6",
+    "python-dotenv": "1.2.3",
+    "sqlglot": "27.29.0",
+    "streamlit": "1.63.0"
+  },
+  "manifest_sha256": "2334271f6dd45a5bf8be590358a506f73cfd9c5967ed6b9f6d5a90f5aaf20205"
+}

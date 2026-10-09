@@ -1,0 +1,137 @@
+{
+  "commit": "7c1aaa4749b19da8a12ff4b5da0eb665a0fe2672",
+  "dirty": false,
+  "suite": "spider_dev",
+  "suite_sha256": "04f185608f946e75e2a37a65b078b5925798de8e4b9950631acebaa2a6ae0091",
+  "subset": "subset200",
+  "subset_sha256": "e173997fc64467a96814f30fd750908996666ac21e891b5bcbb17dbe4a27764d",
+  "source_release": "spider-1.0 dev (spider_data.zip, dev.json revised 2020-08-03)",
+  "database_fingerprint": [
+    [
+      "data/benchmarks/spider/database/battle_death/battle_death.sqlite",
+      "12569f4493a9655639c4ea86ba4bd8a4ea6411e1b8ae0e1fdf3d6a995344265d"
+    ],
+    [
+      "data/benchmarks/spider/database/car_1/car_1.sqlite",
+      "9d851e396e02997a1de073ae982fe1e4b1769fdffce2fac6e325857a3a938709"
+    ],
+    [
+      "data/benchmarks/spider/database/concert_singer/concert_singer.sqlite",
+      "4fa1ba5ab4577e895271088b1dc44aa94be88e25a54293317a67584112ef059d"
+    ],
+    [
+      "data/benchmarks/spider/database/course_teach/course_teach.sqlite",
+      "da45fcdde64ac2b9330146506b7653ad4417489d8e496e509045e1b02245d793"
+    ],
+    [
+      "data/benchmarks/spider/database/cre_Doc_Template_Mgt/cre_Doc_Template_Mgt.sqlite",
+      "9c3fdd03d8795ecde60aae782ce50c4fb1d6c03de1401fcdd6dc177342a53df5"
+    ],
+    [
+      "data/benchmarks/spider/database/dog_kennels/dog_kennels.sqlite",
+      "ea5fbc6cf6aaf500371c5c121c339d9802ba6f5fbecd948a5274c0b487a9f486"
+    ],
+    [
+      "data/benchmarks/spider/database/employee_hire_evaluation/employee_hire_evaluation.sqlite",
+      "760fec5cc872ef0cdf99242614f05c93dbd00d422ac9da87ea64fcf555be7373"
+    ],
+    [
+      "data/benchmarks/spider/database/flight_2/flight_2.sqlite",
+      "db777ba6488ae2b515cb138d71ff23c4533e5fd0355854648a1102faff3fb7af"
+    ],
+    [
+      "data/benchmarks/spider/database/museum_visit/museum_visit.sqlite",
+      "3217aee38d8e3661d374bf025591b7164a1179c568ef5d20f3c338035fc6e1dd"
+    ],
+    [
+      "data/benchmarks/spider/database/network_1/network_1.sqlite",
+      "bec92cd9a68d6f23469a0df246429299f44caaf75eab12275784e0bb7d0aa9ca"
+    ],
+    [
+      "data/benchmarks/spider/database/orchestra/orchestra.sqlite",
+      "13b64af1cf6fcbd34953a44f951b2bf79bedc000b344549212dac1a9345e2f86"
+    ],
+    [
+      "data/benchmarks/spider/database/pets_1/pets_1.sqlite",
+      "8ffe0ea9b3b034ca8860a2f18300a98c7583ce2522ea195726a04803f675e5bb"
+    ],
+    [
+      "data/benchmarks/spider/database/poker_player/poker_player.sqlite",
+      "63fffd7b68524f07a742a74b74b95a4ba178e6419f3574b9ee78b8dda1df46ba"
+    ],
+    [
+      "data/benchmarks/spider/database/real_estate_properties/real_estate_properties.sqlite",
+      "5d0bd83afa93a843e68f892d8430fe625d7ed2508aae00a341926b0b5b478a29"
+    ],
+    [
+      "data/benchmarks/spider/database/singer/singer.sqlite",
+      "5c1b72755d148c294b26d7b479307e8799b93485ac918720f953e2ab84d59a0a"
+    ],
+    [
+      "data/benchmarks/spider/database/student_transcripts_tracking/student_transcripts_tracking.sqlite",
+      "5a1f4928a1fd36f6edb31c4f054203b2e2fab6b18e5951c4f5633628f82a8e56"
+    ],
+    [
+      "data/benchmarks/spider/database/tvshow/tvshow.sqlite",
+      "1212c2e75cf1dcf3aeb4055331a85298b073d8a613ead77975b13bd3346b9fc4"
+    ],
+    [
+      "data/benchmarks/spider/database/voter_1/voter_1.sqlite",
+      "815bf1611b8a32f649d292a6138562f1761a0c10cb256e20f6561199cff31531"
+    ],
+    [
+      "data/benchmarks/spider/database/world_1/world_1.sqlite",
+      "17b986695f16786d58d66f85e49dba87bdfe72953207ab9b1b49da9d2301ef65"
+    ],
+    [
+      "data/benchmarks/spider/database/wta_1/wta_1.sqlite",
+      "8f20747456d7748674b4f05432f3de96446ced95b8bd5a6fd01284f6c28f727c"
+    ]
+  ],
+  "adapter_version": "3",
+  "scorer_version": "2",
+  "prompt_sha256": "89d91cbac0ecc8b32b0af647d3d1238f513249cf6cdcc9bf4ff7eb597be333c3",
+  "provider": "ollama",
+  "model": "qwen3.5:9b-q4_K_M",
+  "evidence": false,
+  "use_rag": true,
+  "rag_top_k": 6,
+  "work_limit": 1000000000,
+  "max_rows": 100000,
+  "max_repair_attempts": 1,
+  "retry_policy": "2x10.0",
+  "identity_sha256": "d8f16b5239870f63ac1efd411a9fe9aa1d9a07b64030abad8c96821bdbe99ffd",
+  "run_id": "2026-10-09T053348_spider_dev_subset200_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off_d8f16b52_22eb",
+  "mode": "llm",
+  "case_count": 200,
+  "source": {
+    "kind": "download",
+    "release": "spider-1.0 dev (spider_data.zip, dev.json revised 2020-08-03)",
+    "url": "https://drive.usercontent.google.com/download?id=1403EGqzIDoHMdQF4c9Bkyl7dZLZ5Wt6J&export=download&confirm=t",
+    "sha256": "00636695dabed6b5f4b8328a16b13e069a2f16591d5efcce57660669c85b121b",
+    "licence": "CC BY-SA 4.0",
+    "adapter_version": "3",
+    "unpacked_at": "2026-10-09T04:23:56+00:00",
+    "licence_source": "https://yale-lily.github.io/spider (the archive bundles no licence file)"
+  },
+  "started": "2026-10-09T05:33:48+00:00",
+  "duration_s": 4609.715,
+  "outage_count": 0,
+  "status": "complete",
+  "generation_failures": 0,
+  "citable": true,
+  "citable_reason": "",
+  "python": "3.13.14",
+  "packages": {
+    "duckdb": "1.5.5",
+    "google-genai": "1.75.0",
+    "langchain-core": "0.3.86",
+    "langchain-ollama": "0.2.3",
+    "pandas": "2.3.3",
+    "psycopg": "3.3.6",
+    "python-dotenv": "1.2.3",
+    "sqlglot": "27.29.0",
+    "streamlit": "1.63.0"
+  },
+  "manifest_sha256": "fd16769f66e7095bd1e71a8cda6005666725a2f761074bcac0e5ae436c82e46f"
+}

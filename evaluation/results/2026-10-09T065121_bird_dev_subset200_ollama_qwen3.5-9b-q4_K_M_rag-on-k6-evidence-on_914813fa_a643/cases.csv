@@ -1,0 +1,371 @@
+suite,id,hardness,expected,outcome,generated_sql,error,latency_ms,schema_recall,retrieved_tables,attempts,prompt_tokens,completion_tokens,generation_failure
+bird_dev,2,hard,answerable,error,,EMPTY_GENERATED_SQL,28590.28,1.0,"frpm, satscores, schools",1,,,
+bird_dev,16,easy,answerable,wrong,"SELECT COUNT(*) AS count
+FROM schools s
+JOIN satscores",,28490.88,1.0,"frpm, satscores, schools",1,,,
+bird_dev,17,easy,answerable,error,,EMPTY_GENERATED_SQL,25754.03,1.0,"frpm, satscores, schools",1,,,
+bird_dev,19,hard,answerable,error,,EMPTY_GENERATED_SQL,25493.33,1.0,"frpm, satscores, schools",1,,,
+bird_dev,27,medium,answerable,error,,EMPTY_GENERATED_SQL,24836.57,1.0,"frpm, satscores, schools",1,,,
+bird_dev,28,hard,answerable,error,,EMPTY_GENERATED_SQL,25664.66,1.0,"frpm, satscores, schools",1,,,
+bird_dev,30,easy,answerable,error,,EMPTY_GENERATED_SQL,27770.49,1.0,"frpm, satscores, schools",1,,,
+bird_dev,36,hard,answerable,error,,EMPTY_GENERATED_SQL,25845.45,1.0,"frpm, satscores, schools",1,,,
+bird_dev,51,easy,answerable,error,,EMPTY_GENERATED_SQL,26152.11,1.0,"frpm, satscores, schools",1,,,
+bird_dev,52,easy,answerable,correct,"SELECT COUNT(*) AS total_schools
+FROM satscores s
+JOIN schools sc ON s.cds = sc.CDSCode
+WHERE LOWER(sc.MailCity) = LOWER('Lakeport')",,26825.52,1.0,"frpm, satscores, schools",1,,,
+bird_dev,70,easy,answerable,wrong,"SELECT StatusType, COUNT(*) AS count FROM schools WHERE LOWER(County) LIKE '%alpine%' AND SOCType = 'District Community Day Schools' GROUP BY StatusType;",,24979.24,1.0,"frpm, satscores, schools",1,,,
+bird_dev,71,easy,answerable,wrong,SELECT District FROM schools WHERE LOWER(City) LIKE LOWER('%fresno%') AND Magnet = 0;,,19649.93,1.0,"frpm, satscores, schools",1,,,
+bird_dev,74,medium,answerable,error,,EMPTY_GENERATED_SQL,25502.88,1.0,"frpm, satscores, schools",1,,,
+bird_dev,76,medium,answerable,error,,EMPTY_GENERATED_SQL,24836.17,1.0,"frpm, satscores, schools",1,,,
+bird_dev,97,hard,answerable,error,,EMPTY_GENERATED_SQL,26949.29,1.0,"account, card, client, disp, district, loan, trans",1,,,
+bird_dev,98,medium,answerable,error,,EMPTY_GENERATED_SQL,31201.47,1.0,"account, card, client, disp, district, loan, order, trans",1,,,
+bird_dev,108,easy,answerable,error,,EMPTY_GENERATED_SQL,26909.34,1.0,"account, client, disp, district, loan, order, trans",1,,,
+bird_dev,110,easy,answerable,error,,EMPTY_GENERATED_SQL,27007.98,1.0,"account, card, client, disp, district, order, trans",1,,,
+bird_dev,115,hard,answerable,error,,EMPTY_GENERATED_SQL,26671.88,1.0,"account, client, disp, district, order, trans",1,,,
+bird_dev,118,hard,answerable,error,,EMPTY_GENERATED_SQL,28188.73,1.0,"account, card, client, disp, district, loan, order, trans",1,,,
+bird_dev,119,hard,answerable,error,,EMPTY_GENERATED_SQL,27196.72,1.0,"account, card, client, disp, district, loan, trans",1,,,
+bird_dev,122,hard,answerable,error,,EMPTY_GENERATED_SQL,28258.59,1.0,"account, card, client, disp, district, loan, trans",1,,,
+bird_dev,130,medium,answerable,error,,EMPTY_GENERATED_SQL,27445.28,1.0,"account, client, disp, district, loan, order, trans",1,,,
+bird_dev,131,medium,answerable,error,,EMPTY_GENERATED_SQL,26980.00,1.0,"account, client, disp, district, loan, trans",1,,,
+bird_dev,133,easy,answerable,error,SELECT A2 AS district,OperationalError: no such column: A2,52084.48,1.0,"account, card, client, disp, district, order, trans",1,,,
+bird_dev,143,hard,answerable,error,,EMPTY_GENERATED_SQL,27218.45,1.0,"account, card, client, disp, district, loan, order, trans",1,,,
+bird_dev,146,hard,answerable,error,,EMPTY_GENERATED_SQL,26627.40,1.0,"account, card, client, disp, district, loan, order, trans",1,,,
+bird_dev,154,hard,answerable,error,,EMPTY_GENERATED_SQL,27523.79,0.714,"account, client, district, loan, order, trans",1,,,
+bird_dev,156,hard,answerable,error,,EMPTY_GENERATED_SQL,26712.90,1.0,"account, client, disp, district, loan, order, trans",1,,,
+bird_dev,162,hard,answerable,error,,EMPTY_GENERATED_SQL,26241.07,1.0,"account, client, disp, district, loan, order, trans",1,,,
+bird_dev,170,easy,answerable,correct,SELECT COUNT(*) FROM trans WHERE LOWER(operation) = LOWER('VYBER KARTOU') AND date > '1995-12-31';,,25506.98,1.0,"account, card, client, disp, district, order, trans",1,,,
+bird_dev,184,easy,answerable,error,,EMPTY_GENERATED_SQL,27170.05,1.0,"account, card, client, disp, district, order, trans",1,,,
+bird_dev,202,easy,answerable,correct,SELECT COUNT(*) AS triple_bond_count FROM bond WHERE LOWER(bond_type) = LOWER('#');,,24629.32,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,216,easy,answerable,wrong,"SELECT c.atom_id, c.atom_id2, b.bond_type
+FROM connected c
+JOIN bond b ON c.bond_id = b.bond_id
+WHERE LOWER(b.bond_type) = LOWER('#');",,24612.35,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,223,easy,answerable,error,,EMPTY_GENERATED_SQL,25234.09,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,226,medium,answerable,error,,EMPTY_GENERATED_SQL,24908.43,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,235,easy,answerable,correct,"SELECT COUNT(DISTINCT m.molecule_id) 
+FROM molecule m
+JOIN atom a ON m.molecule_id = a.molecule_id
+WHERE LOWER(m.label) = '+' AND LOWER(a.element) = 'br';",,22857.88,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,241,easy,answerable,correct,SELECT COUNT(*) FROM molecule WHERE label = '-';,,25177.21,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,246,medium,answerable,error,,EMPTY_GENERATED_SQL,26745.12,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,257,easy,answerable,error,,EMPTY_GENERATED_SQL,25104.00,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,264,easy,answerable,correct,"SELECT molecule_id, label FROM molecule WHERE LOWER(molecule_id) = LOWER('TR000') OR LOWER(molecule_id) = LOWER('TR001') OR LOWER(molecule_id) = LOWER('TR002');",,15225.84,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,266,easy,answerable,error,,EMPTY_GENERATED_SQL,24735.43,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,269,easy,answerable,error,,EMPTY_GENERATED_SQL,24999.58,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,272,medium,answerable,error,,EMPTY_GENERATED_SQL,24664.03,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,273,medium,answerable,error,,EMPTY_GENERATED_SQL,24457.91,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,274,easy,answerable,error,,EMPTY_GENERATED_SQL,24525.29,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,281,hard,answerable,error,,EMPTY_GENERATED_SQL,25426.78,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,284,medium,answerable,error,,EMPTY_GENERATED_SQL,24458.54,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,287,medium,answerable,error,,EMPTY_GENERATED_SQL,24668.86,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,289,easy,answerable,wrong,"SELECT molecule_id, label FROM molecule WHERE LOWER(molecule_id) = LOWER('TR151');",,14865.48,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,290,hard,answerable,error,,EMPTY_GENERATED_SQL,24648.68,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,296,easy,answerable,error,,EMPTY_GENERATED_SQL,25612.83,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,302,hard,answerable,refused,"SELECT DISTINCT a.element
+FROM atom a
+JOIN connected c ON a.atom_id =",BLOCKED_UNSAFE_SQL,24670.19,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,311,easy,answerable,error,,EMPTY_GENERATED_SQL,25535.86,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,317,medium,answerable,error,,EMPTY_GENERATED_SQL,24483.96,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,324,easy,answerable,error,,EMPTY_GENERATED_SQL,25410.37,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,332,easy,answerable,refused,"SELECT COUNT(DISTINCT m.molecule_id) AS count
+FROM molecule m
+JOIN bond b ON m.molecule_id = b.molecule_id
+WHERE m.molecule_id BETWEEN 'TR004' AND 'TR010'
+  AND LOWER(b",BLOCKED_UNSAFE_SQL,24577.13,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,335,easy,answerable,error,,EMPTY_GENERATED_SQL,24871.12,1.0,"atom, bond, connected, molecule",1,,,
+bird_dev,350,easy,answerable,error,,EMPTY_GENERATED_SQL,30310.76,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,357,easy,answerable,wrong,SELECT promoTypes FROM cards WHERE LOWER(name) = LOWER('Duress');,,14421.38,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,365,easy,answerable,correct,SELECT type FROM cards WHERE LOWER(name) = LOWER('Benalish Knight');,,24290.35,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,377,easy,answerable,wrong,SELECT COUNT(*) AS count FROM cards WHERE LOWER(originalType) = 'summon - angel' AND subtypes NOT LIKE '%angel%';,,26861.47,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,396,easy,answerable,refused,"SELECT COUNT(*) AS card_count
+FROM cards
+WHERE LOWER(frameVersion) = '1993'
+  AND LOWER(availability) LIKE '%paper%'
+  AND",BLOCKED_UNSAFE_SQL,29591.14,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,417,medium,answerable,error,SELECT CAST(SUM(CASE WHEN s.type = 'expansion' THEN 1 ELSE 0 END) AS REAL) * 100.0 / COUNT(*) AS percentage FROM sets,OperationalError: no such column: s.type,53326.17,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,419,easy,answerable,correct,SELECT COUNT(*) AS count FROM cards WHERE LOWER(borderColor) = LOWER('borderless') AND edhrecRank > 12000;,,26493.76,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,426,easy,answerable,error,,EMPTY_GENERATED_SQL,27829.80,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,435,easy,answerable,error,,EMPTY_GENERATED_SQL,27376.66,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,443,easy,answerable,correct,SELECT code FROM sets WHERE LOWER(type) = LOWER('expansion');,,23614.54,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,459,medium,answerable,wrong,"SELECT name, convertedManaCost FROM cards WHERE LOWER(name) IN (LOWER('Serra Angel'), LOWER('Shrine Keeper')) ORDER BY convertedManaCost DESC;",,19471.27,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,460,easy,answerable,correct,"SELECT artist FROM cards WHERE LOWER(flavorName) = LOWER('Battra, Dark Destroyer');",,14839.94,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,467,easy,answerable,correct,"SELECT s.baseSetSize AS card_count
+FROM sets s
+JOIN set_translations st ON s.code = st.setCode
+WHERE LOWER(st.translation) LIKE LOWER('%Hauptset Zehnte Edition%');",,25173.97,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,468,medium,answerable,wrong,"SELECT st.translation
+FROM set_translations st
+JOIN sets s ON st.setCode = s.code
+WHERE LOWER(s.name) = 'Eighth Edition'
+  AND LOWER(st.language) = 'Chinese Simplified';",,24083.74,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,481,easy,answerable,wrong,SELECT DISTINCT language FROM foreign_data WHERE LOWER(name) = LOWER('Ancestor''s Chosen') AND flavorText IS NOT NULL;,,27504.81,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,484,medium,answerable,error,,EMPTY_GENERATED_SQL,27904.03,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,500,medium,answerable,wrong,"SELECT st.translation
+FROM cards c
+JOIN sets s ON c.setCode = s.code
+JOIN set_translations st ON s.code = st.setCode AND LOWER(st.language) = LOWER('Japanese')
+WHERE LOWER(c.name) = LOWER('Fellwar Stone');",,48351.80,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,503,easy,answerable,correct,"SELECT s.type
+FROM sets s
+JOIN cards c ON s.code = c.setCode
+WHERE LOWER(c.name) = LOWER('Samite Pilgrim');",,19463.57,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,507,hard,answerable,wrong,SELECT CAST(SUM(CASE WHEN c.isOnlineOnly = 1 THEN 1 ELSE 0 END) AS REAL) * 100.0 / COUNT(*) AS percentage FROM cards c JOIN set_translations st ON c.setCode = st.setCode WHERE LOWER(st.language) = LOWER('Portuguese (Brazil)');,,28207.61,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,510,easy,answerable,correct,SELECT artist FROM cards WHERE side IS NULL ORDER BY convertedManaCost DESC LIMIT 1;,,21425.14,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,512,easy,answerable,error,,EMPTY_GENERATED_SQL,26906.52,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,516,medium,answerable,wrong,"SELECT COUNT(*) AS card_count
+FROM cards c
+JOIN foreign_data fd ON c.uuid = fd.uuid
+WHERE LOWER(c.artist) LIKE LOWER('Volkan Baǵa')
+  AND LOWER(fd.language) = 'French';",,20328.10,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,526,easy,answerable,error,,EMPTY_GENERATED_SQL,26734.07,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,527,medium,answerable,wrong,"SELECT r.date, r.text FROM rulings r JOIN cards c ON r.uuid = c.uuid WHERE LOWER(c.artist) = LOWER('Kev Walker') ORDER BY r.date DESC;",,21344.56,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,,,
+bird_dev,536,easy,answerable,refused,SELECT COUNT(*) AS user_count FROM users WHERE,BLOCKED_UNSAFE_SQL,57386.23,1.0,"badges, comments, posthistory, postlinks, posts, users, votes",1,,,
+bird_dev,552,easy,answerable,correct,SELECT b.Name FROM badges b JOIN users u ON b.UserId = u.Id WHERE LOWER(u.DisplayName) = LOWER('csgillespie'),,15140.39,1.0,"badges, comments, posthistory, posts, tags, users, votes",1,,,
+bird_dev,554,easy,answerable,correct,"SELECT u.DisplayName
+FROM badges b
+JOIN users u ON b.UserId = u.Id
+GROUP BY u.Id, u.DisplayName
+ORDER BY COUNT(*) DESC
+LIMIT 1",,19691.61,1.0,"badges, comments, posthistory, posts, users, votes",1,,,
+bird_dev,560,easy,answerable,correct,SELECT COUNT(*) AS count FROM badges WHERE LOWER(Name) = LOWER('Revival');,,16878.22,1.0,"badges, comments, posthistory, postlinks, posts, tags, users, votes",1,,,
+bird_dev,569,easy,answerable,correct,SELECT COUNT(*) AS vote_count FROM votes v JOIN posts p ON v.PostId = p.Id WHERE LOWER(p.Title) LIKE '%data visualization%';,,14431.30,1.0,"badges, comments, postlinks, posts, users, votes",1,,,
+bird_dev,579,easy,answerable,error,,EMPTY_GENERATED_SQL,26995.55,1.0,"badges, comments, posthistory, posts, tags, users",1,,,
+bird_dev,581,medium,answerable,wrong,"SELECT p.LastEditorDisplayName
+FROM posts p
+WHERE LOWER(p.Title) = LOWER('Open source tools for visualizing multi-dimensional data?')",,23704.75,1.0,"badges, posthistory, postlinks, posts, tags, users, votes",1,,,
+bird_dev,585,easy,answerable,correct,SELECT SUM(v.BountyAmount) AS TotalBountyAmount FROM posts p JOIN votes v ON p.Id = v.PostId WHERE LOWER(p.Title) LIKE '%data%';,,19420.00,1.0,"comments, posthistory, postlinks, posts, tags, users, votes",1,,,
+bird_dev,589,easy,answerable,correct,SELECT Id FROM users ORDER BY Reputation DESC LIMIT 1;,,17814.74,1.0,"badges, comments, posthistory, postlinks, posts, users, votes",1,,,
+bird_dev,590,easy,answerable,wrong,"SELECT Id AS UserId, Views FROM users ORDER BY Views ASC LIMIT 1;",,16237.78,1.0,"badges, comments, posthistory, postlinks, posts, tags, users, votes",1,,,
+bird_dev,594,easy,answerable,correct,"SELECT u.DisplayName, u.Reputation
+FROM users u
+INNER JOIN posts p ON u.Id = p.OwnerUserId
+WHERE p.Id = 1;",,22478.84,1.0,"badges, comments, posthistory, postlinks, posts, users, votes",1,,,
+bird_dev,595,medium,answerable,error,,EMPTY_GENERATED_SQL,25653.76,1.0,"badges, comments, posthistory, posts, users, votes",1,,,
+bird_dev,597,easy,answerable,refused,SELECT COUNT(DISTINCT,BLOCKED_UNSAFE_SQL,26388.20,1.0,"badges, comments, posthistory, posts, users, votes",1,,,
+bird_dev,610,easy,answerable,correct,"SELECT DISTINCT b.Name
+FROM badges b
+JOIN users u ON b.UserId = u.Id
+WHERE u.Reputation = (SELECT MAX(Reputation) FROM users);",,25324.22,1.0,"badges, comments, posthistory, posts, users, votes",1,,,
+bird_dev,619,easy,answerable,correct,"SELECT COUNT(*) AS adult_supporter_count
+FROM badges b
+JOIN users u ON b.UserId = u.Id
+WHERE LOWER(b.Name) LIKE '%Supporter%'
+AND u.Age BETWEEN 19 AND 65;",,26165.92,1.0,"badges, comments, posthistory, posts, tags, users",1,,,
+bird_dev,622,easy,answerable,wrong,SELECT b.Name FROM badges b JOIN users u ON b.UserId = u.Id WHERE LOWER(u.DisplayName) = LOWER('Sharpie');,,12976.61,1.0,"badges, comments, posthistory, posts, users, votes",1,,,
+bird_dev,630,easy,answerable,error,,EMPTY_GENERATED_SQL,26733.96,1.0,"badges, comments, posthistory, posts, tags, users",1,,,
+bird_dev,654,medium,answerable,correct,"SELECT u.DisplayName, u.Location
+FROM tags t
+JOIN posts p ON t.ExcerptPostId = p.Id
+JOIN users u ON p.OwnerUserId = u.Id
+WHERE LOWER(t.TagName) = LOWER('hypothesis-testing');",,20681.84,1.0,"badges, comments, posthistory, posts, tags, users, votes",1,,,
+bird_dev,657,medium,answerable,correct,"SELECT u.DisplayName, u.WebsiteUrl FROM users u JOIN votes v ON u.Id = v.UserId WHERE v.VoteTypeId = 8 AND v.BountyAmount = (SELECT MAX(BountyAmount) FROM votes WHERE VoteTypeId = 8);",,25266.62,1.0,"badges, comments, posthistory, posts, tags, users, votes",1,,,
+bird_dev,661,easy,answerable,correct,SELECT Age FROM users WHERE Reputation = (SELECT MAX(Reputation) FROM users);,,25559.50,1.0,"badges, comments, posthistory, posts, users, votes",1,,,
+bird_dev,664,easy,answerable,correct,SELECT SUM(Score) AS total_score FROM posts WHERE LasActivityDate LIKE '2010-07-19%';,,21851.05,1.0,"comments, posthistory, postlinks, posts, tags, users, votes",1,,,
+bird_dev,665,medium,answerable,error,,EMPTY_GENERATED_SQL,26082.80,1.0,"comments, posthistory, postlinks, posts, tags, users, votes",1,,,
+bird_dev,671,easy,answerable,correct,"SELECT u.DisplayName
+FROM badges b
+JOIN users u ON b.UserId = u.Id
+WHERE LOWER(b.Name) = LOWER('Autobiographer')
+ORDER BY b.Date ASC
+LIMIT 1",,18629.02,1.0,"badges, comments, posthistory, posts, tags, users, votes",1,,,
+bird_dev,676,easy,answerable,correct,SELECT DisplayName FROM users WHERE Age IS NOT NULL AND Age BETWEEN 19 AND 65;,,16173.09,1.0,"badges, comments, posthistory, posts, users, votes",1,,,
+bird_dev,678,easy,answerable,refused,"SELECT Id, Title FROM posts WHERE LOWER(OwnerDisplayName) = LOWER('Harvey Motulsky') AND ViewCount IS NOT NULL ORDER BY ViewCount DESC LIMIT",BLOCKED_UNSAFE_SQL,25872.50,1.0,"badges, comments, posts, tags, users, votes",1,,,
+bird_dev,701,hard,answerable,reference_invalid,,QUERY_ABORTED_AFTER_1000000000_VM_STEPS,25659.40,1.0,"comments, postlinks, posts, tags, users, votes",1,,,
+bird_dev,725,easy,answerable,correct,SELECT COUNT(*) AS count FROM superhero s JOIN publisher p ON s.publisher_id = p.id WHERE LOWER(p.publisher_name) = LOWER('Marvel Comics');,,46610.70,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,728,medium,answerable,wrong,"SELECT 
+    colour.colour,
+    COUNT(superhero.id) AS superhero_count
+FROM superhero
+JOIN publisher ON superhero.publisher_id = publisher.id
+JOIN colour ON superhero.eye_colour_id = colour.id
+WHERE LOWER(publisher_name) = LOWER('Marvel Comics')
+GROUP BY colour.colour
+ORDER BY superhero_count DESC",,48179.12,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,738,easy,answerable,wrong,"SELECT DISTINCT s.superhero_name
+FROM superhero s
+JOIN hero_attribute ha ON s.id = ha.hero_id
+JOIN attribute a ON ha.attribute_id = a.id
+WHERE LOWER(a.attribute_name) = LOWER('Durability')
+  AND ha.attribute_value < 50;",,26188.81,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,746,easy,answerable,correct,SELECT AVG(attribute_value) FROM hero_attribute;,,13843.19,1.0,"alignment, attribute, hero_attribute, hero_power, publisher, superhero, superpower",1,,,
+bird_dev,761,medium,answerable,error,,EMPTY_GENERATED_SQL,25053.86,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,774,easy,answerable,correct,"SELECT r.race
+FROM superhero s
+JOIN race r ON s.race_id = r.id
+WHERE LOWER(s.superhero_name) = LOWER('A-Bomb');",,13010.79,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,777,easy,answerable,correct,"SELECT g.gender
+FROM superhero s
+JOIN gender g ON s.gender_id = g.id
+WHERE LOWER(s.superhero_name) = LOWER('Agent 13');",,12081.71,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,779,easy,answerable,correct,"SELECT COUNT(DISTINCT hp.power_id) AS power_count
+FROM superhero s
+JOIN hero_power hp ON s.id = hp.hero_id
+WHERE LOWER(s.superhero_name) = LOWER('Amazo');",,20694.82,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,785,easy,answerable,correct,"SELECT s.superhero_name
+FROM superhero s
+JOIN alignment a ON s.alignment_id = a.id
+WHERE LOWER(a.alignment) = LOWER('Neutral')",,13678.77,1.0,"alignment, attribute, colour, gender, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,789,easy,answerable,correct,SELECT AVG(s.weight_kg) AS average_weight FROM superhero s JOIN race r ON s.race_id = r.id WHERE LOWER(r.race) LIKE '%alien%';,,22603.71,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,794,medium,answerable,wrong,"SELECT s.superhero_name, ha.attribute_value
+FROM superhero s
+JOIN hero_attribute ha ON s.id = ha.hero_id
+JOIN attribute a ON ha.attribute_id = a.id
+WHERE LOWER(a.attribute_name) = LOWER('Speed')
+ORDER BY ha.attribute_value DESC
+LIMIT 1;",,16191.09,1.0,"alignment, attribute, hero_attribute, hero_power, publisher, superhero, superpower",1,,,
+bird_dev,801,medium,answerable,error,,EMPTY_GENERATED_SQL,24957.40,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,808,easy,answerable,wrong,"SELECT r.race
+FROM superhero s
+JOIN race r ON s.race_id = r.id
+WHERE s.weight_kg = 108 AND s.height_cm = 188;",,23753.88,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,819,hard,answerable,refused,SELECT SUM(CASE WHEN c.colour = 'Blue' THEN 1 ELSE 0 END) - SUM(CASE,BLOCKED_UNSAFE_SQL,25547.38,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,832,easy,answerable,correct,SELECT superhero_name FROM superhero ORDER BY height_cm DESC LIMIT 1;,,18321.26,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,833,easy,answerable,correct,SELECT superhero_name FROM superhero WHERE LOWER(full_name) = LOWER('Charles Chandler');,,10301.46,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,837,easy,answerable,wrong,SELECT hero_id FROM hero_attribute ORDER BY attribute_value ASC LIMIT 1;,,15200.08,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,839,easy,answerable,correct,"SELECT s.full_name
+FROM superhero s
+JOIN colour c ON s.eye_colour_id = c.id
+WHERE s.weight_kg < 100
+AND LOWER(c.colour) = 'brown'",,20220.87,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,,,
+bird_dev,868,easy,answerable,wrong,"SELECT c.lat, c.lng, c.location
+FROM circuits c
+JOIN races r ON c.circuitId = r.circuitId
+WHERE LOWER(r.name) LIKE '%malaysian grand prix%';",,24514.16,1.0,"circuits, constructors, drivers, driverstandings, laptimes, pitstops, races, seasons",1,,,
+bird_dev,872,easy,answerable,error,,EMPTY_GENERATED_SQL,27983.69,1.0,"circuits, constructors, drivers, laptimes, pitstops, qualifying, races, results, seasons, status",1,,,
+bird_dev,894,medium,answerable,wrong,"SELECT d.forename, d.surname, r.name AS race_name FROM lapTimes lt JOIN drivers d ON lt.driverId = d.driverId JOIN races r ON lt.raceId = r.raceId ORDER BY lt.milliseconds ASC LIMIT 1;",,23710.96,1.0,"circuits, constructors, drivers, laptimes, pitstops, races, results, seasons, status",1,,,
+bird_dev,895,medium,answerable,error,,EMPTY_GENERATED_SQL,26905.69,1.0,"circuits, constructors, drivers, laptimes, pitstops, races, results, seasons, status",1,,,
+bird_dev,899,medium,answerable,refused,"SELECT c.circuitId, c.name, c.location, c.country, COUNT(r.raceId) AS race_count
+FROM circuits c
+JOIN races r ON c.circuitId = r.circuitId
+WHERE r.year BETWEEN 19",BLOCKED_UNSAFE_SQL,27250.60,1.0,"circuits, constructorresults, constructors, drivers, driverstandings, races, seasons",1,,,
+bird_dev,915,easy,answerable,error,,EMPTY_GENERATED_SQL,27445.94,1.0,"circuits, drivers, driverstandings, laptimes, pitstops, races, seasons",1,,,
+bird_dev,922,easy,answerable,error,,EMPTY_GENERATED_SQL,27086.21,1.0,"circuits, constructorresults, constructors, drivers, laptimes, pitstops, races, results, seasons, status",1,,,
+bird_dev,923,easy,answerable,correct,SELECT COUNT(*) AS race_count FROM races r JOIN circuits c ON r.circuitId = c.circuitId WHERE LOWER(c.country) = LOWER('Italy');,,21804.87,1.0,"circuits, constructorresults, constructors, drivers, driverstandings, laptimes, pitstops, races, seasons",1,,,
+bird_dev,944,hard,answerable,refused,"SELECT 
+    ROUND(((last_milliseconds - champion_milliseconds) * 100.0 / last_milliseconds), 2) AS percentage_faster
+FROM (
+    SELECT 
+        r.raceId,
+        MIN(r.milliseconds) AS champion_milliseconds,
+        MAX(r",BLOCKED_UNSAFE_SQL,26631.40,1.0,"circuits, constructors, drivers, driverstandings, laptimes, pitstops, races, results, seasons, status",1,,,
+bird_dev,958,medium,answerable,wrong,"SELECT d.forename, d.surname
+FROM lapTimes lt
+JOIN drivers d ON lt.driverId = d.driverId
+ORDER BY lt.milliseconds ASC
+LIMIT 1;",,18528.61,1.0,"circuits, constructors, drivers, driverstandings, laptimes, pitstops, races, results, seasons, status",1,,,
+bird_dev,964,easy,answerable,correct,SELECT code FROM drivers WHERE LOWER(nationality) = LOWER('American');,,18058.95,1.0,"constructors, drivers, driverstandings, laptimes, pitstops, qualifying, races",1,,,
+bird_dev,967,easy,answerable,error,,EMPTY_GENERATED_SQL,26164.76,1.0,"constructors, drivers, driverstandings, laptimes, pitstops, qualifying, races",1,,,
+bird_dev,981,medium,answerable,error,,EMPTY_GENERATED_SQL,26342.14,1.0,"circuits, constructors, drivers, qualifying, races, seasons",1,,,
+bird_dev,983,easy,answerable,error,,EMPTY_GENERATED_SQL,24782.41,0.5,"circuits, constructorresults, constructors, drivers, races, seasons",1,,,
+bird_dev,988,hard,answerable,error,,EMPTY_GENERATED_SQL,24827.54,1.0,"circuits, constructors, drivers, pitstops, races, seasons",1,,,
+bird_dev,990,hard,answerable,error,"SELECT c.constructorRef, c",OperationalError: no such column: c.constructorRef,51494.10,1.0,"circuits, constructors, drivers, laptimes, pitstops, races, results, seasons, status",1,,,
+bird_dev,996,easy,answerable,error,,EMPTY_GENERATED_SQL,27162.36,1.0,"circuits, constructors, drivers, driverstandings, pitstops, qualifying, races, results, seasons, status",1,,,
+bird_dev,1004,easy,answerable,error,,EMPTY_GENERATED_SQL,24894.14,1.0,"circuits, constructors, constructorstandings, drivers, driverstandings, races, seasons",1,,,
+bird_dev,1026,medium,answerable,error,,EMPTY_GENERATED_SQL,31943.05,1.0,"country, league, match, player, player_attributes, team, team_attributes",1,,,
+bird_dev,1037,hard,answerable,refused,SELECT CAST(SUM(CASE WHEN LOWER(pa.preferred_foot) = 'left' THEN 1 ELSE 0 END) AS,BLOCKED_UNSAFE_SQL,29930.42,1.0,"country, league, match, player, player_attributes, team, team_attributes",1,,,
+bird_dev,1061,easy,answerable,error,,EMPTY_GENERATED_SQL,29606.45,1.0,"country, league, match, player, player_attributes, team, team_attributes",1,,,
+bird_dev,1075,medium,answerable,error,"SELECT pa.player_api_id, p.player_name, pa.balance, pa.potential",OperationalError: no such column: pa.player_api_id,55116.62,1.0,"country, league, match, player, player_attributes, team, team_attributes",1,,,
+bird_dev,1085,medium,answerable,error,,EMPTY_GENERATED_SQL,24982.22,1.0,"country, league, match, player, player_attributes, team, team_attributes",1,,,
+bird_dev,1088,medium,answerable,correct,SELECT DISTINCT p.player_name FROM Player p JOIN Player_Attributes pa ON p.player_api_id = pa.player_api_id WHERE pa.volleys > 70 AND pa.dribbling > 70,,22045.21,1.0,"country, league, match, player, player_attributes, team, team_attributes",1,,,
+bird_dev,1104,medium,answerable,error,,EMPTY_GENERATED_SQL,29687.33,1.0,"country, league, match, player, player_attributes, team, team_attributes",1,,,
+bird_dev,1131,easy,answerable,reference_invalid,,QUERY_ABORTED_AFTER_1000000000_VM_STEPS,28647.81,1.0,"country, league, match, player, team, team_attributes",1,,,
+bird_dev,1168,hard,answerable,error,,EMPTY_GENERATED_SQL,26356.14,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1172,easy,answerable,wrong,"SELECT COUNT(DISTINCT p.ID) 
+FROM Patient p
+JOIN Laboratory lab ON p.ID = lab.ID
+WHERE LOWER(p.SEX) = 'M'
+AND lab.`T-BIL` IS NOT NULL
+AND lab.`T-BIL` >= 2.0;",,25252.32,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1175,medium,answerable,error,,EMPTY_GENERATED_SQL,24475.15,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1180,medium,answerable,error,,EMPTY_GENERATED_SQL,24636.19,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1194,hard,answerable,wrong,"SELECT Patient.SEX
+FROM Patient
+JOIN Examination ON Patient.ID = Examination.ID",,26946.40,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1198,easy,answerable,refused,SELECT COUNT(*) AS count FROM Patient WHERE LOWER(SEX,BLOCKED_UNSAFE_SQL,25797.63,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1204,easy,answerable,error,,EMPTY_GENERATED_SQL,24598.89,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1213,medium,answerable,error,,EMPTY_GENERATED_SQL,24782.21,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1218,medium,answerable,error,,EMPTY_GENERATED_SQL,24868.91,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1222,easy,answerable,correct,"SELECT COUNT(DISTINCT P.ID) AS patient_count
+FROM Patient P
+JOIN Laboratory L ON P.ID = L.ID
+WHERE LOWER(P.SEX) = LOWER('M')
+AND L.CRE >= 1.5",,46675.78,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1230,easy,answerable,correct,"SELECT DISTINCT p.ID
+FROM Patient p
+JOIN Laboratory l ON p.ID = l.ID
+WHERE LOWER(p.Admission) = LOWER('-')
+  AND l.CPK < 250;",,23077.89,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1231,hard,answerable,error,,EMPTY_GENERATED_SQL,24551.84,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1241,hard,answerable,error,,EMPTY_GENERATED_SQL,25080.96,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1259,medium,answerable,error,,EMPTY_GENERATED_SQL,27177.40,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1264,medium,answerable,wrong,SELECT COUNT(*) AS patient_count FROM Patient p,,24561.89,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1275,medium,answerable,error,,EMPTY_GENERATED_SQL,24546.59,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1297,medium,answerable,error,,EMPTY_GENERATED_SQL,24431.42,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1301,easy,answerable,error,,EMPTY_GENERATED_SQL,25597.57,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1302,hard,answerable,wrong,"SELECT COUNT(DISTINCT e.ID) AS patient_count
+FROM Examination e
+JOIN Laboratory l ON e.ID = l.ID
+WHERE l.CPK < 250
+AND (LOWER(e.KCT) = '+' OR LOWER(e.RVVT) = '+' OR LOWER(e.LAC) = '+')",,22641.58,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1309,medium,answerable,error,,EMPTY_GENERATED_SQL,24690.33,1.0,"examination, laboratory, patient",1,,,
+bird_dev,1315,easy,answerable,error,,EMPTY_GENERATED_SQL,25502.97,1.0,"attendance, budget, event, income, major, member, zip_code",1,,,
+bird_dev,1316,medium,answerable,refused,"SELECT member.phone
+FROM member
+JOIN attendance ON member.member_id = attendance.link_to_member
+JOIN event ON attendance.link_to_event = event.event_id
+WHERE LOWER(event.event_name) LIKE '%women% soccer%' OR LOWER(event.event_name) LIKE '%soccer",BLOCKED_UNSAFE_SQL,26625.80,1.0,"attendance, budget, event, income, major, member, zip_code",1,,,
+bird_dev,1317,medium,answerable,unanswerable,SELECT 'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error;,UNANSWERABLE_WITH_GIVEN_SCHEMA,26460.94,1.0,"attendance, budget, event, income, major, member, zip_code",1,,,
+bird_dev,1324,medium,answerable,error,,EMPTY_GENERATED_SQL,26807.51,1.0,"attendance, budget, event, income, major, member, zip_code",1,,,
+bird_dev,1329,easy,answerable,correct,"SELECT z.county
+FROM member m
+JOIN zip_code z ON m.zip = z.zip_code
+WHERE LOWER(m.first_name) = LOWER('Sherri') 
+  AND LOWER(m.last_name) = LOWER('Ramsey');",,22475.56,1.0,"budget, event, expense, income, major, member, zip_code",1,,,
+bird_dev,1337,easy,answerable,correct,"SELECT SUM(b.amount) AS total_budgeted_amount
+FROM budget b
+JOIN event e ON b.link_to_event = e.event_id
+WHERE LOWER(e.event_name) = LOWER('October Speaker');",,22120.74,1.0,"attendance, budget, event, income, major, member, zip_code",1,,,
+bird_dev,1350,medium,answerable,error,,EMPTY_GENERATED_SQL,27128.88,1.0,"attendance, budget, event, expense, income, major, member, zip_code",1,,,
+bird_dev,1362,easy,answerable,error,,EMPTY_GENERATED_SQL,25922.31,1.0,"budget, event, income, major, member, zip_code",1,,,
+bird_dev,1365,easy,answerable,error,,EMPTY_GENERATED_SQL,26120.80,1.0,"attendance, budget, event, expense, income, major, member, zip_code",1,,,
+bird_dev,1373,easy,answerable,correct,SELECT COUNT(*) AS count FROM member m JOIN zip_code z ON m.zip = z.zip_code WHERE LOWER(z.state) = LOWER('Maryland');,,24716.94,1.0,"budget, event, expense, income, major, member, zip_code",1,,,
+bird_dev,1379,easy,answerable,correct,"SELECT COUNT(*) FROM event WHERE LOWER(type) = 'meeting' AND strftime('%Y', event_date) = '2020';",,18834.83,1.0,"attendance, budget, event, expense, income, member, zip_code",1,,,
+bird_dev,1383,easy,answerable,wrong,"SELECT m.first_name || ' ' || m.last_name AS name
+FROM member m
+JOIN zip_code z ON m.zip = z.zip_code
+WHERE LOWER(z.city) LIKE '%georgetown%'
+  AND LOWER(z.state) LIKE '%south carolina%';",,23156.02,1.0,"budget, event, income, major, member, zip_code",1,,,
+bird_dev,1393,easy,answerable,correct,"SELECT first_name, last_name, email FROM member WHERE LOWER(position) = LOWER('Secretary');",,24132.57,1.0,"attendance, budget, event, income, major, member, zip_code",1,,,
+bird_dev,1409,easy,answerable,correct,SELECT SUM(cost) AS total_expense FROM expense WHERE expense_date = '2019-08-20';,,21375.58,1.0,"budget, event, expense, income, major, member, zip_code",1,,,
+bird_dev,1411,easy,answerable,correct,"SELECT e.expense_description
+FROM expense e
+JOIN member m ON e.link_to_member = m.member_id
+WHERE LOWER(m.first_name) = LOWER('Sacha') 
+  AND LOWER(m.last_name) = LOWER('Harrison');",,20665.53,1.0,"budget, event, expense, income, major, member, zip_code",1,,,
+bird_dev,1426,medium,answerable,refused,"SELECT m.last_name, ma.department, ma.college
+FROM member m
+JOIN major ma ON m.link_to_major = ma.major_id
+WHERE",BLOCKED_UNSAFE_SQL,25407.50,1.0,"budget, event, expense, income, major, member, zip_code",1,,,
+bird_dev,1430,medium,answerable,error,,EMPTY_GENERATED_SQL,26671.82,1.0,"budget, event, expense, income, major, member, zip_code",1,,,
+bird_dev,1434,easy,answerable,error,,EMPTY_GENERATED_SQL,25711.20,1.0,"attendance, budget, event, expense, major, member, zip_code",1,,,
+bird_dev,1437,hard,answerable,error,,EMPTY_GENERATED_SQL,26350.27,1.0,"attendance, budget, event, expense, income, major, member, zip_code",1,,,
+bird_dev,1438,easy,answerable,correct,"SELECT maj.college
+FROM member m
+JOIN major maj ON m.link_to_major = maj.major_id
+WHERE LOWER(m.first_name) = LOWER('Katy')
+AND m.link_to_major = 'rec1N0upiVLy5esTO'",,38344.46,1.0,"attendance, budget, event, expense, income, major, member, zip_code",1,,,
+bird_dev,1454,medium,answerable,error,,EMPTY_GENERATED_SQL,27284.35,1.0,"attendance, budget, event, expense, income, member, zip_code",1,,,
+bird_dev,1471,easy,answerable,error,,EMPTY_GENERATED_SQL,24556.16,1.0,"customers, gasstations, products, transactions_1k, yearmonth",1,,,
+bird_dev,1473,medium,answerable,error,,EMPTY_GENERATED_SQL,24276.77,1.0,"customers, gasstations, products, transactions_1k, yearmonth",1,,,
+bird_dev,1487,medium,answerable,error,,EMPTY_GENERATED_SQL,24476.79,1.0,"customers, gasstations, products, transactions_1k, yearmonth",1,,,
+bird_dev,1490,medium,answerable,wrong,SELECT CAST(SUM(CASE WHEN c.Segment = 'LAM' AND y.Consumption > 46.73 THEN 1 ELSE 0 END) AS REAL) * 100.0 / SUM(CASE WHEN c.Segment = 'LAM' THEN 1 ELSE 0 END) AS percentage FROM customers c LEFT JOIN yearmonth y ON c.CustomerID = y.CustomerID WHERE c.Segment LIKE '%LAM%';,,25417.38,1.0,"customers, gasstations, products, transactions_1k, yearmonth",1,,,
+bird_dev,1493,easy,answerable,error,,EMPTY_GENERATED_SQL,24491.97,1.0,"customers, gasstations, products, transactions_1k, yearmonth",1,,,
+bird_dev,1496,easy,answerable,wrong,"SELECT c.Segment, SUM(y.Consumption) AS TotalConsumption
+FROM yearmonth y
+JOIN customers c ON y.CustomerID = c.CustomerID
+WHERE y.Date = '201309'
+GROUP BY c.Segment
+ORDER BY TotalConsumption ASC
+LIMIT 1;",,23801.69,1.0,"customers, gasstations, products, transactions_1k, yearmonth",1,,,
+bird_dev,1507,easy,answerable,error,,EMPTY_GENERATED_SQL,24926.43,1.0,"customers, gasstations, products, transactions_1k, yearmonth",1,,,
