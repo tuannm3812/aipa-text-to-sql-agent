@@ -1,0 +1,277 @@
+[
+  {
+    "db_id": "pets_mini",
+    "question": "How many pets are there?",
+    "query": "SELECT count(*) FROM pets",
+    "sql": {
+      "from": {
+        "table_units": [
+          [
+            "table_unit",
+            0
+          ]
+        ],
+        "conds": []
+      },
+      "select": [
+        false,
+        [
+          [
+            3,
+            [
+              0,
+              [
+                0,
+                0,
+                false
+              ],
+              null
+            ]
+          ]
+        ]
+      ],
+      "where": [],
+      "groupBy": [],
+      "having": [],
+      "orderBy": [],
+      "limit": null,
+      "intersect": null,
+      "union": null,
+      "except": null
+    },
+    "query_toks": [
+      "SELECT",
+      "count(*)",
+      "FROM",
+      "pets"
+    ],
+    "query_toks_no_value": [
+      "select",
+      "count(*)",
+      "from",
+      "pets"
+    ],
+    "question_toks": [
+      "How",
+      "many",
+      "pets",
+      "are",
+      "there?"
+    ]
+  },
+  {
+    "db_id": "shop_mini",
+    "question": "What is the name of the oldest employee?",
+    "query": "SELECT name FROM employee ORDER BY age DESC LIMIT 1",
+    "sql": {
+      "from": {
+        "table_units": [
+          [
+            "table_unit",
+            1
+          ]
+        ],
+        "conds": []
+      },
+      "select": [
+        false,
+        [
+          [
+            0,
+            [
+              0,
+              [
+                0,
+                4,
+                false
+              ],
+              null
+            ]
+          ]
+        ]
+      ],
+      "where": [],
+      "groupBy": [],
+      "having": [],
+      "orderBy": [
+        "desc",
+        [
+          [
+            0,
+            [
+              0,
+              5,
+              false
+            ],
+            null
+          ]
+        ]
+      ],
+      "limit": 1,
+      "intersect": null,
+      "union": null,
+      "except": null
+    },
+    "query_toks": [
+      "SELECT",
+      "name",
+      "FROM",
+      "employee",
+      "ORDER",
+      "BY",
+      "age",
+      "DESC",
+      "LIMIT",
+      "1"
+    ],
+    "query_toks_no_value": [
+      "select",
+      "name",
+      "from",
+      "employee",
+      "order",
+      "by",
+      "age",
+      "desc",
+      "limit",
+      "1"
+    ],
+    "question_toks": [
+      "What",
+      "is",
+      "the",
+      "name",
+      "of",
+      "the",
+      "oldest",
+      "employee?"
+    ]
+  },
+  {
+    "db_id": "shop_mini",
+    "question": "Which shops have no employees?",
+    "query": "SELECT name FROM shop WHERE shop_id NOT IN (SELECT shop_id FROM employee)",
+    "sql": {
+      "from": {
+        "table_units": [
+          [
+            "table_unit",
+            0
+          ]
+        ],
+        "conds": []
+      },
+      "select": [
+        false,
+        [
+          [
+            0,
+            [
+              0,
+              [
+                0,
+                2,
+                false
+              ],
+              null
+            ]
+          ]
+        ]
+      ],
+      "where": [
+        [
+          true,
+          8,
+          [
+            0,
+            [
+              0,
+              1,
+              false
+            ],
+            null
+          ],
+          {
+            "from": {
+              "table_units": [
+                [
+                  "table_unit",
+                  1
+                ]
+              ],
+              "conds": []
+            },
+            "select": [
+              false,
+              [
+                [
+                  0,
+                  [
+                    0,
+                    [
+                      0,
+                      6,
+                      false
+                    ],
+                    null
+                  ]
+                ]
+              ]
+            ],
+            "where": [],
+            "groupBy": [],
+            "having": [],
+            "orderBy": [],
+            "limit": null,
+            "intersect": null,
+            "union": null,
+            "except": null
+          },
+          null
+        ]
+      ],
+      "groupBy": [],
+      "having": [],
+      "orderBy": [],
+      "limit": null,
+      "intersect": null,
+      "union": null,
+      "except": null
+    },
+    "query_toks": [
+      "SELECT",
+      "name",
+      "FROM",
+      "shop",
+      "WHERE",
+      "shop_id",
+      "NOT",
+      "IN",
+      "(SELECT",
+      "shop_id",
+      "FROM",
+      "employee)"
+    ],
+    "query_toks_no_value": [
+      "select",
+      "name",
+      "from",
+      "shop",
+      "where",
+      "shop_id",
+      "not",
+      "in",
+      "(select",
+      "shop_id",
+      "from",
+      "employee)"
+    ],
+    "question_toks": [
+      "Which",
+      "shops",
+      "have",
+      "no",
+      "employees?"
+    ]
+  }
+]

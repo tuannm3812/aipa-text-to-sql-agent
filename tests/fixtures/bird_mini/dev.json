@@ -1,0 +1,26 @@
+[
+  {
+    "question_id": 100,
+    "db_id": "club_mini",
+    "question": "How many members does the club have?",
+    "evidence": "",
+    "SQL": "SELECT COUNT(*) FROM member",
+    "difficulty": "simple"
+  },
+  {
+    "question_id": 205,
+    "db_id": "hero_mini",
+    "question": "What is the average height of heroes taller than 2 metres?",
+    "evidence": "taller than 2 metres refers to height_cm > 200",
+    "SQL": "SELECT AVG(height_cm) FROM superhero WHERE height_cm > 200",
+    "difficulty": "moderate"
+  },
+  {
+    "question_id": 317,
+    "db_id": "club_mini",
+    "question": "Which member spent the most in total?",
+    "evidence": null,
+    "SQL": "SELECT m.name FROM member AS m JOIN expense AS e ON e.member_id = m.member_id GROUP BY m.member_id ORDER BY SUM(e.cost) DESC LIMIT 1",
+    "difficulty": "challenging"
+  }
+]

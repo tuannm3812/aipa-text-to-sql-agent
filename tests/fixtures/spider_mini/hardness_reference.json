@@ -1,0 +1,506 @@
+[
+ {
+  "dev_index": 295,
+  "db_id": "employee_hire_evaluation",
+  "query": "SELECT count(DISTINCT LOCATION) FROM shop",
+  "sql": {
+   "from": {
+    "table_units": [
+     [
+      "table_unit",
+      1
+     ]
+    ],
+    "conds": []
+   },
+   "select": [
+    false,
+    [
+     [
+      3,
+      [
+       0,
+       [
+        0,
+        7,
+        true
+       ],
+       null
+      ]
+     ]
+    ]
+   ],
+   "where": [],
+   "groupBy": [],
+   "having": [],
+   "orderBy": [],
+   "limit": null,
+   "intersect": null,
+   "union": null,
+   "except": null
+  },
+  "official_hardness": "easy"
+ },
+ {
+  "dev_index": 506,
+  "db_id": "battle_death",
+  "query": "SELECT note FROM death WHERE note LIKE '%East%'",
+  "sql": {
+   "from": {
+    "table_units": [
+     [
+      "table_unit",
+      2
+     ]
+    ],
+    "conds": []
+   },
+   "select": [
+    false,
+    [
+     [
+      0,
+      [
+       0,
+       [
+        0,
+        16,
+        false
+       ],
+       null
+      ]
+     ]
+    ]
+   ],
+   "where": [
+    [
+     false,
+     9,
+     [
+      0,
+      [
+       0,
+       16,
+       false
+      ],
+      null
+     ],
+     "\"%East%\"",
+     null
+    ]
+   ],
+   "groupBy": [],
+   "having": [],
+   "orderBy": [],
+   "limit": null,
+   "intersect": null,
+   "union": null,
+   "except": null
+  },
+  "official_hardness": "medium"
+ },
+ {
+  "dev_index": 331,
+  "db_id": "cre_Doc_Template_Mgt",
+  "query": "SELECT template_type_code FROM Templates GROUP BY template_type_code ORDER BY count(*) DESC LIMIT 1",
+  "sql": {
+   "from": {
+    "table_units": [
+     [
+      "table_unit",
+      1
+     ]
+    ],
+    "conds": []
+   },
+   "select": [
+    false,
+    [
+     [
+      0,
+      [
+       0,
+       [
+        0,
+        5,
+        false
+       ],
+       null
+      ]
+     ]
+    ]
+   ],
+   "where": [],
+   "groupBy": [
+    [
+     0,
+     5,
+     false
+    ]
+   ],
+   "having": [],
+   "orderBy": [
+    "desc",
+    [
+     [
+      0,
+      [
+       3,
+       0,
+       false
+      ],
+      null
+     ]
+    ]
+   ],
+   "limit": 1,
+   "intersect": null,
+   "union": null,
+   "except": null
+  },
+  "official_hardness": "hard"
+ },
+ {
+  "dev_index": 974,
+  "db_id": "dog_kennels",
+  "query": "SELECT count(*) FROM Dogs WHERE age  <  ( SELECT avg(age) FROM Dogs )",
+  "sql": {
+   "from": {
+    "table_units": [
+     [
+      "table_unit",
+      5
+     ]
+    ],
+    "conds": []
+   },
+   "select": [
+    false,
+    [
+     [
+      3,
+      [
+       0,
+       [
+        0,
+        0,
+        false
+       ],
+       null
+      ]
+     ]
+    ]
+   ],
+   "where": [
+    [
+     false,
+     4,
+     [
+      0,
+      [
+       0,
+       26,
+       false
+      ],
+      null
+     ],
+     {
+      "from": {
+       "table_units": [
+        [
+         "table_unit",
+         5
+        ]
+       ],
+       "conds": []
+      },
+      "select": [
+       false,
+       [
+        [
+         5,
+         [
+          0,
+          [
+           0,
+           26,
+           false
+          ],
+          null
+         ]
+        ]
+       ]
+      ],
+      "where": [],
+      "groupBy": [],
+      "having": [],
+      "orderBy": [],
+      "limit": null,
+      "intersect": null,
+      "union": null,
+      "except": null
+     },
+     null
+    ]
+   ],
+   "groupBy": [],
+   "having": [],
+   "orderBy": [],
+   "limit": null,
+   "intersect": null,
+   "union": null,
+   "except": null
+  },
+  "official_hardness": "hard"
+ },
+ {
+  "dev_index": 107,
+  "db_id": "car_1",
+  "query": "SELECT T2.CountryName FROM CAR_MAKERS AS T1 JOIN COUNTRIES AS T2 ON T1.Country  =  T2.CountryId GROUP BY T1.Country ORDER BY Count(*) DESC LIMIT 1;",
+  "sql": {
+   "from": {
+    "table_units": [
+     [
+      "table_unit",
+      2
+     ],
+     [
+      "table_unit",
+      1
+     ]
+    ],
+    "conds": [
+     [
+      false,
+      2,
+      [
+       0,
+       [
+        0,
+        9,
+        false
+       ],
+       null
+      ],
+      [
+       0,
+       3,
+       false
+      ],
+      null
+     ]
+    ]
+   },
+   "select": [
+    false,
+    [
+     [
+      0,
+      [
+       0,
+       [
+        0,
+        4,
+        false
+       ],
+       null
+      ]
+     ]
+    ]
+   ],
+   "where": [],
+   "groupBy": [
+    [
+     0,
+     9,
+     false
+    ]
+   ],
+   "having": [],
+   "orderBy": [
+    "desc",
+    [
+     [
+      0,
+      [
+       3,
+       0,
+       false
+      ],
+      null
+     ]
+    ]
+   ],
+   "limit": 1,
+   "intersect": null,
+   "union": null,
+   "except": null
+  },
+  "official_hardness": "extra"
+ },
+ {
+  "dev_index": 505,
+  "db_id": "battle_death",
+  "query": "SELECT name ,  RESULT ,  bulgarian_commander FROM battle EXCEPT SELECT T1.name ,  T1.result ,  T1.bulgarian_commander FROM battle AS T1 JOIN ship AS T2 ON T1.id  =  T2.lost_in_battle WHERE T2.location  =  'English Channel'",
+  "sql": {
+   "from": {
+    "table_units": [
+     [
+      "table_unit",
+      0
+     ]
+    ],
+    "conds": []
+   },
+   "select": [
+    false,
+    [
+     [
+      0,
+      [
+       0,
+       [
+        0,
+        2,
+        false
+       ],
+       null
+      ]
+     ],
+     [
+      0,
+      [
+       0,
+       [
+        0,
+        6,
+        false
+       ],
+       null
+      ]
+     ],
+     [
+      0,
+      [
+       0,
+       [
+        0,
+        4,
+        false
+       ],
+       null
+      ]
+     ]
+    ]
+   ],
+   "where": [],
+   "groupBy": [],
+   "having": [],
+   "orderBy": [],
+   "limit": null,
+   "intersect": null,
+   "union": null,
+   "except": {
+    "from": {
+     "table_units": [
+      [
+       "table_unit",
+       0
+      ],
+      [
+       "table_unit",
+       1
+      ]
+     ],
+     "conds": [
+      [
+       false,
+       2,
+       [
+        0,
+        [
+         0,
+         1,
+         false
+        ],
+        null
+       ],
+       [
+        0,
+        7,
+        false
+       ],
+       null
+      ]
+     ]
+    },
+    "select": [
+     false,
+     [
+      [
+       0,
+       [
+        0,
+        [
+         0,
+         2,
+         false
+        ],
+        null
+       ]
+      ],
+      [
+       0,
+       [
+        0,
+        [
+         0,
+         6,
+         false
+        ],
+        null
+       ]
+      ],
+      [
+       0,
+       [
+        0,
+        [
+         0,
+         4,
+         false
+        ],
+        null
+       ]
+      ]
+     ]
+    ],
+    "where": [
+     [
+      false,
+      2,
+      [
+       0,
+       [
+        0,
+        12,
+        false
+       ],
+       null
+      ],
+      "\"English Channel\"",
+      null
+     ]
+    ],
+    "groupBy": [],
+    "having": [],
+    "orderBy": [],
+    "limit": null,
+    "intersect": null,
+    "union": null,
+    "except": null
+   }
+  },
+  "official_hardness": "extra"
+ }
+]
