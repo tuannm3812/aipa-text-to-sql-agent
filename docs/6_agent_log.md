@@ -3476,3 +3476,131 @@ Evaluated 12 cases. Exact result match: 12/12
 **Not done:** the full Spider/BIRD release runs (about 25-30 hours of machine
 time at the measured rate), gate G8, and prompt-token accounting for Ollama.
 All three lead `docs/4_next_steps.md`.
+
+## 2026-10-09 — Codex: follow-up implementation review, UI and first-result audit
+
+Reviewed the changes after `404d4f5` through `80e2ab8`, including the response
+to the four previous findings, the Streamlit migration, the sentinel fix and
+the five committed routine result bundles. The tree was clean before the
+review and HEAD remained `80e2ab8` during verification.
+
+**Previous findings closed for their reproduced cases:**
+
+- The 100%-to-1% regression now returns FAIL and pairs all 100 cases; generation
+  failures stay in the headline population and are reported separately.
+- The interrupted SQLite fixture now refuses resume after its database is
+  changed, naming `database_fingerprint`; zero cases execute and the existing
+  artifacts remain byte-identical.
+- The replacement live lock is preserved and takeover refuses when its contents
+  differ from the observed stale lock. The new protocol never renames the live
+  lock away to create the gap demonstrated in the last review, and cleanup
+  checks the session token.
+- The nested-CTE probe now reports `['customers', 'orders']`, retaining the
+  physical outer table. Scoped extraction and fingerprint fields have tests.
+
+These closures do not claim the carried-forward mid-session database-change,
+SQLite WAL or shared-hostname PID-namespace limitations are fixed. They are
+explicitly recorded in `docs/4_next_steps.md`. Full public release runs remain
+pending; the README keeps public subset results labelled as harness evidence.
+
+### P2 — sentinel substring matching refuses otherwise valid reads
+
+The model's exact refusal statement now reaches the user as a refusal, as
+intended. However, `text_to_sql_agent/pipeline.py:286` recognises a sentinel by
+its presence anywhere in the SQL text, including comments and ordinary data
+literals. The new `BLOCKED_UNSAFE_SQL` branch therefore introduces false
+refusals for valid read-only questions whose generated SQL contains that text.
+
+Reproduced on a temporary `events(id, status)` table containing
+`(1, 'BLOCKED_UNSAFE_SQL')`, patching only the model response and exercising
+the real `ask_database_with_sql` pipeline:
+
+```sql
+SELECT id FROM events /* BLOCKED_UNSAFE_SQL */
+SELECT id FROM events WHERE status = 'BLOCKED_UNSAFE_SQL'
+```
+
+Both return `error='BLOCKED_UNSAFE_SQL'`, with no rows. The same statements
+through the real `run_gold` safety/execution path return `error=None` and
+`[(1,)]`. As a positive control, the actual control statement
+`SELECT 'BLOCKED_UNSAFE_SQL' AS error;` still returns the intended refusal.
+The two other statements are queries about data, not the model emitting that
+control response. The shared helper also carries forward the equivalent
+substring problem for `UNANSWERABLE_WITH_GIVEN_SCHEMA`.
+
+**For Claude:** recognise the sentinel response structurally rather than
+matching a string anywhere in the statement. Preserve both intended control
+responses on initial generation and repair, but let comments, identifiers and
+filter literals containing the code remain ordinary query content subject to
+the existing validator. Keep non-read-only SQL governed by the unsafe-query
+check. Add the two negative fixtures above for both public pipeline wrappers
+and the repair path, alongside the current positive sentinel tests. This is a
+request to tighten detection, not to undo the owner's refusal-scoring choice.
+
+### Audit of the committed results
+
+Read all five committed manifests and CSVs, checked their manifest and identity
+checksums, unique case IDs, row counts and CSV columns, and regenerated each
+report with `render_report`: every report matches its committed bytes. All
+five recompute as `complete` and citable, record commit `7c1aaa4`, and report
+zero generation failures. The values independently recomputed from the rows
+agree with Claude's entry and the README:
+
+| Run | Recomputed result |
+|---|---|
+| demo | EX 5/12, 41.7% [16.7, 66.7] |
+| safety | safety accuracy 12/15, 80.0% [60.0, 100.0] |
+| Spider subset200 | EX 103/200, 51.5% [44.5, 58.5] |
+| BIRD subset200, evidence on | EX 51/200, 25.5% [19.5, 32.0] |
+| BIRD subset200, evidence off | EX 34/200, 17.0% [12.0, 22.5] |
+
+The same-ID BIRD paired calculation reproduces **+8.5 points [3.5, 13.5]**,
+with **23** cases helped and **6** hurt. This audits recorded evidence; no
+provider calls were repeated, so it does not assess generation variance or
+independently reproduce model output.
+
+### Fresh verification and scope
+
+- Full `uv run pytest`: **1,148 passed, 350 skipped** (no PostgreSQL DSN).
+- Focused gates, identity, runner, adapters, pipeline and UI suites:
+  **329 passed, 2 skipped**. This includes the AppTest cold-start, gold demo
+  evaluation and result-viewer tests; the two skips require PostgreSQL.
+- Ruff check passed; format check: **112 files** already formatted; mypy:
+  no issues in **46 source files**.
+- Real CLI gold gate: demo PASS at **12/12**; safety PASS with **15**
+  structural cases and EX not applicable.
+- Fresh runtime probes checked all four earlier reproductions and the sentinel
+  false-refusal finding above. They used temporary databases and files only.
+
+Commands used `UV_CACHE_DIR=/private/tmp/aipa-review-uv`. No live PostgreSQL,
+remote CI or full public benchmark run was verified in this review. Only this
+append-only log entry was added; no application, spec, plan or result artifact
+was changed, and no commit, push or message to another agent was made.
+
+## 2026-10-10 — Codex: repeat status check; sentinel finding remains open
+
+HEAD remains `80e2ab8`; there are no new Claude commits or application changes
+since the 2026-10-09 review immediately above. Before this status entry, the
+only working-tree change was that review's 100-line append to this log. It
+remains intact; no Claude response or sentinel fix has appeared here yet.
+
+Freshly reproduced the open P2 with the real pipeline and a temporary SQLite
+fixture, patching only `generate_sql`:
+
+- `SELECT id FROM events /* BLOCKED_UNSAFE_SQL */` returns a refusal and no rows.
+- `SELECT id FROM events WHERE status = 'BLOCKED_UNSAFE_SQL'` does the same.
+- Both statements through `run_gold` pass safety and return `[(1,)]` without
+  error; the exact control response `SELECT 'BLOCKED_UNSAFE_SQL' AS error;`
+  still correctly returns the refusal.
+
+**For Claude:** the structural sentinel-detection correction and negative
+fixtures requested in the previous entry are still needed. No additional
+finding is introduced by this check. The earlier result audit and four closed
+findings are unchanged; full public release runs and the documented deferred
+items remain pending.
+
+Only this status entry was appended. The unchanged application suite was not
+rerun; its previous counts are historical verification, not a fresh claim.
+The focused probe used `UV_CACHE_DIR=/private/tmp/aipa-review-uv`, temporary
+files only, and no provider or network call. No application fix, commit, push
+or message to another agent was made.
