@@ -283,8 +283,10 @@ uv run python scripts/evaluate_v2.py --suite bird_dev --subset subset200 --evide
 uv run python scripts/evaluate_v2.py --gate regression --new <run dir> --baseline <run dir>
 ```
 
-Public suites require the explicit budget shown. The v1 commands below still
-work and produce the historical-format files.
+Public suites require the explicit budget shown. Ollama model runs send
+`think: false` unless `--ollama-think on` or `--ollama-think default` says
+otherwise, and the setting is recorded in the run's identity and directory
+name. The v1 commands below still work and produce the historical-format files.
 
 For Gemini free-tier testing with the v1 script, use a throttle or a smaller smoke test:
 
@@ -379,35 +381,50 @@ python scripts/evaluate_text_to_sql.py --mode llm --provider gemini --model gemi
 
 ## Evaluation Results
 
-### v2 results — 2026-10-09, commit `7c1aaa4`
+### v2 results — 2026-10-10, commit `7708295`
 
 Measured under the frozen evaluation contract v2
 (`docs/superpowers/specs/2026-10-08-evaluation-contract-v2-design.md`): typed
 result comparison, a separate safety metric, bootstrap 95 % intervals over
 cases, and a manifest per run recording the commit, suite and database hashes,
-prompt hash, model and settings. Model: Ollama `qwen3.5:9b-q4_K_M`, schema RAG
-on (`k=6`). Every run below is `complete` and citable. **These numbers are not
-comparable to the May tables further down**: the model, the pipeline and the
-scoring rules all differ.
+prompt hash, model and settings. Model: Ollama `qwen3.5:9b-q4_K_M` with
+thinking off, schema RAG on (`k=6`). Every run below is `complete` and citable.
+**These numbers are not comparable to the May tables further down**: the
+model, the pipeline and the scoring rules all differ.
 
-| Suite | Cases | Result | Run |
+| Suite | Cases | Thinking off (current) | Thinking at the model's default (2026-10-09) |
 |---|---:|---|---|
-| `demo` (3 demo databases) | 12 | EX **41.7%** [16.7, 66.7] (5/12) | [`2026-10-09T052607_demo_full_ol…`](evaluation/results/2026-10-09T052607_demo_full_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off_bdbb6f00_5980/report.md) |
-| `safety` (refusals and unanswerables) | 15 | safety accuracy **80.0%** [60.0, 100.0] (12/15) | [`2026-10-09T053032_safety_full_…`](evaluation/results/2026-10-09T053032_safety_full_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off_96810104_3aea/report.md) |
+| `demo` (3 demo databases) | 12 | EX **33.3%** [8.3, 58.3] (4/12), [run](evaluation/results/2026-10-10T061821_demo_full_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off-think-off_b3215300_55cb/report.md) | EX 41.7% [16.7, 66.7] (5/12), [run](evaluation/results/2026-10-09T052607_demo_full_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off_bdbb6f00_5980/report.md) |
+| `safety` (refusals and unanswerables) | 15 | safety accuracy **73.3%** [53.3, 93.3] (11/15), [run](evaluation/results/2026-10-10T061911_safety_full_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off-think-off_d4425037_0a6d/report.md) | safety accuracy 80.0% [60.0, 100.0] (12/15), [run](evaluation/results/2026-10-09T053032_safety_full_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off_96810104_3aea/report.md) |
 
-On `safety` the model refused all six data-modification requests, answered all
-six questions about data the schema does not hold as unanswerable, declined two
-internals requests as "unanswerable" rather than refusing them (reported
-separately, not counted as correct), and returned one empty response.
+**Why two columns.** The model thinks by default. Until 2026-10-10 its
+thinking counted against the 512-token output cap the app gives the SQL
+answer, and when the thinking used the whole cap no SQL came back. The app and
+the harness now turn thinking off (`docs/3_decisions.md`, 2026-10-10). On the
+two small suites above the change moves one case each way, inside the
+intervals. On the 200-case Spider and BIRD subsets it raised EX by 8.5 to 11.5
+points, paired on the same cases with every interval above zero, and cut the
+mean time per case from about 25 s to 3-7 s.
+
+On `safety` with thinking off, the model refused all six data-modification
+requests and declined the three internals requests as "unanswerable" rather
+than refusing them (reported separately, not counted as correct). It declined
+five of the six questions about data the schema does not hold, and answered
+the sixth with a substitute metric.
 
 **Spider and BIRD.** Full dev-set release runs (1,034 Spider and 1,534 BIRD
-questions, BIRD with and without its evidence hints) are **pending**; the
-contract reserves this table for full sets. The routine 200-case verification
-runs are committed —
+questions, BIRD with and without its evidence hints) are **in progress** with
+thinking off; the contract reserves this table for full sets. The routine
+200-case verification runs are committed and are harness evidence, not
+release results. With thinking off:
+[Spider subset](evaluation/results/2026-10-10T061944_spider_dev_subset200_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off-think-off_bd62bfcf_0b75/report.md),
+[BIRD with evidence](evaluation/results/2026-10-10T063015_bird_dev_subset200_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-on-think-off_e80d4f09_0030/report.md),
+[BIRD without evidence](evaluation/results/2026-10-10T065415_bird_dev_subset200_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off-think-off_4b63f372_687b/report.md).
+At the model's default thinking:
 [Spider subset](evaluation/results/2026-10-09T053348_spider_dev_subset200_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off_d8f16b52_22eb/report.md),
 [BIRD with evidence](evaluation/results/2026-10-09T065121_bird_dev_subset200_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-on_914813fa_a643/report.md),
-[BIRD without evidence](evaluation/results/2026-10-09T081747_bird_dev_subset200_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off_451a3ae6_72c7/report.md) — and are harness evidence, not
-release results.
+[BIRD without evidence](evaluation/results/2026-10-09T081747_bird_dev_subset200_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off_451a3ae6_72c7/report.md),
+and a [full Spider run](evaluation/results/2026-10-09T144616_spider_dev_full_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off_39d3e0ef_8d5a/report.md) kept as the record of that setting.
 
 ### May 2026 (historical)
 
