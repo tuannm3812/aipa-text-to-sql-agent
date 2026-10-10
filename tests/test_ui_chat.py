@@ -9,6 +9,7 @@ never sees `redact_dsn`.
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import patch
 
 import ui.chat as chat
@@ -56,3 +57,21 @@ def test_a_successful_call_is_returned_unchanged() -> None:
         )
 
     assert actual == expected
+
+
+def test_the_apps_ollama_call_sends_think_false(customers_db: str, recording_ollama: Any) -> None:
+    """The app passes no think flag, so Ollama gets the backend's default: thinking off."""
+    recording_ollama.replies.append("SELECT name FROM customers")
+
+    sql_text, result = chat._run_query(
+        "list customers",
+        db_path=customers_db,
+        model_name="qwen3.5:9b-q4_K_M",
+        provider="ollama",
+        use_rag=False,
+        rag_top_k=3,
+    )
+
+    assert result.ok, result.error
+    assert sql_text == "SELECT name FROM customers"
+    assert recording_ollama.reasoning == [False]

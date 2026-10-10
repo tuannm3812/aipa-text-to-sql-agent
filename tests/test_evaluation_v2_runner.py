@@ -1114,6 +1114,126 @@ def test_cli_rejects_resume_with_more_than_one_suite(tmp_path: Path) -> None:
         cli.main(["--suite", "demo", "safety", "--resume", str(tmp_path)])
 
 
+# --- Ollama's think flag in the run identity -----------------------------------------------
+
+
+class FlagRecorder(StubGenerator):
+    """A ``StubGenerator`` that also records the ``ollama_think`` each call was given."""
+
+    def __init__(self, cases: list[Case]) -> None:
+        super().__init__(cases)
+        self.flags: list[object] = []
+
+    def __call__(self, question: str, schema_text: str, **kw: Any) -> str:
+        self.flags.append(kw.get("ollama_think", "absent"))
+        return super().__call__(question, schema_text, **kw)
+
+
+@pytest.mark.parametrize(
+    "overrides,recorded,sent,suffix",
+    [
+        ({}, "off", False, "-think-off"),  # an Ollama model run thinks only when told to
+        ({"ollama_think": "off"}, "off", False, "-think-off"),
+        ({"ollama_think": "on"}, "on", True, "-think-on"),
+        ({"ollama_think": "default"}, "default", None, ""),
+        ({"provider": "gemini", "model": "gemini-2.5-flash"}, "n/a", False, ""),
+    ],
+)
+def test_a_model_run_records_the_think_flag_it_sends(
+    tmp_path: Path, overrides: dict[str, str], recorded: str, sent: bool | None, suffix: str
+) -> None:
+    cases, pick = _first(tmp_path, 1)
+    stub = FlagRecorder(cases)
+    with patch("text_to_sql_agent.pipeline.generate_sql", stub):
+        result = run_suite(cases, config=_llm(**pick, **overrides), out_root=tmp_path / "out")
+    assert _manifest(result.run_dir)["ollama_think"] == recorded
+    assert result.manifest.identity.ollama_think == recorded
+    assert stub.flags == [sent]
+    assert f"_rag-on-k6-evidence-off{suffix}_" in result.run_dir.name
+    assert f"| ollama_think | `{recorded}` |" in (result.run_dir / "report.md").read_text("utf-8")
+
+
+def test_a_gold_run_records_ollama_think_as_not_applicable(tmp_path: Path) -> None:
+    # `_config()` names provider "ollama", but a gold run calls no model.
+    result = run_suite(load_suite(DEMO), config=_config(), out_root=tmp_path)
+    assert _manifest(result.run_dir)["ollama_think"] == "n/a"
+    assert "_rag-on-k6-evidence-off_" in result.run_dir.name
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"mode": "llm", "provider": "gemini", "ollama_think": "off"}, "provider 'gemini'"),
+        ({"mode": "gold", "ollama_think": "on"}, "mode 'gold'"),
+        ({"mode": "llm", "ollama_think": "maybe"}, "'maybe'"),
+    ],
+)
+def test_an_ollama_think_that_cannot_be_sent_is_refused_before_anything_is_written(
+    tmp_path: Path, overrides: dict[str, str], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        run_suite(load_suite(DEMO), config=_config(**overrides), out_root=tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_resume_refuses_a_changed_ollama_think_naming_it(tmp_path: Path) -> None:
+    cases = load_suite(DEMO)
+    stub = StubGenerator(cases, fail={cases[1].question: KeyboardInterrupt()})
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", stub),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        run_suite(cases, config=_llm(ollama_think="on"), out_root=tmp_path)
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", StubGenerator(cases)),
+        pytest.raises(ResumeRefused, match="ollama_think"),
+    ):
+        run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=_only_dir(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--mode", "llm", "--provider", "gemini", "--ollama-think", "off"],
+        ["--mode", "gold", "--provider", "ollama", "--ollama-think", "on"],
+        ["--provider", "ollama", "--ollama-think", "default"],  # gold is the default mode
+        ["--gate", "gold", "--provider", "ollama", "--ollama-think", "off"],
+    ],
+)
+def test_cli_refuses_ollama_think_outside_an_ollama_model_run(
+    tmp_path: Path, argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["--suite", "demo", *argv, "--out-root", str(tmp_path / "out")])
+    assert exited.value.code == 2
+    assert "--ollama-think applies only to --mode llm --provider ollama" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_refuses_ollama_think_with_the_regression_gate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = ["--gate", "regression", "--new", "a", "--baseline", "b", "--ollama-think", "on"]
+    with pytest.raises(SystemExit) as exited:
+        cli.main(argv)
+    assert exited.value.code == 2
+    assert "--ollama-think" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "flag,recorded",
+    [([], "off"), (["--ollama-think", "on"], "on"), (["--ollama-think", "default"], "default")],
+)
+def test_cli_records_the_resolved_ollama_think(
+    tmp_path: Path, flag: list[str], recorded: str
+) -> None:
+    argv = ["--suite", "demo", "--mode", "llm", "--provider", "ollama", "--model", "stub:latest"]
+    with patch("text_to_sql_agent.pipeline.generate_sql", StubGenerator(load_suite(DEMO))):
+        code = cli.main([*argv, *flag, "--out-root", str(tmp_path)])
+    assert code == 0
+    assert _manifest(_only_dir(tmp_path))["ollama_think"] == recorded
+
+
 # --- execution budget ----------------------------------------------------------------------
 
 

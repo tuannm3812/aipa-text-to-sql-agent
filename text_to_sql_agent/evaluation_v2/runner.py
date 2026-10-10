@@ -65,6 +65,7 @@ from text_to_sql_agent.evaluation_v2.identity import (
     fingerprint_changes,
     git_state,
     identity_diff,
+    is_ollama,
     retry_policy,
 )
 from text_to_sql_agent.evaluation_v2.manifest import (
@@ -155,6 +156,10 @@ _RETRYABLE = re.compile(
 MAX_WORK_LIMIT = 2**31 - 1
 
 Mode = Literal["gold", "llm"]
+# `--ollama-think`: the flag an Ollama model run sends, or "default" to send none.
+OllamaThink = Literal["off", "on", "default"]
+# Each choice as the pipeline's `ollama_think` argument (`ChatOllama(reasoning=...)`).
+_THINK_FLAGS: dict[str, bool | None] = {"off": False, "on": True, "default": None}
 _T = TypeVar("_T")
 
 
@@ -171,6 +176,9 @@ class RunConfig:
     ``work_limit`` (the engine's own unit; ``0`` disables the guard) and ``max_rows`` are the
     execution budget for both the reference and the model's query; ``None`` means the
     engine's ``default_work_limit`` and ``DEFAULT_MAX_ROWS`` - the app's demo guards.
+    ``ollama_think`` is Ollama's think flag for an Ollama model run: ``"off"`` sends
+    ``think: false``, ``"on"`` sends ``think: true`` and ``"default"`` sends nothing. There,
+    ``None`` means ``"off"``; any other run must leave it ``None`` (``resolve_ollama_think``).
     """
 
     suite: str
@@ -188,6 +196,7 @@ class RunConfig:
     retry_base_seconds: float = 20.0
     work_limit: int | None = None
     max_rows: int | None = None
+    ollama_think: OllamaThink | None = None
 
 
 @dataclass(frozen=True)
@@ -257,6 +266,33 @@ def _prompt_sha256(engine: Engine) -> str:
         engine.prompt_engine_rules_block,
     )
     return hashlib.sha256(prompt.encode()).hexdigest()
+
+
+def resolve_ollama_think(config: RunConfig) -> str:
+    """The run's ``ollama_think`` identity value: the think flag it sends, if any.
+
+    An Ollama model run records ``config.ollama_think``, or ``"off"`` when that is ``None``:
+    the 512-token output cap is the SQL answer's budget, and thinking spent inside it can
+    leave no answer. Every other run - another provider, or gold mode, which calls no model -
+    records ``"n/a"``.
+
+    Raises:
+        ValueError: If ``config.ollama_think`` is not ``off``, ``on`` or ``default``, or is set
+            for a run that sends no flag, where it would be recorded but never sent.
+    """
+    requested = config.ollama_think
+    if requested is not None and requested not in _THINK_FLAGS:
+        raise ValueError(
+            f"ollama_think must be one of {', '.join(_THINK_FLAGS)}, got {requested!r}"
+        )
+    if config.mode == "llm" and is_ollama(config.provider):
+        return "off" if requested is None else requested
+    if requested is not None:
+        raise ValueError(
+            "ollama_think applies only to an Ollama model run (mode 'llm', provider 'ollama'), "
+            f"not to mode {config.mode!r} with provider {config.provider!r}"
+        )
+    return "n/a"
 
 
 def _single(values: set[_T], what: str) -> _T:
@@ -339,6 +375,7 @@ def build_identity(
         max_rows=DEFAULT_MAX_ROWS if config.max_rows is None else config.max_rows,
         max_repair_attempts=config.max_repair_attempts,
         retry_policy=retry_policy(config.max_retries, config.retry_base_seconds),
+        ollama_think=resolve_ollama_think(config),
     )
     return payload, source
 
@@ -398,6 +435,9 @@ def _ask_model(
     attempts are excluded, so latency describes the pipeline rather than the provider's
     rate limiter.
     """
+    # The flag the identity records; "n/a" passes the pipeline's default, which only the
+    # Ollama call reads.
+    think = _THINK_FLAGS.get(resolve_ollama_think(config), False)
     attempt = 0
     while True:
         started = time.perf_counter()
@@ -413,6 +453,7 @@ def _ask_model(
                 max_repair_attempts=config.max_repair_attempts,
                 work_limit=config.work_limit,
                 max_rows=config.max_rows,
+                ollama_think=think,
                 on_repair_error=repair_errors.append,
             )
         except Exception as exc:
@@ -926,7 +967,10 @@ def run_suite(
     if resume_dir is None:
         started = datetime.now(UTC).replace(microsecond=0)
         label = config_label(
-            use_rag=config.use_rag, rag_top_k=config.rag_top_k, evidence=config.evidence
+            use_rag=config.use_rag,
+            rag_top_k=config.rag_top_k,
+            evidence=config.evidence,
+            ollama_think=payload.ollama_think,
         )
         run_dir = allocate_run_dir(out_root, payload, started=started, config=label)
     else:

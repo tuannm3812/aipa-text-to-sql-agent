@@ -26,8 +26,13 @@ from text_to_sql_agent.evaluation_v2.gates import (
     load_exceptions,
     regression_gate,
 )
-from text_to_sql_agent.evaluation_v2.identity import IDENTITY_FIELDS, IdentityPayload
-from text_to_sql_agent.evaluation_v2.manifest import Manifest, read_manifest, write_manifest
+from text_to_sql_agent.evaluation_v2.identity import IDENTITY_FIELDS, REPO_ROOT, IdentityPayload
+from text_to_sql_agent.evaluation_v2.manifest import (
+    Manifest,
+    manifest_sha256,
+    read_manifest,
+    write_manifest,
+)
 from text_to_sql_agent.evaluation_v2.report import NOT_APPLICABLE, UNDEFINED_EMPTY
 from text_to_sql_agent.evaluation_v2.runner import (
     CASES_FILE,
@@ -359,6 +364,7 @@ _BASE_IDENTITY: dict[str, Any] = {
     "max_rows": 100,
     "max_repair_attempts": 1,
     "retry_policy": "0x20.0",
+    "ollama_think": "off",
 }
 
 
@@ -424,8 +430,57 @@ def _gate(tmp_path: Path, old: dict[str, str], new: dict[str, str], **kw: Any): 
 
 def test_compatibility_fields_are_the_identity_minus_the_three_that_may_differ() -> None:
     assert set(COMPATIBILITY_FIELDS) == set(IDENTITY_FIELDS) - {"commit", "dirty", "prompt_sha256"}
-    assert len(COMPATIBILITY_FIELDS) == len(IDENTITY_FIELDS) - 3 == 17
+    assert len(COMPATIBILITY_FIELDS) == len(IDENTITY_FIELDS) - 3 == 18
     assert "database_fingerprint" in COMPATIBILITY_FIELDS
+    assert "ollama_think" in COMPATIBILITY_FIELDS
+
+
+def _as_written_before_ollama_think(run_dir: Path) -> Path:
+    """Rewrite ``run_dir``'s manifest as a runner from before ``ollama_think`` wrote it."""
+    path = run_dir / MANIFEST_FILE
+    data = read_manifest(path)
+    del data["ollama_think"]
+    data["manifest_sha256"] = manifest_sha256(data)
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return run_dir
+
+
+def test_a_think_off_run_and_a_run_from_before_the_field_are_incompatible(
+    tmp_path: Path,
+) -> None:
+    # Different measurements: one sent `think: false`, the other let the model think.
+    old, new = _outcomes(20)
+    with pytest.raises(RegressionRefused, match="ollama_think") as caught:
+        regression_gate(
+            make_run(tmp_path, "new", new, ollama_think="off"),
+            _as_written_before_ollama_think(make_run(tmp_path, "old", old, ollama_think="default")),
+        )
+    assert caught.value.differences == (("ollama_think", "off", "default"),)
+
+
+def test_two_runs_from_before_the_field_still_compare(tmp_path: Path) -> None:
+    old, new = _outcomes(40, wrong={0})
+    result = regression_gate(
+        _as_written_before_ollama_think(make_run(tmp_path, "new", new, ollama_think="default")),
+        _as_written_before_ollama_think(make_run(tmp_path, "old", old, ollama_think="default")),
+    )
+    assert result.passed and result.regression is not None
+    assert result.regression.drop_points == pytest.approx(2.5)
+
+
+def test_a_committed_run_from_before_the_field_compares_with_itself() -> None:
+    run = (
+        REPO_ROOT
+        / "evaluation"
+        / "results"
+        / (
+            "2026-10-09T052607_demo_full_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off_bdbb6f00_5980"
+        )
+    )
+    assert "ollama_think" not in read_manifest(run / MANIFEST_FILE)
+    result = regression_gate(run, run)
+    assert result.passed and result.regression is not None
+    assert result.regression.drop_points == 0
 
 
 def test_runs_over_different_database_contents_are_incompatible(tmp_path: Path) -> None:

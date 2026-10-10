@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+from collections.abc import Iterator
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -353,3 +356,132 @@ def test_gemini_usage_counts_thoughts_as_completion() -> None:
         _record_gemini_usage(SimpleNamespace(usage_metadata=meta))
         _record_gemini_usage(SimpleNamespace(usage_metadata=None))
     assert (usage.prompt_tokens, usage.completion_tokens) == (40, 12)
+
+
+# --- Ollama's think flag -------------------------------------------------------------------
+
+SCHEMA = "CREATE TABLE t (a INTEGER);"
+# Stands for "the caller passed no `ollama_think` at all", which is not the same as `None`.
+OMITTED = object()
+
+
+def test_ollama_is_sent_think_false_by_default(recording_ollama: Any) -> None:
+    """`num_predict=512` is the SQL answer's budget; thinking spent inside it can leave none."""
+    generate_sql("how many rows", SCHEMA, provider="ollama", model_name="m")
+    # The whole constructor call: only `reasoning` is new, the rest is as before.
+    assert [call.options for call in recording_ollama.calls] == [
+        {"model": "m", "temperature": 0.0, "num_predict": 512, "reasoning": False}
+    ]
+
+
+@pytest.mark.parametrize("think", [False, True, None])
+def test_ollama_receives_the_requested_think_flag(
+    recording_ollama: Any, think: bool | None
+) -> None:
+    generate_sql("q", SCHEMA, provider="ollama", model_name="m", ollama_think=think)
+    assert recording_ollama.reasoning == [think]
+
+
+def test_only_the_message_content_can_become_sql(recording_ollama: Any) -> None:
+    """With thinking on, its text arrives beside the answer and must never be extracted."""
+    from langchain_core.messages import AIMessage
+
+    recording_ollama.replies.append(
+        AIMessage(
+            content="SELECT a FROM t",
+            additional_kwargs={"reasoning_content": "Perhaps SELECT b FROM u WHERE secret = 1"},
+        )
+    )
+    sql = generate_sql("q", SCHEMA, provider="ollama", model_name="m", ollama_think=True)
+    assert recording_ollama.reasoning == [True]
+    assert sql == "SELECT a FROM t"
+
+
+def test_the_gemini_call_is_the_same_whatever_ollama_think_says() -> None:
+    from google.genai import types
+
+    sent: list[dict[str, Any]] = []
+
+    class _Models:
+        def generate_content(self, **kwargs: Any) -> SimpleNamespace:
+            sent.append(kwargs)
+            return SimpleNamespace(text="SELECT 1", usage_metadata=None)
+
+    genai = SimpleNamespace(Client=lambda api_key: SimpleNamespace(models=_Models()))
+    with (
+        patch(
+            "text_to_sql_agent.llm._load_gemini_sdk", return_value=("google-genai", genai, types)
+        ),
+        patch(
+            "text_to_sql_agent.llm.get_default_gemini_manager",
+            return_value=SimpleNamespace(run=lambda generate: generate("test-key")),
+        ),
+    ):
+        for think in (OMITTED, False, True, None):
+            kwargs = {} if think is OMITTED else {"ollama_think": think}
+            generate_sql("q", SCHEMA, provider="gemini", model_name="gemini-2.5-flash", **kwargs)
+
+    assert len(sent) == 4 and all(call == sent[0] for call in sent)
+    assert sent[0]["config"].max_output_tokens == 512
+    assert sent[0]["config"].thinking_config is None
+
+
+def _thinking_model_stream() -> Iterator[Any]:
+    """What Ollama streams for a thinking model: thinking, then the answer, then the counts."""
+    from ollama import ChatResponse, Message
+
+    yield ChatResponse(
+        model="m",
+        message=Message(role="assistant", content="", thinking="SELECT secret FROM vault"),
+        done=False,
+    )
+    yield ChatResponse(
+        model="m", message=Message(role="assistant", content="SELECT a FROM t"), done=False
+    )
+    yield ChatResponse(
+        model="m",
+        message=Message(role="assistant", content=""),
+        done=True,
+        done_reason="stop",
+        prompt_eval_count=21,
+        eval_count=34,
+    )
+
+
+@pytest.mark.parametrize(
+    "think,on_the_wire",
+    [
+        (OMITTED, {"think": False}),
+        (False, {"think": False}),
+        (True, {"think": True}),
+        (None, {}),
+    ],
+    ids=["omitted", "false", "true", "none"],
+)
+def test_the_real_chat_ollama_sends_the_flag_and_keeps_thinking_out_of_the_sql(
+    think: object, on_the_wire: dict[str, bool]
+) -> None:
+    """The installed `ChatOllama`, with only Ollama's transport (`Client._request`) faked.
+
+    `reasoning=False` puts `"think": false` in the request body, `True` puts `"think": true`
+    and `None` leaves the key out. Whatever is sent, the thinking text never becomes the SQL,
+    and usage still arrives as `usage_metadata`'s `input_tokens` and `output_tokens`.
+    """
+    from text_to_sql_agent.llm import usage_scope
+
+    bodies: list[dict[str, Any]] = []
+
+    def fake_request(_self: Any, _cls: Any, method: str, path: str, **kwargs: Any) -> Any:
+        assert (method, path, kwargs["stream"]) == ("POST", "/api/chat", True)
+        bodies.append(kwargs["json"])
+        return _thinking_model_stream()
+
+    kwargs = {} if think is OMITTED else {"ollama_think": think}
+    with patch("ollama.Client._request", fake_request), usage_scope() as usage:
+        sql = generate_sql("q", SCHEMA, provider="ollama", model_name="m", **kwargs)
+
+    (body,) = bodies
+    assert {key: value for key, value in body.items() if key == "think"} == on_the_wire
+    assert body["options"] == {"num_predict": 512, "temperature": 0.0}
+    assert sql == "SELECT a FROM t"
+    assert (usage.prompt_tokens, usage.completion_tokens) == (21, 34)

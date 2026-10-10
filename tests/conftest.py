@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from collections.abc import Iterator
 from contextlib import closing
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -82,3 +86,53 @@ def postgres_dsn() -> str:
     except Exception as exc:  # noqa: BLE001 - any connection failure means skip
         pytest.skip(f"{POSTGRES_DSN_ENV} is set but unreachable: {type(exc).__name__}")
     return dsn
+
+
+@dataclass
+class OllamaCall:
+    """One `ChatOllama(...)` construction and the user prompt its `invoke` received."""
+
+    options: dict[str, Any]
+    user_prompt: str
+
+
+@dataclass
+class RecordingOllama:
+    """A stand-in for `llm._load_ollama_sdk` that records every Ollama call.
+
+    Each `ChatOllama(**options)` is recorded with the user prompt its `invoke` received, and
+    answers with the next of `replies` - an `AIMessage`, or a string used as its content -
+    or with `SELECT 1` once they run out. No server is contacted.
+    """
+
+    replies: list[Any] = field(default_factory=list)
+    calls: list[OllamaCall] = field(default_factory=list)
+
+    @property
+    def reasoning(self) -> list[Any]:
+        """Each construction's `reasoning` argument, `"absent"` where none was passed."""
+        return [call.options.get("reasoning", "absent") for call in self.calls]
+
+    def sdk(self) -> tuple[Any, Any, Any]:
+        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+        recorder = self
+
+        class ChatOllama:
+            def __init__(self, **options: Any) -> None:
+                self.options = options
+
+            def invoke(self, messages: list[Any]) -> AIMessage:
+                recorder.calls.append(OllamaCall(self.options, str(messages[-1].content)))
+                reply = recorder.replies.pop(0) if recorder.replies else "SELECT 1"
+                return reply if isinstance(reply, AIMessage) else AIMessage(content=reply)
+
+        return ChatOllama, HumanMessage, SystemMessage
+
+
+@pytest.fixture
+def recording_ollama() -> Iterator[RecordingOllama]:
+    """Patch the Ollama SDK with a `RecordingOllama` for the test's duration."""
+    recorder = RecordingOllama()
+    with patch("text_to_sql_agent.llm._load_ollama_sdk", side_effect=recorder.sdk):
+        yield recorder

@@ -4,6 +4,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -828,3 +829,30 @@ def test_extraction_is_unchanged_for_fenced_prose_before_and_ordinary_queries() 
     assert extract(ordinary) == ordinary
     assert extract("SELECT 1 FROM t;") == "SELECT 1 FROM t;"
     assert extract("SELECT 'a;b' AS x; Done.") == "SELECT 'a;b' AS x; Done."
+
+
+# --- Ollama's think flag through generation and repair -------------------------------------
+
+# Stands for "the caller passed no `ollama_think` at all", which is not the same as `None`.
+OMITTED = object()
+
+
+@pytest.mark.parametrize("wrapper", ["ask_database", "ask_database_with_sql"])
+@pytest.mark.parametrize(
+    "think,sent", [(OMITTED, False), (False, False), (True, True), (None, None)]
+)
+def test_the_generation_and_its_repair_send_the_same_think_flag(
+    customers_db: str, recording_ollama: Any, wrapper: str, think: object, sent: bool | None
+) -> None:
+    recording_ollama.replies += ["SELECT nope FROM customers", "SELECT name FROM customers"]
+    kwargs = {} if think is OMITTED else {"ollama_think": think}
+
+    answer = getattr(agent, wrapper)(
+        "list customers", db_path=customers_db, provider="ollama", model_name="m", **kwargs
+    )
+
+    result = answer[1] if isinstance(answer, tuple) else answer
+    assert result.ok, result.error
+    assert result.rows == [("Alice",)]
+    assert "Repair the SQL" in recording_ollama.calls[1].user_prompt
+    assert recording_ollama.reasoning == [sent, sent], "one generation, then its repair"
