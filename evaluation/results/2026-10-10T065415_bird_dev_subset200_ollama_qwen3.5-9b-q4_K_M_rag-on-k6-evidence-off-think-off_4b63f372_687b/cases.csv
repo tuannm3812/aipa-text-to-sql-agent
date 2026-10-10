@@ -1,0 +1,1053 @@
+suite,id,hardness,expected,outcome,generated_sql,error,latency_ms,schema_recall,retrieved_tables,attempts,prompt_tokens,completion_tokens,generation_failure
+bird_dev,2,hard,answerable,wrong,"SELECT 
+    s.CDSCode AS ""CDS Code"",
+    s.School AS ""School Name"",
+    s.City AS ""City"",
+    s.State AS ""State"",
+    s.Zip AS ""Zip"",
+    s.OpenDate AS ""Open Date"",
+    s.StatusType AS ""Status"",
+    f.`Enrollment (K-12)` AS ""Enrollment K-12"",
+    f.`Percent (%) Eligible FRPM (K-12)` AS ""FRPM % Eligible K-12"",
+    sc.AvgScrRead AS ""Avg SAT Reading Score"",
+    sc.AvgScrMath AS ""Avg SAT Math Score"",
+    sc.AvgScrWrite AS ""Avg SAT Writing Score""
+FROM schools s
+JOIN frpm f ON s.CDSCode = f.CDSCode
+LEFT JOIN satscores sc ON s.CDSCode = sc.cds
+WHERE s.StatusType = 'Active'
+    AND s.County LIKE '%Fresno%'
+    AND s.DOCType LIKE '%County Office of Education%'
+ORDER BY f.`Percent (%) Eligible FRPM (K-12)` DESC;",,14751.09,1.0,"frpm, satscores, schools",1,2399,247,
+bird_dev,16,easy,answerable,correct,"SELECT COUNT(*) AS count
+FROM satscores
+JOIN schools ON satscores.cds = schools.CDSCode
+WHERE LOWER(schools.StatusType) = 'merged'
+AND LOWER(schools.County) = 'alameda'
+AND satscores.NumTstTakr < 100;",,8216.85,1.0,"frpm, satscores, schools",1,2364,68,
+bird_dev,17,easy,answerable,wrong,"SELECT s.CDSCode, s.CharterNum, AVG(sa.AvgScrWrite) AS AvgWritingScore
+FROM schools s
+JOIN satscores sa ON s.CDSCode = sa.cds
+WHERE sa.AvgScrWrite > 499
+GROUP BY s.CDSCode, s.CharterNum
+ORDER BY AvgWritingScore DESC;",,4395.68,1.0,"frpm, satscores, schools",1,2368,74,
+bird_dev,19,hard,answerable,wrong,"SELECT 
+    s.CDSCode AS ""School Code"",
+    s.School AS ""School Name"",
+    s.City AS ""City"",
+    s.State AS ""State"",
+    s.Phone AS ""Phone"",
+    s.Website AS ""Website"",
+    s.FundingType AS ""Funding Type"",
+    s.Charter AS ""Charter Status"",
+    f.`Enrollment (K-12)` AS ""Enrollment"",
+    f.`Percent (%) Eligible Free (K-12)` AS ""% Eligible Free Meals"",
+    f.`Percent (%) Eligible FRPM (K-12)` AS ""% Eligible FRPM""
+FROM schools s
+JOIN frpm f ON s.CDSCode = f.CDSCode
+JOIN satscores sat ON s.CDSCode = sat.cds
+WHERE s.StatusType = 'Active'
+    AND sat.NumTstTakr >= 10
+ORDER BY sat.AvgScrMath DESC
+LIMIT 1;",,24074.77,1.0,"frpm, satscores, schools",1,5036,421,
+bird_dev,27,medium,answerable,wrong,"SELECT s.School AS SchoolName, AVG(sa.AvgScrWrite) AS AvgWritingScore, s.Phone AS CommunicationNumber
+FROM schools s
+JOIN satscores sa ON s.CDSCode = sa.cds
+WHERE (s.OpenDate IS NULL OR strftime('%Y', s.OpenDate) > '1991')
+   AND (s.ClosedDate IS NULL OR strftime('%Y', s.ClosedDate) < '2000')
+GROUP BY s.School, s.Phone;",,6203.56,1.0,"frpm, satscores, schools",1,2395,104,
+bird_dev,28,hard,answerable,wrong,"SELECT 
+    `School Name`,
+    DOCType,
+    (`Enrollment (K-12)` - `Enrollment (Ages 5-17)`) AS enrollment_diff
+FROM frpm f
+JOIN schools s ON f.CDSCode = s.CDSCode
+WHERE LOWER(s.FundingType) = 'locally funded'
+AND (`Enrollment (K-12)` - `Enrollment (Ages 5-17)`) > (
+    SELECT AVG(`Enrollment (K-12)` - `Enrollment (Ages 5-17)`)
+    FROM frpm f2
+    JOIN schools s2 ON f2.CDSCode = s2.CDSCode
+    WHERE LOWER(s2.FundingType) = 'locally funded'
+);",,17658.00,1.0,"frpm, satscores, schools",1,4986,343,
+bird_dev,30,easy,answerable,wrong,"SELECT s.City, SUM(f.`Enrollment (K-12)`) AS Total_Enrollment
+FROM frpm f
+JOIN schools s ON f.CDSCode = s.CDSCode
+WHERE f.`Low Grade` = '1' AND f.`High Grade` = '12'
+GROUP BY s.City
+ORDER BY Total_Enrollment ASC
+LIMIT 5;",,10777.56,1.0,"frpm, satscores, schools",1,4831,142,
+bird_dev,36,hard,answerable,wrong,"SELECT s.AdmFName1 || ' ' || s.AdmLName1 AS AdministratorName
+FROM schools s
+JOIN satscores sa ON s.CDSCode = sa.cds
+WHERE sa.NumGE1500 IS NOT NULL
+ORDER BY sa.NumGE1500 DESC
+LIMIT 1;",,6062.71,1.0,"frpm, satscores, schools",1,2374,68,
+bird_dev,51,easy,answerable,correct,"SELECT s.MailStreet AS Mailing_Street_Address, s.School AS School_Name
+FROM schools s
+JOIN satscores sc ON s.CDSCode = sc.cds
+WHERE sc.AvgScrRead IS NOT NULL
+ORDER BY sc.AvgScrRead ASC
+LIMIT 1;",,3752.14,1.0,"frpm, satscores, schools",1,2370,61,
+bird_dev,52,easy,answerable,wrong,"SELECT COUNT(*) AS total_schools
+FROM satscores s
+JOIN schools sc ON s.cds = sc.CDSCode
+WHERE s.NumGE1500 >= 1500
+AND LOWER(sc.MailCity) LIKE '%lakeport%';",,3716.75,1.0,"frpm, satscores, schools",1,2372,55,
+bird_dev,70,easy,answerable,wrong,"SELECT StatusType AS school_status, COUNT(*) AS count FROM schools WHERE County = 'Alpine' AND SOCType LIKE '%District Community Day School%' GROUP BY StatusType;",,2624.48,1.0,"frpm, satscores, schools",1,2361,36,
+bird_dev,71,easy,answerable,error,"SELECT `District Code`
+FROM frpm
+WHERE `School Name` LIKE '%Fresno%'
+AND Magnet IS NULL;",OperationalError: no such column: Magnet,4718.84,1.0,"frpm, satscores, schools",1,4798,56,
+bird_dev,74,medium,answerable,error,"SELECT MIN(`Low Grade`) AS `Lowest Grade`
+FROM frpm
+WHERE `District Name` LIKE '%Special Education Consortia%'
+AND schools.NCESDist = '0613360';",OperationalError: no such column: schools.NCESDist,6695.30,1.0,"frpm, satscores, schools",1,4843,92,
+bird_dev,76,medium,answerable,correct,"SELECT s.City
+FROM schools s
+JOIN frpm f ON s.CDSCode = f.CDSCode
+WHERE LOWER(s.State) = 'ca'
+AND LOWER(f.`County Name`) LIKE '%merced%'
+AND f.`School Type` LIKE '%High School%'
+AND f.`NSLP Provision Status` = 'Lunch Provision 2'
+AND f.`Low Grade` = '9'
+AND f.`High Grade` = '12';",,5442.39,1.0,"frpm, satscores, schools",1,2381,98,
+bird_dev,97,hard,answerable,wrong,"SELECT 
+    c.client_id,
+    d.disp_id,
+    d.type AS disp_type,
+    COUNT(DISTINCT t.trans_id) AS total_transactions,
+    SUM(CASE WHEN t.amount > 0 THEN t.amount ELSE 0 END) AS total_deposits,
+    SUM(CASE WHEN t.amount < 0 THEN ABS(t.amount) ELSE 0 END) AS total_withdrawals,
+    COUNT(DISTINCT l.loan_id) AS total_loans,
+    SUM(l.amount) AS total_loan_amount,
+    COUNT(DISTINCT ca.card_id) AS total_cards,
+    GROUP_CONCAT(DISTINCT ca.type) AS card_types,
+    CASE 
+        WHEN COUNT(DISTINCT t.trans_id) > 0 AND COUNT(DISTINCT l.loan_id) > 0 THEN 'HIGH_ACTIVITY'
+        WHEN COUNT(DISTINCT t.trans_id) > 0 THEN 'MEDIUM_ACTIVITY'
+        WHEN COUNT(DISTINCT ca.card_id) > 0 THEN 'CARD_ONLY'
+        ELSE 'LOW_ACTIVITY'
+    END AS activity_category,
+    SUM(CASE WHEN t.amount > 0 THEN t.amount ELSE 0 END) + 
+    (SELECT COALESCE(SUM(amount), 0) FROM loan WHERE account_id = d.account_id AND status = 'A') AS total_service_usage
+FROM client c
+JOIN disp d ON c.client_id = d.client_id
+LEFT JOIN trans t ON d.account_id = t.account_id
+LEFT JOIN card ca ON d.account_id = ca.disp_id
+LEFT JOIN loan l ON d.account_id = l.account_id
+WHERE d.type = 'DISPONENT'
+GROUP BY c.client_id, d.disp_id, d.type
+ORDER BY total_deposits + total_withdrawals DESC;",,21103.53,1.0,"account, card, client, disp, district, loan, order, trans",1,1812,380,
+bird_dev,98,medium,answerable,wrong,"SELECT account_id, MIN(amount) AS min_amount
+FROM loan
+WHERE status = 'A' AND strftime('%Y', date) = '1997'
+GROUP BY account_id
+ORDER BY min_amount ASC
+LIMIT 1;",,5940.76,1.0,"account, card, client, disp, district, loan, order, trans",1,1797,51,
+bird_dev,108,easy,answerable,wrong,"SELECT 
+    c.client_id,
+    MAX(l.amount) AS max_loan_amount,
+    t.amount AS first_transaction_amount
+FROM client c
+JOIN loan l ON c.client_id = (
+    SELECT disp.client_id 
+    FROM disp 
+    WHERE disp.account_id = l.account_id
+    LIMIT 1
+)
+JOIN trans t ON c.client_id = (
+    SELECT disp.client_id 
+    FROM disp 
+    WHERE disp.account_id = l.account_id
+)
+WHERE l.amount = (SELECT MAX(amount) FROM loan)
+AND t.date = (
+    SELECT MIN(date) 
+    FROM trans 
+    WHERE account_id IN (
+        SELECT account_id 
+        FROM loan 
+        WHERE amount = (SELECT MAX(amount) FROM loan)
+    )
+)
+GROUP BY c.client_id;",,13800.19,1.0,"account, client, disp, district, loan, order, trans",1,1713,170,
+bird_dev,110,easy,answerable,wrong,"SELECT disp.disp_id
+FROM disp
+JOIN client ON disp.client_id = client.client_id
+JOIN account ON disp.account_id = account.account_id
+JOIN trans ON account.account_id = trans.account_id
+WHERE strftime('%Y', trans.date) = '1998'
+  AND strftime('%m', trans.date) = '09'
+  AND strftime('%d', trans.date) = '02'
+  AND LOWER(trans.type) = 'vyber'
+  AND trans.amount = 5100;",,9187.50,1.0,"account, card, client, disp, district, order, trans",1,1690,112,
+bird_dev,115,hard,answerable,wrong,"SELECT 
+    d.A2 AS district_name,
+    d.A9 AS number_of_inhabitants,
+    COUNT(c.client_id) AS total_clients,
+    SUM(CASE WHEN c.gender = 'M' THEN 1 ELSE 0 END) AS male_clients,
+    ROUND(100.0 * SUM(CASE WHEN c.gender = 'M' THEN 1 ELSE 0 END) / COUNT(c.client_id), 2) AS percentage_male_clients
+FROM district d
+JOIN client c ON d.district_id = c.district_id
+WHERE LOWER(d.A3) LIKE '%south bohem%'
+ORDER BY d.A9 DESC
+LIMIT 1;",,10062.53,1.0,"account, client, disp, district, order, trans",1,1624,142,
+bird_dev,118,hard,answerable,wrong,"SELECT 
+    d.A3 AS region,
+    CASE 
+        WHEN l.amount < 10000 THEN 'Under $10k'
+        WHEN l.amount >= 10000 AND l.amount < 50000 THEN '$10k - $50k'
+        WHEN l.amount >= 50000 AND l.amount < 100000 THEN '$50k - $100k'
+    END AS loan_size_category,
+    COUNT(CASE WHEN l.status = 'C' THEN 1 END) * 100.0 / COUNT(*) AS percentage_no_issues,
+    AVG(COUNT(CASE WHEN l.status = 'C' THEN 1 END) * 100.0 / COUNT(*)) OVER () AS overall_avg_percentage
+FROM loan l
+JOIN district d ON l.account_id IN (SELECT account_id FROM account WHERE district_id = d.district_id)
+WHERE l.amount < 100000 AND l.status IN ('C', 'A', 'D', 'B')
+GROUP BY d.A3, 
+    CASE 
+        WHEN l.amount < 10000 THEN 'Under $10k'
+        WHEN l.amount >= 10000 AND l.amount < 50000 THEN '$10k - $50k'
+        WHEN l.amount >= 50000 AND l.amount < 100000 THEN '$50k - $100k'
+    END;",,21292.46,1.0,"account, card, client, disp, district, loan, order, trans",1,1809,335,
+bird_dev,119,hard,answerable,wrong,"SELECT 
+    d.district_id,
+    d.A2 AS region_name,
+    COUNT(DISTINCT c.client_id) AS total_clients,
+    SUM(CASE WHEN l.status = 'C' THEN 1 ELSE 0 END) AS active_loans,
+    SUM(CASE WHEN l.status = 'A' THEN 1 ELSE 0 END) AS active_accounts,
+    SUM(CASE WHEN l.status = 'D' THEN 1 ELSE 0 END) AS defaulted_loans,
+    MIN(a.date) AS earliest_account_date,
+    MAX(a.date) AS latest_account_date
+FROM district d
+JOIN client c ON c.district_id = d.district_id
+JOIN disp disp ON disp.client_id = c.client_id
+JOIN account a ON a.account_id = disp.account_id
+LEFT JOIN loan l ON l.account_id = disp.account_id AND strftime('%Y', l.date) = '1993'
+WHERE strftime('%Y', a.date) = '1993'
+GROUP BY d.district_id, d.A2;",,11942.53,0.833,"account, card, client, disp, district, loan",1,1461,225,
+bird_dev,122,hard,answerable,wrong,"SELECT 
+    l.loan_id,
+    c.gender,
+    strftime('%Y', c.birth_date) AS birth_year,
+    l.amount,
+    l.duration,
+    l.payments,
+    l.status,
+    d.A3 AS district_region,
+    d.A7 AS district_code,
+    d.A10 AS district_indicator_10,
+    (SELECT COUNT(*) FROM loan l2 WHERE l2.account_id IN (SELECT account_id FROM disp WHERE disp.client_id = c.client_id)) AS loans_in_district,
+    (SELECT AVG(amount) FROM loan l3 WHERE l3.account_id IN (SELECT account_id FROM disp WHERE disp.client_id = c.client_id)) AS avg_loan_amount_district
+FROM loan l
+JOIN client c ON l.account_id IN (SELECT account_id FROM disp WHERE disp.client_id = c.client_id)
+JOIN district d ON c.district_id = d.district_id
+WHERE l.loan_id = 4990;",,22018.93,1.0,"account, card, client, disp, district, loan, trans",1,3598,398,
+bird_dev,130,medium,answerable,error,SELECT COUNT(*) AS count FROM client WHERE LOWER(A3) LIKE '%south%' AND district_id IN (SELECT district_id FROM account WHERE account_id NOT IN (SELECT DISTINCT account_id FROM trans WHERE type = 'VYBER'));,OperationalError: no such column: district,6871.11,1.0,"account, client, disp, district, loan, order, trans",1,3504,84,
+bird_dev,131,medium,answerable,error,"SELECT d.A3 AS district_name, SUM(CASE WHEN l.status = 'A' THEN l.amount ELSE 0 END) AS total_active_loan_amount
+FROM loan l
+JOIN client c ON l.account_id IN (SELECT account_id FROM disp WHERE disp.client_id = c.client_id)
+JOIN district d ON c.district_id = d.district_id
+GROUP BY d.A3
+ORDER BY total_active_loan_amount DESC
+LIMIT 1;",QUERY_ABORTED_AFTER_1000000000_VM_STEPS,10242.59,1.0,"account, card, client, disp, district, loan",1,1432,93,
+bird_dev,133,easy,answerable,wrong,"SELECT A2 AS branch_location, A3 AS district_name, A10 AS unemployment_rate
+FROM district
+WHERE strftime('%Y', date('now')) = '1996'
+ORDER BY A10 DESC
+LIMIT 1;",,3563.27,1.0,"account, card, client, disp, district, loan, trans",1,1663,52,
+bird_dev,143,hard,answerable,error,"SELECT 
+    t.account_id,
+    COUNT(DISTINCT c.card_id) AS num_gold_cards,
+    d.A3 AS district_location,
+    SUM(t.amount) AS total_transactions,
+    MIN(t.balance) AS min_balance,
+    MAX(t.balance) AS max_balance,
+    AVG(t.balance) AS avg_balance,
+    COALESCE(SUM(l.amount), 0) AS total_loan_amount,
+    COUNT(DISTINCT l.loan_id) AS num_loans
+FROM trans t
+JOIN card c ON t.account_id = c.disp_id AND c.type = 'gold'
+JOIN disp d ON t.account_id = d.account_id
+LEFT JOIN loan l ON t.account_id = l.account_id
+GROUP BY t.account_id, d.A3
+ORDER BY avg_balance DESC;",OperationalError: no such column: a.district_id,19088.09,1.0,"account, card, client, disp, district, loan, order, trans",1,3827,341,
+bird_dev,146,hard,answerable,error,"SELECT 
+    c.client_id,
+    c.gender,
+    d.A3 AS region,
+    COUNT(DISTINCT disp.disp_id) AS card_count,
+    SUM(CASE WHEN l.status = 'A' THEN l.amount ELSE 0 END) AS total_active_loan_amount,
+    SUM(CASE WHEN l.status = 'C' THEN l.amount ELSE 0 END) AS total_closed_loan_amount,
+    COUNT(DISTINCT t.trans_id) AS transaction_count,
+    SUM(t.amount) AS total_transaction_amount,
+    ROUND(SUM(t.amount) / NULLIF(SUM(l.amount), 0), 2) AS savings_rate
+FROM client c
+JOIN district d ON c.district_id = d.district_id
+JOIN disp ON c.client_id = disp.client_id AND disp.type = 'OWNER'
+LEFT JOIN loan l ON c.client_id = (SELECT client_id FROM disp WHERE disp.disp_id = l.account_id)
+LEFT JOIN trans t ON c.client_id = (SELECT client_id FROM disp WHERE disp.disp_id = t.account_id)
+WHERE c.gender = 'F'
+GROUP BY c.client_id, c.gender, d.A3
+ORDER BY total_active_loan_amount DESC
+LIMIT 100;",QUERY_ABORTED_AFTER_1000000000_VM_STEPS,21157.35,1.0,"account, card, client, disp, district, loan, order, trans",1,1812,262,
+bird_dev,154,hard,answerable,wrong,"SELECT 
+    CASE 
+        WHEN strftime('%Y', birth_date) - strftime('%Y', 'now') < 30 THEN 'Young'
+        WHEN strftime('%Y', birth_date) - strftime('%Y', 'now') BETWEEN 30 AND 60 THEN 'Middle-aged'
+        ELSE 'Senior'
+    END AS age_group,
+    COUNT(*) AS client_count,
+    SUM(CASE WHEN type = 'VYDAJ' THEN amount ELSE 0 END) AS total_withdrawals,
+    SUM(CASE WHEN type = 'PRIJEM' THEN amount ELSE 0 END) AS total_deposits,
+    AVG(balance) AS avg_balance
+FROM client
+JOIN trans ON client.client_id = trans.account_id
+JOIN district ON client.district_id = district.district_id
+WHERE LOWER(district.A3) LIKE '%prague%' AND client.gender = 'M'
+GROUP BY age_group;",,21547.49,0.714,"account, client, disp, district, order, trans",1,3454,378,
+bird_dev,156,hard,answerable,wrong,"SELECT 
+    c.client_id,
+    c.gender,
+    strftime('%Y', c.birth_date) AS birth_year,
+    CASE 
+        WHEN (strftime('%Y', 'now') - strftime('%Y', c.birth_date)) < 18 THEN 'Minor'
+        WHEN (strftime('%Y', 'now') - strftime('%Y', c.birth_date)) BETWEEN 18 AND 30 THEN 'Young Adult'
+        WHEN (strftime('%Y', 'now') - strftime('%Y', c.birth_date)) BETWEEN 31 AND 50 THEN 'Adult'
+        ELSE 'Senior'
+    END AS age_category,
+    l.amount AS loan_amount,
+    d.A10 AS district_economic_status,
+    d.A8 AS district_population,
+    d.A9 AS district_area,
+    d.A7 AS district_code
+FROM client c
+JOIN loan l ON c.client_id = (SELECT account_id FROM loan WHERE amount = (SELECT MAX(amount) FROM loan))
+JOIN district d ON c.district_id = d.district_id
+WHERE c.gender IN ('M', 'F')
+  AND d.A10 IS NOT NULL;",,13277.04,1.0,"account, client, disp, district, loan, order, trans",1,1728,248,
+bird_dev,162,hard,answerable,wrong,"SELECT 
+    c.client_id,
+    c.gender,
+    a.account_id,
+    a.frequency,
+    d.A3 AS region,
+    COUNT(l.loan_id) AS loan_count,
+    SUM(CASE WHEN l.status = 'A' THEN l.amount ELSE 0 END) AS active_loan_amount,
+    SUM(CASE WHEN l.status = 'D' THEN l.amount ELSE 0 END) AS defaulted_loan_amount,
+    COUNT(t.trans_id) AS transaction_count,
+    SUM(t.amount) AS total_transaction_amount,
+    MAX(t.balance) AS max_balance,
+    MIN(t.balance) AS min_balance,
+    (SELECT COUNT(*) FROM client c2 WHERE c2.district_id = c.district_id AND c2.client_id != c.client_id) AS other_clients_in_region
+FROM client c
+JOIN account a ON c.client_id = a.account_id
+LEFT JOIN loan l ON a.account_id = l.account_id
+LEFT JOIN trans t ON a.account_id = t.account_id
+LEFT JOIN district d ON c.district_id = d.district_id
+WHERE c.client_id = 3541
+GROUP BY c.client_id, a.account_id, a.frequency, d.A3
+ORDER BY transaction_count DESC;",,14914.89,1.0,"account, client, disp, district, loan, order, trans",1,1737,264,
+bird_dev,170,easy,answerable,correct,"SELECT COUNT(*) AS withdrawal_count
+FROM trans
+WHERE type = 'VYDAJ'
+  AND operation LIKE '%KARTOU%'
+  AND strftime('%Y', date) > '1995';",,5867.57,1.0,"account, card, client, disp, district, order, trans",1,1676,46,
+bird_dev,184,easy,answerable,correct,SELECT COUNT(*) AS count FROM client c JOIN disp d ON c.client_id = d.client_id JOIN card ca ON d.disp_id = ca.disp_id WHERE c.gender = 'F' AND ca.type = 'junior';,,4286.89,1.0,"account, card, client, disp, district, order, trans",1,1672,48,
+bird_dev,202,easy,answerable,correct,SELECT COUNT(*) AS count FROM bond WHERE LOWER(bond_type) = '#';,,3508.03,1.0,"atom, bond, connected, molecule",1,1083,17,
+bird_dev,216,easy,answerable,error,"SELECT c.atom_id, c.atom_id2, a.element AS element1, a2.element AS element2
+FROM connected c
+JOIN atom a ON c.atom_id = a.atom_id
+JOIN atom a2 ON c.atom_id2 = a2.atom_id
+WHERE LOWER(c.bond_type) = '#';",OperationalError: no such column: b.bond_type,7488.73,1.0,"atom, bond, connected, molecule",1,2278,130,
+bird_dev,223,easy,answerable,wrong,"SELECT atom_id AS atom_id1, atom_id2 AS atom_id2 FROM connected WHERE bond_id = 'TR000_2_5';",,2098.82,1.0,"atom, bond, connected, molecule",1,1092,32,
+bird_dev,226,medium,answerable,wrong,"SELECT ROUND(100.0 * (SELECT COUNT(*) FROM bond WHERE molecule_id = 'TR008' AND bond_type = '#') / (SELECT COUNT(*) FROM bond WHERE molecule_id = 'TR008'), 5) AS percentage;",,3188.34,1.0,"atom, bond, connected, molecule",1,1102,55,
+bird_dev,235,easy,answerable,wrong,SELECT COUNT(*) AS count FROM molecule m JOIN atom a ON m.molecule_id = a.molecule_id WHERE LOWER(m.label) LIKE '%carcinogenic%' AND LOWER(a.element) = 'bromine';,,2816.10,1.0,"atom, bond, connected, molecule",1,1088,44,
+bird_dev,241,easy,answerable,correct,SELECT COUNT(*) AS count FROM molecule WHERE LOWER(label) = '-';,,1354.72,1.0,"atom, bond, connected, molecule",1,1085,15,
+bird_dev,246,medium,answerable,wrong,"SELECT b.bond_type, b.bond_id
+FROM bond b
+JOIN connected c ON b.bond_id = c.bond_id
+WHERE LOWER(c.atom_id) = '45' OR LOWER(c.atom_id2) = '45';",,3063.24,1.0,"atom, bond, connected, molecule",1,1090,53,
+bird_dev,257,easy,answerable,wrong,"SELECT c.atom_id2
+FROM connected c
+JOIN atom a ON c.atom_id = a.atom_id
+WHERE LOWER(a.element) = 'sulfur';",,2189.90,1.0,"atom, bond, connected, molecule",1,1086,34,
+bird_dev,264,easy,answerable,correct,"SELECT molecule_id, label FROM molecule WHERE LOWER(molecule_id) IN ('tr000', 'tr001', 'tr002');",,2190.72,1.0,"atom, bond, connected, molecule",1,1095,33,
+bird_dev,266,easy,answerable,correct,SELECT SUM(CASE WHEN label = '+' THEN 1 ELSE 0 END) AS total_carcinogenic_molecules FROM molecule WHERE molecule_id >= 'TR000' AND molecule_id <= 'TR030';,,2802.56,1.0,"atom, bond, connected, molecule",1,1095,47,
+bird_dev,269,easy,answerable,wrong,SELECT COUNT(b.bond_id) AS count FROM bond b JOIN connected c ON b.bond_id = c.bond_id JOIN atom a ON c.atom_id = a.atom_id WHERE LOWER(a.element) = 'iodine';,,2801.13,1.0,"atom, bond, connected, molecule",1,1084,47,
+bird_dev,272,medium,answerable,wrong,"SELECT m1.molecule_id AS molecule_id_1, m2.molecule_id AS molecule_id_2
+FROM bond b1
+JOIN atom a1 ON b1.molecule_id = a1.molecule_id
+JOIN molecule m1 ON b1.molecule_id = m1.molecule_id
+JOIN connected c1 ON b1.bond_id = c1.bond_id
+JOIN bond b2 ON b2.molecule_id = m1.molecule_id
+JOIN atom a2 ON b2.molecule_id = a2.molecule_id
+JOIN molecule m2 ON b2.molecule_id = m2.molecule_id
+JOIN connected c2 ON b2.bond_id = c2.bond_id
+WHERE LOWER(b1.bond_type) = '#'
+  AND LOWER(a1.element) = 'carbon'
+  AND LOWER(m1.label) NOT IN ('+')
+  AND LOWER(b2.bond_type) = '#'
+  AND LOWER(a2.element) = 'carbon'
+  AND LOWER(m2.label) NOT IN ('+');",,10587.37,1.0,"atom, bond, connected, molecule",1,1091,219,
+bird_dev,273,medium,answerable,wrong,SELECT CAST(SUM(CASE WHEN LOWER(a.element) = 'chlorine' THEN 1 ELSE 0 END) AS REAL) * 100.0 / COUNT(*) AS percentage FROM atom a JOIN molecule m ON a.molecule_id = m.molecule_id WHERE LOWER(m.label) = 'carcinogenic';,,3738.41,1.0,"atom, bond, connected, molecule",1,1087,67,
+bird_dev,274,easy,answerable,unanswerable,SELECT 'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error;,UNANSWERABLE_WITH_GIVEN_SCHEMA,1336.19,1.0,"atom, bond, connected, molecule",1,1088,15,
+bird_dev,281,hard,answerable,wrong,SELECT COUNT(*) AS count FROM atom WHERE element LIKE '%carcinogenic%';,,1454.57,1.0,"atom, bond, connected, molecule",1,1095,17,
+bird_dev,284,medium,answerable,wrong,"SELECT DISTINCT b.bond_type
+FROM bond b
+JOIN connected c ON b.bond_id = c.bond_id
+JOIN atom a ON c.atom_id = a.atom_id
+WHERE LOWER(a.element) = 'carbon';",,2828.03,1.0,"atom, bond, connected, molecule",1,1091,47,
+bird_dev,287,medium,answerable,wrong,"SELECT CAST(SUM(CASE WHEN b.bond_type = '=' THEN 1 ELSE 0 END) AS REAL) * 100 / COUNT(*) AS percent_double_bonds
+FROM bond b
+JOIN molecule m ON b.molecule_id = m.molecule_id
+WHERE LOWER(m.label) LIKE '%tr047%';",,3861.69,1.0,"atom, bond, connected, molecule",1,1097,70,
+bird_dev,289,easy,answerable,unanswerable,SELECT 'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error;,UNANSWERABLE_WITH_GIVEN_SCHEMA,1325.57,1.0,"atom, bond, connected, molecule",1,1084,15,
+bird_dev,290,hard,answerable,wrong,"SELECT a.element AS toxic_element
+FROM atom a
+JOIN molecule m ON a.molecule_id = m.molecule_id
+WHERE m.label = 'TR151'
+  AND LOWER(a.element) LIKE '%toxic%';",,2897.97,1.0,"atom, bond, connected, molecule",1,1089,49,
+bird_dev,296,easy,answerable,wrong,"SELECT m.molecule_id
+FROM `molecule` m
+JOIN `atom` a ON m.molecule_id = a.molecule_id
+JOIN `connected` c ON a.atom_id = c.atom_id
+WHERE LOWER(a.element) = 'tr'
+  AND LOWER(c.atom_id2) LIKE '%000_1%'
+  AND EXISTS (
+    SELECT 1
+    FROM `bond` b
+    WHERE b.bond_id = c.bond_id
+      AND b.molecule_id = m.molecule_id
+  );",,5842.68,1.0,"atom, bond, connected, molecule",1,1106,114,
+bird_dev,302,hard,answerable,correct,"SELECT DISTINCT a.element
+FROM atom a
+JOIN connected c ON a.atom_id = c.atom_id
+WHERE c.bond_id = 'TR001_2_4';",,2392.01,1.0,"atom, bond, connected, molecule",1,1093,38,
+bird_dev,311,easy,answerable,refused,SELECT COUNT(*) AS count FROM (SELECT DISTINCT m.molecule_id FROM molecule m LEFT JOIN atom a ON m.molecule_id = a.molecule_id WHERE LOWER(a.element) != 'sulphur' AND a.atom_id IS NOT NULL LEFT JOIN connected c ON a.atom_id = c.atom_id LEFT JOIN bond b ON c.bond_id = b.bond_id WHERE b.bond_type = '=' OR b.bond_id IS NULL GROUP BY m.molecule_id HAVING COUNT(CASE WHEN b.bond_type = '=' THEN 1 END) = 0);,BLOCKED_UNSAFE_SQL,5979.60,1.0,"atom, bond, connected, molecule",1,1088,116,
+bird_dev,317,medium,answerable,wrong,"SELECT CAST(SUM(CASE WHEN LOWER(a.element) = 'chlorine' THEN 1 ELSE 0 END) AS REAL) * 100 / COUNT(*) AS percentage
+FROM atom a
+JOIN molecule m ON a.molecule_id = m.molecule_id
+WHERE LOWER(m.label) = '+';",,3942.24,1.0,"atom, bond, connected, molecule",1,1089,65,
+bird_dev,324,easy,answerable,correct,SELECT CAST(SUM(CASE WHEN b.bond_type = '-' THEN 1 ELSE 0 END) AS REAL) * 100 / COUNT(*) AS percentage_single_bonds FROM connected c JOIN bond b ON c.bond_id = b.bond_id;,,3182.62,1.0,"atom, bond, connected, molecule",1,1084,55,
+bird_dev,332,easy,answerable,wrong,"SELECT COUNT(*) AS count FROM bond WHERE LOWER(molecule_id) IN (LOWER('TR004'), LOWER('TR005'), LOWER('TR006'), LOWER('TR007'), LOWER('TR008'), LOWER('TR009'), LOWER('TR010')) AND bond_type = '-';",,4057.03,1.0,"atom, bond, connected, molecule",1,1097,71,
+bird_dev,335,easy,answerable,wrong,SELECT COUNT(*) AS total_molecules_with_double_bonded_oxygen FROM atom a INNER JOIN bond b ON a.molecule_id = b.molecule_id WHERE LOWER(a.element) = 'o' AND b.bond_type = '#';,,2923.41,1.0,"atom, bond, connected, molecule",1,1087,49,
+bird_dev,350,easy,answerable,correct,"SELECT DISTINCT f.language
+FROM foreign_data f
+JOIN cards c ON f.uuid = c.uuid
+WHERE LOWER(c.name) = 'annul' AND c.number = '29';",,7769.77,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2283,39,
+bird_dev,357,easy,answerable,wrong,"SELECT c.name AS card_name, c.promoTypes AS promotion_type
+FROM cards c
+WHERE LOWER(c.name) = 'duress';",,6232.53,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2279,30,
+bird_dev,365,easy,answerable,wrong,"SELECT name, type FROM cards WHERE LOWER(name) = 'benalish knight';",,5697.95,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2280,18,
+bird_dev,377,easy,answerable,wrong,SELECT COUNT(*) AS count FROM cards WHERE LOWER(originalType) = 'summon - angel' AND (subtypes IS NULL OR subtypes NOT LIKE '%angel%');,,6650.95,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2287,35,
+bird_dev,396,easy,answerable,correct,"SELECT COUNT(*) AS count FROM ""cards"" WHERE frameVersion = '1993' AND availability LIKE '%paper%' AND hasContentWarning = 1;",,4402.87,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2290,34,
+bird_dev,417,medium,answerable,wrong,"SELECT CAST(SUM(CASE WHEN s.type = 'expansion' THEN 1 ELSE 0 END) AS REAL) * 100.0 / COUNT(*) AS japanese_expansion_percentage
+FROM sets s
+JOIN set_translations st ON s.code = st.setCode
+WHERE LOWER(st.language) LIKE '%japanese%';",,7503.94,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2278,69,
+bird_dev,419,easy,answerable,wrong,SELECT COUNT(*) AS count FROM cards WHERE LOWER(borderColor) = 'borderless' AND edhrecRank < 12000;,,4146.92,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2291,31,
+bird_dev,426,easy,answerable,wrong,"SELECT name, code
+FROM sets
+WHERE isOnlineOnly = 1
+ORDER BY name ASC
+LIMIT 3;",,4592.07,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2293,26,
+bird_dev,435,easy,answerable,correct,SELECT id FROM cards WHERE LOWER(borderColor) = 'black';,,2186.61,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2282,14,
+bird_dev,443,easy,answerable,correct,SELECT code FROM sets WHERE LOWER(type) = LOWER('expansion');,,3649.35,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2281,15,
+bird_dev,459,medium,answerable,refused,"SELECT 
+    CASE 
+        WHEN LOWER(name) = 'serra angel' THEN faceConvertedManaCost AS serra_angel_cost
+        WHEN LOWER(name) = 'shrine keeper' THEN faceConvertedManaCost AS shrine_keeper_cost
+        ELSE NULL 
+    END AS card_name,
+    faceConvertedManaCost AS converted_mana_cost
+FROM cards
+WHERE LOWER(name) IN ('serra angel', 'shrine keeper');",BLOCKED_UNSAFE_SQL,7133.56,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2286,90,
+bird_dev,460,easy,answerable,correct,"SELECT artist FROM cards WHERE LOWER(flavorName) = 'battra, dark destroyer';",,3957.75,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2285,19,
+bird_dev,467,easy,answerable,wrong,SELECT COUNT(*) AS card_count FROM sets WHERE LOWER(name) = 'hauptset zehnte edition';,,4051.20,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2287,22,
+bird_dev,468,medium,answerable,wrong,"SELECT s.name AS english_name, st.translation AS simplified_chinese_translation
+FROM sets s
+JOIN set_translations st ON s.code = st.setCode
+WHERE LOWER(s.name) LIKE '%eighth edition%'
+  AND st.language = 'Chinese Simplified';",,7594.80,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2286,55,
+bird_dev,481,easy,answerable,wrong,"SELECT DISTINCT f.language
+FROM foreign_data f
+JOIN cards c ON f.uuid = c.uuid
+WHERE LOWER(c.name) = 'ancestor''s chosen'
+  AND f.flavorText IS NOT NULL;",,7496.65,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2290,44,
+bird_dev,484,medium,answerable,wrong,"SELECT name AS italian_name, convertedManaCost
+FROM cards
+WHERE setCode = 'Coldsnap'
+  AND LOWER(name) LIKE '%italian%'
+ORDER BY convertedManaCost DESC
+LIMIT 1;",,6503.70,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,4661,89,
+bird_dev,500,medium,answerable,wrong,"SELECT s.name AS english_name, st.translation AS japanese_name
+FROM sets s
+JOIN set_translations st ON s.code = st.setCode AND st.language = 'Japanese'
+WHERE s.code IN (
+    SELECT DISTINCT c.setCode
+    FROM cards c
+    WHERE LOWER(c.name) LIKE '%fellwar stone%'
+);",,4662.92,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2287,69,
+bird_dev,503,easy,answerable,correct,"SELECT s.type AS expansion_type
+FROM sets s
+JOIN cards c ON s.code = c.setCode
+WHERE LOWER(c.name) = 'samite pilgrim';",,6216.66,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2287,34,
+bird_dev,507,hard,answerable,wrong,"SELECT CAST(SUM(CASE WHEN LOWER(language) = 'portuguese (brazil)' THEN 1 ELSE 0 END) AS REAL) * 100.0 / COUNT(*) AS percentage
+FROM set_translations
+WHERE LOWER(language) LIKE '%portuguese%';",,3959.34,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2291,60,
+bird_dev,510,easy,answerable,wrong,"SELECT name AS illustrator
+FROM cards
+WHERE layout = 'normal'
+ORDER BY convertedManaCost DESC
+LIMIT 1;",,4375.96,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2299,27,
+bird_dev,512,easy,answerable,wrong,SELECT COUNT(*) AS count FROM cards WHERE LOWER(power) = 'unknown' AND hasNonFoil = 1 AND duelDeck = 'a';,,4894.26,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,4646,61,
+bird_dev,516,medium,answerable,wrong,SELECT COUNT(*) AS count FROM cards c JOIN foreign_data fd ON c.uuid = fd.uuid WHERE LOWER(c.artist) = 'volkan baçµa' AND LOWER(fd.language) = 'french';,,6821.42,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2286,43,
+bird_dev,526,easy,answerable,correct,SELECT COUNT(*) AS count FROM cards WHERE LOWER(artist) = 'matthew d. wilson' AND LOWER(availability) = 'paper';,,2550.88,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2287,30,
+bird_dev,527,medium,answerable,wrong,"SELECT r.date, r.text
+FROM rulings r
+JOIN cards c ON r.uuid = c.uuid
+WHERE LOWER(c.artist) = 'kev walker'
+ORDER BY r.date DESC;",,4811.85,1.0,"cards, foreign_data, legalities, rulings, set_translations, sets",1,2291,39,
+bird_dev,536,easy,answerable,correct,"SELECT COUNT(*) AS user_count
+FROM users
+WHERE Views > 10
+AND strftime('%Y', CreationDate) > '2013';",,8359.04,1.0,"badges, comments, posthistory, posts, users, votes",1,1599,33,
+bird_dev,552,easy,answerable,correct,"SELECT b.Name
+FROM badges b
+JOIN users u ON b.UserId = u.Id
+WHERE LOWER(u.DisplayName) = 'csgillespie';",,4789.54,1.0,"badges, posthistory, posts, tags, users, votes",1,1558,31,
+bird_dev,554,easy,answerable,correct,SELECT DisplayName FROM users WHERE Id IN (SELECT UserId FROM badges GROUP BY UserId ORDER BY COUNT(*) DESC LIMIT 1),,2692.86,1.0,"badges, comments, posthistory, posts, users, votes",1,1594,25,
+bird_dev,560,easy,answerable,correct,SELECT COUNT(*) AS RevivalBadgeCount FROM badges WHERE LOWER(Name) = 'revival';,,2727.77,1.0,"badges, posthistory, postlinks, posts, tags, users, votes",1,1656,20,
+bird_dev,569,easy,answerable,correct,"SELECT COUNT(*) AS vote_count
+FROM votes
+JOIN posts ON posts.Id = votes.PostId
+WHERE LOWER(posts.Title) LIKE '%data%visualization%';",,7915.65,1.0,"comments, posthistory, postlinks, posts, tags, users, votes",1,3487,65,
+bird_dev,579,easy,answerable,wrong,"SELECT c.Id, c.PostId, c.Score, c.Text, c.CreationDate, c.UserId, c.UserDisplayName
+FROM comments c
+JOIN posts p ON c.PostId = p.Id
+WHERE LOWER(p.Title) LIKE '%how does gentle boosting differ from adaboost%';",,6787.78,1.0,"comments, posthistory, postlinks, posts, tags, users, votes",1,1713,60,
+bird_dev,581,medium,answerable,wrong,SELECT OwnerDisplayName AS Editor FROM posts WHERE LOWER(Title) = LOWER('open source tools for visualizing multi-dimensional data?');,,5565.69,1.0,"comments, posthistory, postlinks, posts, tags, users, votes",1,1714,27,
+bird_dev,585,easy,answerable,correct,"SELECT SUM(v.BountyAmount) AS TotalBountyAmount
+FROM votes v
+JOIN posts p ON v.PostId = p.Id
+WHERE LOWER(p.Title) LIKE '%data%';",,5932.97,1.0,"comments, posthistory, postlinks, posts, tags, users, votes",1,1710,39,
+bird_dev,589,easy,answerable,wrong,"SELECT Id AS UserId, Reputation FROM users ORDER BY Reputation DESC LIMIT 1;",,2163.36,1.0,"badges, comments, posthistory, postlinks, posts, users, votes",1,1687,17,
+bird_dev,590,easy,answerable,wrong,"SELECT Id AS user_id, Views AS view_count
+FROM users
+ORDER BY Views ASC
+LIMIT 1;",,5421.36,1.0,"badges, comments, posthistory, postlinks, posts, tags, users, votes",1,3598,48,
+bird_dev,594,easy,answerable,correct,"SELECT u.DisplayName AS CreatedByUser, u.Reputation
+FROM users u
+JOIN posts p ON u.Id = p.OwnerUserId
+WHERE p.Id = 1;",,3836.47,1.0,"badges, comments, posthistory, postlinks, posts, users, votes",1,1695,35,
+bird_dev,595,medium,answerable,wrong,"SELECT UserId, COUNT(DISTINCT PostHistoryTypeId) AS HistoryTypeCount
+FROM postHistory
+WHERE PostId IN (
+    SELECT Id
+    FROM posts
+    WHERE ViewCount >= 1000
+)
+GROUP BY UserId
+HAVING COUNT(DISTINCT PostHistoryTypeId) = 1;",,5023.11,1.0,"comments, posthistory, postlinks, posts, users, votes",1,1637,66,
+bird_dev,597,easy,answerable,wrong,SELECT COUNT(*) AS count FROM badges b INNER JOIN users u ON b.UserId = u.Id WHERE LOWER(u.Location) LIKE '%india%' AND LOWER(b.Name) = 'teacher';,,3527.38,1.0,"badges, comments, posthistory, posts, users, votes",1,1587,38,
+bird_dev,610,easy,answerable,wrong,"SELECT b.Name
+FROM badges b
+JOIN users u ON b.UserId = u.Id
+WHERE u.Reputation = (
+    SELECT MAX(Reputation)
+    FROM users
+);",,3542.54,1.0,"badges, comments, posthistory, posts, users, votes",1,1592,39,
+bird_dev,619,easy,answerable,wrong,"SELECT COUNT(*) AS adult_supporter_count
+FROM badges b
+JOIN users u ON b.UserId = u.Id
+WHERE LOWER(b.Name) = 'supporter'
+  AND (u.Age >= 18 OR u.AboutMe LIKE '%adult%');",,4469.90,1.0,"badges, comments, postlinks, posts, tags, users, votes",1,1636,54,
+bird_dev,622,easy,answerable,wrong,"SELECT b.Name
+FROM badges b
+JOIN users u ON b.UserId = u.Id
+WHERE LOWER(u.DisplayName) = 'sharpie';",,3149.12,1.0,"badges, comments, posthistory, posts, users, votes",1,1595,29,
+bird_dev,630,easy,answerable,wrong,"SELECT t.TagName
+FROM tags t
+JOIN posts p ON t.ExcerptPostId = p.Id
+JOIN users u ON p.OwnerUserId = u.Id
+WHERE LOWER(u.DisplayName) LIKE '%john salvatier%';",,4165.54,1.0,"badges, comments, posthistory, posts, tags, users, votes",1,1671,47,
+bird_dev,654,medium,answerable,wrong,"SELECT u.DisplayName, u.Location
+FROM users u
+JOIN tags t ON t.ExcerptPostId = u.Id
+WHERE LOWER(t.TagName) LIKE '%hypothesis-testing%';",,4303.09,1.0,"badges, comments, posthistory, posts, tags, users, votes",1,1677,39,
+bird_dev,657,medium,answerable,correct,"SELECT u.DisplayName, u.WebsiteUrl
+FROM users u
+JOIN votes v ON u.Id = v.UserId
+WHERE v.VoteTypeId = 8
+ORDER BY v.BountyAmount DESC
+LIMIT 1;",,4044.19,1.0,"badges, comments, posthistory, posts, tags, users, votes",1,1682,45,
+bird_dev,661,easy,answerable,wrong,"SELECT MAX(Age) AS MaxAge
+FROM users;",,2296.58,1.0,"badges, comments, posthistory, posts, users, votes",1,1585,13,
+bird_dev,664,easy,answerable,wrong,"SELECT SUM(p.Score) AS total_score
+FROM posts p
+WHERE strftime('%Y-%m-%d', p.CreaionDate) = '2010-07-19';",,3784.10,1.0,"comments, posthistory, postlinks, posts, tags, users, votes",1,1717,42,
+bird_dev,665,medium,answerable,wrong,"SELECT strftime('%Y-%m', pl.CreationDate) AS month,
+       COUNT(*) AS link_count
+FROM postLinks pl
+JOIN posts p ON pl.PostId = p.Id
+WHERE strftime('%Y', pl.CreationDate) = '2010'
+  AND p.AnswerCount <= 2
+GROUP BY strftime('%Y-%m', pl.CreationDate)",,5853.38,1.0,"comments, posthistory, postlinks, posts, tags, users, votes",1,1721,81,
+bird_dev,671,easy,answerable,correct,"SELECT u.DisplayName
+FROM badges b
+JOIN users u ON b.UserId = u.Id
+WHERE b.Name = 'Autobiographer'
+ORDER BY b.Date ASC
+LIMIT 1;",,3861.83,1.0,"badges, comments, posthistory, posts, users, votes",1,1594,39,
+bird_dev,676,easy,answerable,wrong,SELECT DisplayName FROM users WHERE Age >= 18;,,2306.92,1.0,"badges, comments, posthistory, posts, users, votes",1,1588,12,
+bird_dev,678,easy,answerable,wrong,"SELECT Id, Title
+FROM posts
+WHERE LOWER(OwnerDisplayName) = 'harvey motulsky'
+ORDER BY ViewCount DESC
+LIMIT 1;",,3154.12,1.0,"comments, posthistory, postlinks, posts, tags, users",1,1613,34,
+bird_dev,701,hard,answerable,reference_invalid,"SELECT CAST(SUM(CASE WHEN Score > 50 THEN 1 ELSE 0 END) AS REAL) * 100 / COUNT(*) AS percentage
+FROM posts
+WHERE OwnerUserId = (
+    SELECT Id
+    FROM users
+    ORDER BY Reputation DESC
+    LIMIT 1
+);",QUERY_ABORTED_AFTER_1000000000_VM_STEPS,4950.29,1.0,"comments, posthistory, postlinks, posts, tags, users, votes",1,1717,64,
+bird_dev,725,easy,answerable,correct,SELECT COUNT(*) AS count FROM superhero s JOIN publisher p ON s.publisher_id = p.id WHERE LOWER(p.publisher_name) = 'marvel comics';,,4694.89,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,2713,51,
+bird_dev,728,medium,answerable,wrong,"SELECT superhero.superhero_name, colour.colour AS eye_colour, COUNT(*) AS count
+FROM superhero
+JOIN colour ON superhero.eye_colour_id = colour.id
+JOIN publisher ON superhero.publisher_id = publisher.id
+WHERE LOWER(publisher.publisher_name) LIKE '%marvel%'
+GROUP BY superhero.superhero_name, colour.colour
+ORDER BY count DESC;",,4461.80,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,1335,72,
+bird_dev,738,easy,answerable,correct,"SELECT superhero_name
+FROM superhero
+WHERE id IN (
+    SELECT hero_id
+    FROM hero_attribute
+    WHERE attribute_id = (
+        SELECT id
+        FROM attribute
+        WHERE LOWER(attribute_name) = 'durability'
+    )
+    AND attribute_value < 50
+);",,3742.57,1.0,"alignment, attribute, hero_attribute, hero_power, publisher, superhero, superpower",1,1241,63,
+bird_dev,746,easy,answerable,correct,"SELECT AVG(attribute_value) AS average_attribute_value
+FROM hero_attribute;",,1570.95,1.0,"alignment, attribute, hero_attribute, hero_power, publisher, superhero, superpower",1,1236,15,
+bird_dev,761,medium,answerable,correct,"SELECT superhero_name
+FROM superhero
+WHERE gender_id = (SELECT id FROM gender WHERE LOWER(gender) = 'male')
+AND weight_kg > (
+    SELECT AVG(weight_kg) * 0.79
+    FROM superhero
+);",,3471.70,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,1344,53,
+bird_dev,774,easy,answerable,wrong,"SELECT alignment.alignment 
+FROM superhero 
+JOIN alignment ON superhero.alignment_id = alignment.id 
+WHERE LOWER(superhero.superhero_name) = 'a-bomb';",,2523.59,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,1327,32,
+bird_dev,777,easy,answerable,correct,"SELECT g.gender
+FROM superhero s
+JOIN gender g ON s.gender_id = g.id
+WHERE LOWER(s.superhero_name) LIKE '%agent 13%';",,2653.25,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,1328,35,
+bird_dev,779,easy,answerable,correct,SELECT COUNT(*) AS power_count FROM hero_power JOIN superhero ON hero_power.hero_id = superhero.id WHERE LOWER(superhero.superhero_name) = 'amazo';,,4493.98,1.0,"alignment, attribute, hero_attribute, hero_power, publisher, superhero, superpower",1,2538,56,
+bird_dev,785,easy,answerable,correct,"SELECT superhero.superhero_name
+FROM superhero
+JOIN alignment ON superhero.alignment_id = alignment.id
+WHERE LOWER(alignment.alignment) = 'neutral';",,2479.69,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,1325,30,
+bird_dev,789,easy,answerable,correct,"SELECT AVG(s.weight_kg) AS average_weight
+FROM superhero s
+JOIN race r ON s.race_id = r.id
+WHERE LOWER(r.race) LIKE '%alien%';",,3011.49,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,1328,39,
+bird_dev,794,medium,answerable,wrong,"SELECT superhero_name AS hero_name, attribute_value AS speed FROM hero_attribute JOIN superhero ON hero_attribute.hero_id = superhero.id WHERE attribute_id = (SELECT id FROM attribute WHERE LOWER(attribute_name) = 'speed') ORDER BY attribute_value DESC LIMIT 1;",,3273.59,1.0,"alignment, attribute, hero_attribute, hero_power, publisher, superhero, superpower",1,1233,52,
+bird_dev,801,medium,answerable,wrong,"SELECT CAST(SUM(CASE WHEN LOWER(g.gender) = 'male' THEN 1 ELSE 0 END) AS REAL) / SUM(CASE WHEN LOWER(g.gender) IN ('female', 'male') THEN 1 ELSE 0 END) AS ratio
+FROM superhero s
+JOIN gender g ON s.gender_id = g.id;",,4204.34,1.0,"alignment, attribute, gender, hero_attribute, hero_power, publisher, superhero, superpower",1,1275,69,
+bird_dev,808,easy,answerable,wrong,"SELECT s.race_id, r.race
+FROM superhero s
+JOIN race r ON s.race_id = r.id
+WHERE s.weight_kg = 108 AND s.height_cm = 188;",,3207.62,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,1339,47,
+bird_dev,819,hard,answerable,wrong,SELECT (SELECT COUNT(*) FROM superhero WHERE height_cm IS NULL AND eye_colour_id = (SELECT id FROM colour WHERE LOWER(colour) = 'blue')) - (SELECT COUNT(*) FROM superhero WHERE weight_kg IS NULL AND eye_colour_id IS NULL) AS difference;,,3445.73,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,1340,55,
+bird_dev,832,easy,answerable,wrong,"SELECT superhero_name AS name, height_cm AS height FROM superhero ORDER BY height_cm DESC LIMIT 1;",,1918.30,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,1322,22,
+bird_dev,833,easy,answerable,correct,"SELECT superhero_name 
+FROM superhero 
+WHERE LOWER(full_name) = LOWER('Charles Chandler');",,1776.76,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,1327,19,
+bird_dev,837,easy,answerable,wrong,SELECT hero_id FROM hero_attribute ORDER BY attribute_value ASC LIMIT 1;,,1823.73,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,1329,16,
+bird_dev,839,easy,answerable,correct,"SELECT superhero.full_name
+FROM superhero
+WHERE superhero.weight_kg < 100
+AND LOWER(superhero.eye_colour_id) = (
+    SELECT colour.id
+    FROM colour
+    WHERE LOWER(colour.colour) = 'brown'
+);",,3560.71,1.0,"alignment, attribute, colour, gender, hero_attribute, hero_power, publisher, race, superhero, superpower",1,1339,54,
+bird_dev,868,easy,answerable,wrong,"SELECT c.name AS circuit_name, c.location, c.lat, c.lng
+FROM circuits c
+WHERE LOWER(c.name) LIKE '%malaysian%' OR LOWER(c.location) LIKE '%malaysia%';",,4354.52,1.0,"circuits, constructors, drivers, driverstandings, laptimes, pitstops, qualifying, races, results, status",1,1915,43,
+bird_dev,872,easy,answerable,wrong,"SELECT d.code
+FROM drivers d
+JOIN qualifying q ON d.driverId = q.driverId
+JOIN races r ON q.raceId = r.raceId
+WHERE r.round = 45
+AND LOWER(q.q3) LIKE '%0:01:33%';",,6303.23,1.0,"circuits, constructors, drivers, laptimes, pitstops, qualifying, races, results, seasons, status",1,1862,60,
+bird_dev,894,medium,answerable,wrong,"SELECT 
+    d.forename || ' ' || d.surname AS driver,
+    r.name AS race,
+    l.milliseconds AS milliseconds
+FROM lapTimes l
+JOIN drivers d ON l.driverId = d.driverId
+JOIN races r ON l.raceId = r.raceId
+ORDER BY l.milliseconds ASC
+LIMIT 1;",,7396.98,1.0,"circuits, constructors, drivers, driverstandings, laptimes, pitstops, qualifying, races, results, seasons, status",1,1958,73,
+bird_dev,895,medium,answerable,wrong,"SELECT AVG(CAST(strftime('%s', lapTimes.time) AS REAL)) AS avg_lap_time_seconds
+FROM lapTimes
+JOIN drivers ON lapTimes.driverId = drivers.driverId
+JOIN races ON lapTimes.raceId = races.raceId
+WHERE drivers.forename = 'Lewis'
+  AND drivers.surname = 'Hamilton'
+  AND races.name LIKE '%Malaysian%'
+  AND races.year = 2009;",,5120.16,1.0,"circuits, constructors, drivers, laptimes, pitstops, races, results, seasons, status",1,1713,94,
+bird_dev,899,medium,answerable,wrong,"SELECT c.name AS circuit_name, c.location, c.country, COUNT(r.raceId) AS race_count
+FROM circuits c
+JOIN races r ON c.circuitId = r.circuitId
+WHERE r.year BETWEEN 1990 AND 2000
+GROUP BY c.circuitId
+HAVING COUNT(r.raceId) >= 4;",,7037.09,1.0,"circuits, constructorresults, constructors, constructorstandings, drivers, driverstandings, races, seasons",1,1560,77,
+bird_dev,915,easy,answerable,wrong,"SELECT c.country AS country
+FROM drivers d
+JOIN circuits c ON 1=1
+WHERE d.dob IS NOT NULL
+ORDER BY d.dob ASC
+LIMIT 1;",,6244.50,1.0,"circuits, constructors, drivers, driverstandings, laptimes, qualifying, races, results, status",1,1807,39,
+bird_dev,922,easy,answerable,wrong,"SELECT r.date, r.name 
+FROM races r
+JOIN circuits c ON r.circuitId = c.circuitId
+WHERE strftime('%Y', r.date) LIKE '201%'
+  AND LOWER(c.name) LIKE '%abu dhabi%';",,4685.51,1.0,"circuits, constructorresults, constructors, drivers, laptimes, pitstops, races, results, seasons, status",1,1809,54,
+bird_dev,923,easy,answerable,correct,"SELECT COUNT(*) AS race_count
+FROM races
+JOIN circuits ON races.circuitId = circuits.circuitId
+WHERE LOWER(circuits.country) = 'italy';",,5215.23,1.0,"circuits, constructorresults, constructors, drivers, driverstandings, laptimes, pitstops, races, seasons",1,3334,59,
+bird_dev,944,hard,answerable,wrong,"SELECT CAST((1.0 - (CAST(r_last.milliseconds AS REAL) / r_champion.milliseconds)) * 100 AS REAL) AS percentage_faster
+FROM results r_champion, results r_last
+WHERE r_champion.raceId = (SELECT raceId FROM races WHERE name LIKE '%Australian%' AND year = 2008)
+AND r_last.raceId = r_champion.raceId
+AND r_champion.position = 1
+AND r_last.position = (SELECT MAX(position) FROM results WHERE raceId = r_champion.raceId);",,8375.81,1.0,"constructors, drivers, driverstandings, laptimes, pitstops, qualifying, races, results, status",1,1847,123,
+bird_dev,958,medium,answerable,wrong,"SELECT d.forename, d.surname, MIN(l.milliseconds) AS fastest_lap_milliseconds
+FROM lapTimes l
+JOIN drivers d ON l.driverId = d.driverId
+GROUP BY l.driverId
+ORDER BY fastest_lap_milliseconds ASC
+LIMIT 1;",,5857.90,1.0,"circuits, constructors, drivers, driverstandings, laptimes, pitstops, races, results, seasons, status",1,1822,57,
+bird_dev,964,easy,answerable,wrong,SELECT code FROM drivers WHERE LOWER(nationality) LIKE '%america%';,,2529.66,1.0,"constructors, drivers, driverstandings, laptimes, pitstops, qualifying, races",1,1556,17,
+bird_dev,967,easy,answerable,error,"SELECT 
+    SUM(CASE WHEN d.code IN ('NED') THEN 1 ELSE 0 END) AS netherlands_count
+FROM (
+    SELECT driverId, code
+    FROM drivers
+    ORDER BY dob DESC
+    LIMIT 3
+) AS top_youngest;",OperationalError: no such column: d.code,8038.68,1.0,"constructors, drivers, driverstandings, laptimes, pitstops, qualifying, races, results, status",1,3781,108,
+bird_dev,981,medium,answerable,wrong,"SELECT 
+    r.year AS race_year,
+    d.forename || ' ' || d.surname AS driver_name,
+    r.date AS race_date,
+    r.time AS race_time
+FROM races r
+JOIN qualifying q ON r.raceId = q.raceId
+JOIN drivers d ON q.driverId = d.driverId
+WHERE (d.dob IS NOT NULL)
+  AND (r.year - CAST(strftime('%Y', d.dob) AS INTEGER)) = (
+      SELECT MIN(r2.year - CAST(strftime('%Y', d2.dob) AS INTEGER))
+      FROM races r2
+      JOIN qualifying q2 ON r2.raceId = q2.raceId
+      JOIN drivers d2 ON q2.driverId = d2.driverId
+      WHERE d2.dob IS NOT NULL
+  )
+ORDER BY r.year, r.date, r.time;",,10181.60,1.0,"circuits, constructors, drivers, pitstops, qualifying, races, seasons",1,1485,189,
+bird_dev,983,easy,answerable,wrong,"SELECT c.name, c.url
+FROM constructors c
+JOIN constructorStandings cs ON c.constructorId = cs.constructorId
+WHERE LOWER(c.nationality) = 'italian'
+ORDER BY cs.points DESC
+LIMIT 1;",,3804.33,1.0,"circuits, constructorresults, constructors, constructorstandings, drivers, qualifying, races, seasons",1,1578,49,
+bird_dev,988,hard,answerable,wrong,"SELECT 
+    d.forename,
+    d.surname,
+    d.nationality,
+    AVG(CAST(p.duration AS REAL)) AS avg_pit_stop_duration
+FROM drivers d
+JOIN pitStops p ON d.driverId = p.driverId
+WHERE LOWER(d.nationality) = 'german'
+  AND strftime('%Y', d.dob) BETWEEN '1980' AND '1985'
+GROUP BY d.driverId, d.forename, d.surname, d.nationality
+ORDER BY avg_pit_stop_duration ASC
+LIMIT 3;",,7757.54,1.0,"constructors, drivers, driverstandings, laptimes, pitstops, qualifying, races, results, status",1,1850,124,
+bird_dev,990,hard,answerable,wrong,"SELECT c.name AS constructor_reference_name, c.url AS website
+FROM constructors c
+JOIN constructorStandings cs ON c.constructorId = cs.constructorId
+JOIN races r ON cs.raceId = r.raceId
+WHERE r.year = 2009
+  AND r.name LIKE '%Singapore%'
+ORDER BY cs.position ASC
+LIMIT 1;",,7945.16,0.667,"circuits, constructorresults, constructors, constructorstandings, drivers, qualifying, races, seasons",1,1586,75,
+bird_dev,996,easy,answerable,wrong,"SELECT CAST(COUNT(*) AS REAL) / 10.0 AS avg_races_per_year
+FROM (
+    SELECT COUNT(*) AS race_count
+    FROM races
+    WHERE year >= 2000 AND year < 2010
+);",,6845.23,1.0,"circuits, constructors, drivers, laptimes, pitstops, qualifying, races, results, seasons, status",1,1852,56,
+bird_dev,1004,easy,answerable,wrong,"SELECT 
+    d.forename || ' ' || d.surname AS full_name,
+    MAX(d.dob) AS oldest_dob,
+    COALESCE(MAX(ds.wins), 0) AS wins
+FROM drivers d
+LEFT JOIN driverStandings ds ON d.driverId = ds.driverId
+GROUP BY d.driverId
+ORDER BY oldest_dob DESC
+LIMIT 1;",,6166.55,1.0,"circuits, constructors, constructorstandings, drivers, driverstandings, pitstops, races, seasons",1,1565,81,
+bird_dev,1026,medium,answerable,wrong,"SELECT home_team_api_id, COUNT(*) AS losses
+FROM Match
+WHERE season = '2016' AND home_team_goal < away_team_goal
+GROUP BY home_team_api_id
+ORDER BY losses ASC
+LIMIT 1;",,10829.31,1.0,"country, league, match, player, player_attributes, team, team_attributes",1,3466,49,
+bird_dev,1037,hard,answerable,wrong,"SELECT CAST(SUM(CASE WHEN LOWER(preferred_foot) = 'left' THEN 1 ELSE 0 END) AS REAL) * 100.0 / COUNT(*) AS percentage
+FROM Player_Attributes
+WHERE strftime('%Y', date) IN ('1987', '1988', '1989', '1990', '1991', '1992');",,9882.93,1.0,"country, league, match, player, player_attributes, team, team_attributes",1,3474,90,
+bird_dev,1061,easy,answerable,wrong,SELECT COUNT(*) AS player_count FROM Player WHERE LOWER(player_name) LIKE '%adam%' AND weight > 170;,,6208.30,1.0,"country, league, match, player, team, team_attributes",1,2959,26,
+bird_dev,1075,medium,answerable,wrong,"SELECT p.player_name, pa.balance, pa.potential
+FROM Player p
+JOIN Player_Attributes pa ON p.player_api_id = pa.player_api_id
+WHERE pa.potential = 61
+ORDER BY pa.balance DESC
+LIMIT 1;",,8789.89,1.0,"country, league, match, player, player_attributes, team, team_attributes",1,3466,54,
+bird_dev,1085,medium,answerable,wrong,"SELECT 
+    p.player_name,
+    MAX(pa.crossing) AS max_crossing_rating
+FROM Player_Attributes pa
+JOIN Player p ON pa.player_api_id = p.player_api_id
+WHERE LOWER(p.player_name) IN ('alexis', 'ariel borysiuk', 'arouna kone')
+GROUP BY p.player_api_id
+ORDER BY max_crossing_rating DESC;",,11138.60,1.0,"country, league, player, player_attributes, team, team_attributes",1,4567,146,
+bird_dev,1088,medium,answerable,wrong,"SELECT p.player_name
+FROM Player p
+JOIN Player_Attributes pa ON p.player_api_id = pa.player_api_id
+WHERE pa.volleys > 70 AND pa.dribbling > 70;",,10241.34,1.0,"country, league, match, player, player_attributes, team, team_attributes",1,7020,88,
+bird_dev,1104,medium,answerable,wrong,"SELECT p.player_name, pa.potential 
+FROM ""Player"" p
+JOIN ""Player_Attributes"" pa ON p.player_api_id = pa.player_api_id
+WHERE p.player_name LIKE '%Francesco Parravicini%'
+AND strftime('%Y-%m-%d', pa.date) = '2010-08-30';",,8228.96,1.0,"country, league, player, player_attributes, team, team_attributes",1,2229,73,
+bird_dev,1131,easy,answerable,reference_invalid,"SELECT AVG(p.height) AS average_height
+FROM Player p
+JOIN Match m ON p.player_api_id = m.home_player_1 OR p.player_api_id = m.away_player_1 OR p.player_api_id = m.home_player_2 OR p.player_api_id = m.away_player_2 OR p.player_api_id = m.home_player_3 OR p.player_api_id = m.away_player_3 OR p.player_api_id = m.home_player_4 OR p.player_api_id = m.away_player_4 OR p.player_api_id = m.home_player_5 OR p.player_api_id = m.away_player_5 OR p.player_api_id = m.home_player_6 OR p.player_api_id = m.away_player_6 OR p.player_api_id = m.home_player_7 OR p.player_api_id = m.away_player_7 OR p.player_api_id = m.home_player_8 OR p.player_api_id = m.away_player_8 OR p.player_api_id = m.home_player_9 OR p.player_api_id = m.away_player_9 OR p.player_api_id = m.home_player_10 OR p.player_api_id = m.away_player_10 OR p.player_api_id = m.home_player_11 OR p.player_api_id = m.away_player_11
+JOIN League l ON m.league_id = l.id
+WHERE LOWER(l.name) LIKE '%italy%';",QUERY_ABORTED_AFTER_1000000000_VM_STEPS,19357.75,1.0,"country, league, match, player, player_attributes, team, team_attributes",1,3462,298,
+bird_dev,1168,hard,answerable,unanswerable,SELECT 'UNANSWERABLE_WITH_GIVEN_SCHEMA' AS error;,UNANSWERABLE_WITH_GIVEN_SCHEMA,4411.47,1.0,"examination, laboratory, patient",1,1703,15,
+bird_dev,1172,easy,answerable,wrong,SELECT COUNT(*) AS count FROM Patient P JOIN Laboratory L ON P.ID = L.ID WHERE LOWER(P.SEX) = 'm' AND L.`T-BIL` > 0;,,5539.51,1.0,"examination, laboratory, patient",1,1684,39,
+bird_dev,1175,medium,answerable,wrong,"SELECT MAX(CAST(strftime('%Y', Birthday) - strftime('%Y', 'now') AS INTEGER)) AS max_age, Diagnosis
+FROM Patient
+WHERE ID IN (
+    SELECT L.ID
+    FROM Laboratory L
+    JOIN Examination E ON L.ID = E.ID
+    WHERE HGB = (
+        SELECT MAX(HGB)
+        FROM Laboratory
+    )
+);",,4842.04,1.0,"examination, laboratory, patient",1,1700,80,
+bird_dev,1180,medium,answerable,correct,"SELECT SEX FROM Patient
+WHERE ID IN (
+    SELECT P.ID
+    FROM Laboratory L
+    JOIN Patient P ON L.ID = P.ID
+    WHERE L.GPT = 9
+      AND strftime('%Y-%m-%d', L.Date) = '1992-06-12'
+);",,6671.35,1.0,"examination, laboratory, patient",1,1707,69,
+bird_dev,1194,hard,answerable,correct,"SELECT P.SEX
+FROM Patient P
+JOIN Examination E ON P.ID = E.ID
+JOIN Laboratory L ON P.ID = L.ID
+WHERE LOWER(E.Diagnosis) LIKE '%pss%'
+AND LOWER(L.CRP) LIKE '%2+%'
+AND L.CRE = 1
+AND L.LDH = 123;",,11187.26,1.0,"examination, laboratory, patient",1,3550,144,
+bird_dev,1198,easy,answerable,wrong,SELECT COUNT(*) AS count FROM Patient WHERE SEX = 'F' AND Diagnosis LIKE '%APS%';,,2765.16,1.0,"examination, laboratory, patient",1,1683,21,
+bird_dev,1204,easy,answerable,error,"SELECT CAST(strftime('%s', MIN(`Examination Date`)) - strftime('%s', `First Date`) AS INTEGER) / 86400.0 AS days_diff
+FROM Examination
+WHERE ID = 821298;",OperationalError: no such column: First Date,6986.22,1.0,"examination, laboratory, patient",1,3499,108,
+bird_dev,1213,medium,answerable,wrong,"SELECT 
+    P.ID,
+    CASE 
+        WHEN L.ALP IS NULL THEN 'No lab data'
+        WHEN L.ALP <= 150 THEN 'Normal'
+        ELSE 'Elevated'
+    END AS ALP_Status
+FROM Patient P
+LEFT JOIN Laboratory L ON P.ID = L.ID
+WHERE strftime('%m', P.Birthday) = '04' 
+    AND strftime('%d', P.Birthday) = '01' 
+    AND strftime('%Y', P.Birthday) = '1982';",,6662.92,1.0,"examination, laboratory, patient",1,1711,118,
+bird_dev,1218,medium,answerable,wrong,"SELECT CAST(SUM(CASE WHEN LOWER(SEX) = 'f' AND UA > 0 THEN 1 ELSE 0 END) AS REAL) * 100.0 / COUNT(*) AS percentage
+FROM Laboratory
+JOIN Patient ON Laboratory.ID = Patient.ID;",,6801.39,1.0,"examination, laboratory, patient",1,3471,102,
+bird_dev,1222,easy,answerable,wrong,SELECT COUNT(*) AS count FROM Patient WHERE LOWER(SEX) = LOWER('M') AND Description IS NOT NULL;,,4182.97,1.0,"examination, laboratory, patient",1,3434,44,
+bird_dev,1230,easy,answerable,wrong,"SELECT DISTINCT P.ID
+FROM Patient P
+JOIN Laboratory L ON P.ID = L.ID
+WHERE L.CPK IS NOT NULL
+AND (L.CPK BETWEEN 0 AND 100 OR L.CPK < 0)
+AND P.Admission LIKE '%outpatient%';",,4967.62,1.0,"examination, laboratory, patient",1,1692,60,
+bird_dev,1231,hard,answerable,wrong,"SELECT COUNT(*) AS count FROM Patient p JOIN Laboratory l ON p.ID = l.ID WHERE strftime('%Y', p.Birthday) BETWEEN '1936' AND '1956' AND LOWER(p.SEX) = 'm' AND (l.CPK > 0 OR l.CPK IS NULL);",,4282.08,1.0,"examination, laboratory, patient",1,1703,66,
+bird_dev,1241,hard,answerable,wrong,"SELECT 
+    COUNT(CASE WHEN PLT < 150 THEN ID END) AS count_lower_than_normal,
+    COUNT(CASE WHEN PLT > 150 THEN ID END) AS count_higher_than_normal
+FROM Laboratory
+WHERE PLT IS NOT NULL;",,4006.99,1.0,"examination, laboratory, patient",1,1707,59,
+bird_dev,1259,medium,answerable,wrong,SELECT Diagnosis FROM Patient WHERE Birthday > '1985-01-01' AND LOWER(Description) LIKE '%rheumatoid%' OR LOWER(Diagnosis) LIKE '%rheumatoid%';,,3172.21,1.0,"examination, laboratory, patient",1,1701,46,
+bird_dev,1264,medium,answerable,error,SELECT COUNT(*) AS count FROM Examination WHERE Thrombosis = 1 AND C4 = 'normal';,OperationalError: no such column: C4,4097.75,1.0,"examination, laboratory, patient",1,3456,46,
+bird_dev,1275,medium,answerable,correct,"SELECT COUNT(*) AS MaleCount
+FROM Patient P
+JOIN Laboratory L ON P.ID = L.ID
+WHERE LOWER(L.CENTROMEA) = '0'
+  AND LOWER(L.SSB) IN ('-', '0', 'negative')
+  AND P.SEX = 'M';",,4063.24,1.0,"examination, laboratory, patient",1,1703,61,
+bird_dev,1297,medium,answerable,wrong,SELECT COUNT(*) AS count FROM Laboratory WHERE `T-CHO` > 0 AND (SELECT LAC FROM Examination WHERE Examination.ID = Laboratory.ID) = '-';,,4708.88,1.0,"examination, laboratory, patient",1,3462,57,
+bird_dev,1301,easy,answerable,error,"SELECT E.ID
+FROM Examination E
+WHERE E.Thrombosis = 0
+AND E.CPK IS NOT NULL;",OperationalError: no such column: E.CPK,4929.68,1.0,"examination, laboratory, patient",1,3461,56,
+bird_dev,1302,hard,answerable,error,SELECT COUNT(*) AS count FROM Laboratory WHERE CPK = 0 AND (RVVT = '+' OR LAC = '+' OR KCT = '+');,OperationalError: no such column: RVVT,5057.06,1.0,"examination, laboratory, patient",1,3476,62,
+bird_dev,1309,medium,answerable,error,"SELECT PLT AS Platelet_Level
+FROM Laboratory
+WHERE Diagnosis = 'MCTD'
+AND PLT BETWEEN 150 AND 400;",OperationalError: no such column: Diagnosis,5294.80,1.0,"examination, laboratory, patient",1,3475,74,
+bird_dev,1315,easy,answerable,correct,"SELECT COUNT(*) AS student_count
+FROM attendance a
+JOIN member m ON a.link_to_member = m.member_id
+JOIN event e ON a.link_to_event = e.event_id
+WHERE LOWER(e.event_name) LIKE '%women% soccer%'
+  AND m.position IN ('Member', 'Inactive', 'President', 'Secretary', 'Treasurer', 'Vice President');",,5668.07,1.0,"attendance, budget, event, income, major, member, zip_code",1,1647,78,
+bird_dev,1316,medium,answerable,wrong,"SELECT m.phone
+FROM member m
+JOIN attendance a ON m.member_id = a.link_to_member
+JOIN event e ON a.link_to_event = e.event_id
+WHERE e.event_name LIKE '%Women%Soccer%'
+  AND m.position = 'Member';",,4355.24,1.0,"attendance, budget, event, income, major, member, zip_code",1,1653,55,
+bird_dev,1317,medium,answerable,correct,"SELECT COUNT(*) AS count
+FROM member m
+JOIN attendance a ON m.member_id = a.link_to_member
+JOIN event e ON a.link_to_event = e.event_id
+WHERE LOWER(e.event_name) LIKE '%women% soccer%'
+  AND LOWER(m.position) = 'member'
+  AND m.t_shirt_size = 'Medium';",,5202.27,1.0,"attendance, budget, event, income, major, member, zip_code",1,1661,72,
+bird_dev,1324,medium,answerable,error,"SELECT AVG(CASE WHEN e.type = 'Meeting' AND strftime('%Y', e.event_date) = '2020' THEN COUNT(a.link_to_member) ELSE NULL END) AS avg_meeting_attendance
+FROM event e
+LEFT JOIN attendance a ON e.event_id = a.link_to_event
+WHERE strftime('%Y', e.event_date) = '2020';",OperationalError: misuse of aggregate function COUNT(),13024.15,1.0,"attendance, budget, event, expense, income, major, member, zip_code",1,3903,160,
+bird_dev,1329,easy,answerable,wrong,"SELECT city, county FROM zip_code WHERE zip_code IN (SELECT zip FROM member WHERE last_name = 'Ramsey' AND first_name = 'Sherri');",,5669.91,1.0,"budget, event, expense, income, major, member, zip_code",1,1737,33,
+bird_dev,1337,easy,answerable,correct,"SELECT SUM(b.amount) AS total_budgeted_amount
+FROM budget b
+JOIN event e ON b.link_to_event = e.event_id
+WHERE LOWER(e.event_name) LIKE '%october speaker%';",,6011.25,1.0,"attendance, budget, event, expense, income, major, member",1,1827,42,
+bird_dev,1350,medium,answerable,wrong,"SELECT e.status
+FROM event e
+JOIN expense ex ON e.event_id = ex.link_to_budget
+WHERE LOWER(ex.expense_description) LIKE '%post cards%'
+   OR LOWER(ex.expense_description) LIKE '%posters%'
+  AND strftime('%Y-%m', ex.expense_date) = '2019-08';",,7642.80,1.0,"attendance, budget, event, expense, income, major, member, zip_code",1,1905,72,
+bird_dev,1362,easy,answerable,wrong,"SELECT COUNT(DISTINCT city) AS city_count
+FROM zip_code
+WHERE LOWER(county) = 'orange' AND LOWER(state) = 'virginia';",,3693.75,1.0,"budget, event, expense, income, major, member, zip_code",1,1739,35,
+bird_dev,1365,easy,answerable,wrong,"SELECT e.expense_id, e.expense_description, e.cost, b.category, b.remaining
+FROM expense e
+JOIN budget b ON e.link_to_budget = b.budget_id
+WHERE b.remaining = (SELECT MIN(remaining) FROM budget);",,4471.28,1.0,"budget, event, expense, income, major, member, zip_code",1,1740,52,
+bird_dev,1373,easy,answerable,correct,SELECT COUNT(*) AS count FROM member m JOIN zip_code z ON m.zip = z.zip_code WHERE LOWER(z.state) = 'maryland';,,3415.67,1.0,"budget, event, expense, income, major, member, zip_code",1,1741,30,
+bird_dev,1379,easy,answerable,correct,"SELECT COUNT(*) AS count FROM event WHERE type = 'Meeting' AND strftime('%Y', event_date) = '2020';",,3383.08,1.0,"attendance, budget, event, income, major, member, zip_code",1,1643,29,
+bird_dev,1383,easy,answerable,wrong,"SELECT m.first_name || ' ' || m.last_name AS student_name
+FROM member m
+JOIN zip_code z ON m.zip = z.zip_code
+WHERE LOWER(z.city) LIKE '%georgetown%'
+  AND LOWER(z.state) LIKE '%south carolina%';",,4207.55,1.0,"budget, event, income, major, member, zip_code",1,1492,56,
+bird_dev,1393,easy,answerable,wrong,"SELECT first_name || ' ' || last_name AS full_name, email
+FROM member
+WHERE position = 'Secretary';",,3076.12,1.0,"attendance, budget, event, income, major, member, zip_code",1,1645,25,
+bird_dev,1409,easy,answerable,correct,SELECT SUM(cost) AS total_expense FROM expense WHERE expense_date = '2019-08-20';,,5504.07,1.0,"attendance, budget, event, expense, income, major, member, zip_code",1,1895,27,
+bird_dev,1411,easy,answerable,correct,"SELECT expense_description AS ""Kind of expenses""
+FROM expense
+WHERE link_to_member = (
+    SELECT member_id
+    FROM member
+    WHERE first_name = 'Sacha' AND last_name = 'Harrison'
+);",,6311.00,1.0,"budget, event, expense, income, major, member, zip_code",1,1739,49,
+bird_dev,1426,medium,answerable,correct,"SELECT m.last_name, major.department, major.college
+FROM member m
+JOIN major ON LOWER(m.link_to_major) = LOWER(major.major_id)
+WHERE LOWER(major.major_name) LIKE '%environmental%' AND LOWER(major.major_name) LIKE '%engineering%';",,4868.79,1.0,"budget, event, expense, income, major, member, zip_code",1,1748,58,
+bird_dev,1430,medium,answerable,correct,"SELECT m.last_name, m.position
+FROM member m
+JOIN expense e ON m.member_id = e.link_to_member
+WHERE e.expense_description LIKE '%Pizza%'
+AND strftime('%m', e.expense_date) = '09'
+AND strftime('%d', e.expense_date) = '10'
+AND strftime('%Y', e.expense_date) = '2019';",,8366.28,1.0,"budget, event, expense, income, major, member, zip_code",1,1754,85,
+bird_dev,1434,easy,answerable,wrong,"SELECT zip_code
+FROM zip_code
+WHERE LOWER(state) = LOWER('puerto rico')
+  AND type = 'PO Box';",,3655.41,1.0,"attendance, budget, event, expense, major, member, zip_code",1,1778,29,
+bird_dev,1437,hard,answerable,wrong,"SELECT 
+    m.member_id,
+    m.first_name,
+    m.last_name,
+    e.event_id AS link_to_event
+FROM attendance a
+JOIN member m ON a.link_to_member = m.member_id
+JOIN event e ON a.link_to_event = e.event_id
+WHERE LOWER(m.position) NOT LIKE '%inactive%'
+    AND strftime('%Y-%m-%d', e.event_date) >= '2019-01-10'
+    AND strftime('%Y-%m-%d', e.event_date) <= '2019-11-19';",,8448.57,1.0,"attendance, budget, event, expense, income, major, member, zip_code",1,1921,126,
+bird_dev,1438,easy,answerable,correct,"SELECT maj.college
+FROM member m
+JOIN major maj ON m.link_to_major = maj.major_id
+WHERE LOWER(m.first_name) = 'katy' AND m.link_to_major = 'rec1N0upiVLy5esTO';",,8353.05,1.0,"attendance, budget, event, expense, income, major, member, zip_code",1,3908,104,
+bird_dev,1454,medium,answerable,wrong,"SELECT SUM(CASE WHEN ev.type = 'Meeting' THEN e.cost ELSE 0 END) * 100.0 / NULLIF(SUM(e.cost), 0) AS percentage_of_meeting_cost
+FROM expense e
+JOIN event ev ON e.link_to_budget IS NOT NULL AND e.link_to_member IS NOT NULL
+WHERE e.approved = 'true'
+AND (e.link_to_budget IS NOT NULL OR e.link_to_member IS NOT NULL);",,12963.54,1.0,"attendance, budget, event, expense, income, major, member",1,3782,194,
+bird_dev,1471,easy,answerable,correct,"SELECT CAST(SUM(CASE WHEN LOWER(c.Currency) = 'eur' THEN 1 ELSE 0 END) AS REAL) / SUM(CASE WHEN LOWER(c.Currency) = 'czk' THEN 1 ELSE 0 END) AS ratio
+FROM customers c;",,3794.49,1.0,"customers, gasstations, products, transactions_1k, yearmonth",1,1078,56,
+bird_dev,1473,medium,answerable,wrong,"SELECT AVG(CASE WHEN LOWER(c.Segment) = 'sme' THEN y.Consumption ELSE NULL END) AS AverageMonthlyConsumption
+FROM yearmonth y
+JOIN customers c ON y.CustomerID = c.CustomerID
+WHERE strftime('%Y', y.Date) = '2013';",,6834.78,1.0,"customers, gasstations, products, transactions_1k, yearmonth",1,2243,108,
+bird_dev,1487,medium,answerable,error,"SELECT CustomerID, Consumption
+FROM yearmonth
+WHERE Segment = 'LAM'
+AND Currency = 'EUR'
+AND strftime('%Y-%m', Date) = '2013-10'
+ORDER BY Consumption DESC
+LIMIT 1;",OperationalError: ambiguous column name: CustomerID,7888.60,1.0,"customers, gasstations, products, transactions_1k, yearmonth",1,2260,131,
+bird_dev,1490,medium,answerable,correct,"SELECT CAST(SUM(CASE WHEN Segment = 'LAM' AND Consumption > 46.73 THEN 1 ELSE 0 END) AS REAL) * 100 / SUM(CASE WHEN Segment = 'LAM' THEN 1 ELSE 0 END) AS percent_consumed_more_than_46_73
+FROM yearmonth
+JOIN customers ON yearmonth.CustomerID = customers.CustomerID;",,4693.14,1.0,"customers, gasstations, products, transactions_1k, yearmonth",1,1077,85,
+bird_dev,1493,easy,answerable,wrong,"SELECT CAST(SUM(CASE WHEN Consumption > 528.3 THEN 1 ELSE 0 END) AS REAL) * 100 / COUNT(*) AS percentage
+FROM yearmonth
+WHERE strftime('%Y-%m', Date) = '2012-02';",,3571.83,1.0,"customers, gasstations, products, transactions_1k, yearmonth",1,1082,61,
+bird_dev,1496,easy,answerable,wrong,"SELECT Segment, SUM(CASE WHEN strftime('%Y-%m', Date) = '2013-09' THEN Consumption ELSE 0 END) AS TotalConsumption
+FROM yearmonth
+JOIN customers ON yearmonth.CustomerID = customers.CustomerID
+GROUP BY Segment
+ORDER BY TotalConsumption ASC
+LIMIT 1;",,4137.05,1.0,"customers, gasstations, products, transactions_1k, yearmonth",1,1074,69,
+bird_dev,1507,easy,answerable,wrong,"SELECT DISTINCT strftime('%H:%M', Time) AS TransactionTime
+FROM transactions_1k
+WHERE GasStationID IN (
+    SELECT GasStationID
+    FROM gasstations
+    WHERE ChainID = 11
+);",,2930.16,1.0,"customers, gasstations, products, transactions_1k, yearmonth",1,1082,49,

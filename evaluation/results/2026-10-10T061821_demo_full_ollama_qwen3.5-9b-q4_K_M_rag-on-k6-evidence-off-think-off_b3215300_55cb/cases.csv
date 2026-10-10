@@ -1,0 +1,54 @@
+suite,id,hardness,expected,outcome,generated_sql,error,latency_ms,schema_recall,retrieved_tables,attempts,prompt_tokens,completion_tokens,generation_failure
+demo,university_major_counts,easy,answerable,correct,"SELECT major, COUNT(*) AS student_count FROM students GROUP BY major;",,6029.09,1.0,"courses, grades, students",1,1129,15,
+demo,university_average_score_by_course,medium,answerable,wrong,"SELECT c.course_code, AVG(g.score) AS avg_score
+FROM courses c
+JOIN grades g ON c.course_id = g.course_id
+GROUP BY c.course_code;",,2533.68,1.0,"courses, grades, students",1,1129,36,
+demo,university_top_students_by_average_score,medium,answerable,wrong,"SELECT s.student_id, s.full_name, AVG(g.score) AS avg_score
+FROM students s
+JOIN grades g ON s.student_id = g.student_id
+GROUP BY s.student_id
+ORDER BY avg_score DESC
+LIMIT 5;",,5817.42,1.0,"courses, grades, students",1,2332,83,
+demo,university_grade_distribution,easy,answerable,correct,"SELECT grade, COUNT(*) AS count FROM grades GROUP BY grade;",,1575.17,1.0,"courses, grades, students",1,1131,14,
+demo,retail_revenue_by_region,hard,answerable,wrong,"SELECT 
+    r.region_name,
+    SUM(oi.unit_price * oi.quantity) AS total_completed_sales_revenue
+FROM orders o
+JOIN order_items oi ON o.order_id = oi.order_id
+JOIN customers c ON o.customer_id = c.customer_id
+JOIN regions r ON c.region_id = r.region_id
+WHERE o.order_status = 'Completed'
+GROUP BY r.region_name;",,5852.68,1.0,"customer_support_tickets, customers, marketing_campaigns, order_items, orders, regions, returns, stores",1,1922,82,
+demo,retail_revenue_by_category,hard,answerable,wrong,"SELECT 
+    p.category,
+    SUM(oi.quantity * oi.unit_price) AS total_revenue
+FROM products p
+JOIN order_items oi ON p.product_id = oi.product_id
+JOIN orders o ON oi.order_id = o.order_id
+WHERE o.order_status = 'Completed'
+GROUP BY p.category
+ORDER BY total_revenue DESC;",,6144.75,1.0,"customer_support_tickets, customers, inventory_snapshots, marketing_campaigns, order_items, orders, products, returns, stores, suppliers",1,2275,73,
+demo,retail_support_satisfaction_by_priority,medium,answerable,wrong,"SELECT 
+    priority,
+    AVG(satisfaction_score) AS avg_satisfaction_score
+FROM customer_support_tickets
+GROUP BY priority;",,3655.51,1.0,"customer_support_tickets, customers, marketing_campaigns, orders, products, regions, stores, suppliers",1,1978,28,
+demo,retail_return_reason_counts,easy,answerable,wrong,"SELECT reason, COUNT(*) AS count FROM returns GROUP BY reason ORDER BY count DESC;",,3008.25,1.0,"customer_support_tickets, customers, order_items, orders, products, regions, returns, stores, suppliers",1,1931,18,
+demo,healthcare_appointments_by_status,easy,answerable,correct,"SELECT status, COUNT(*) AS count FROM appointments GROUP BY status;",,1638.30,1.0,"appointments, doctors, hospitals, patients, prescriptions, treatments",1,1110,14,
+demo,healthcare_treatment_cost_by_city,hard,answerable,wrong,"SELECT h.city, AVG(t.cost) AS avg_cost
+FROM hospitals h
+JOIN treatments t ON h.hospital_id = (
+    SELECT d.hospital_id
+    FROM doctors d
+    JOIN appointments a ON d.doctor_id = a.doctor_id
+    WHERE a.appointment_id = t.appointment_id
+)
+GROUP BY h.city;",,8651.53,1.0,"appointments, doctors, hospitals, patients, prescriptions, treatments",1,2339,148,
+demo,healthcare_completed_appointments_by_specialty,medium,answerable,correct,"SELECT specialty, COUNT(*) AS appointment_count
+FROM doctors
+JOIN appointments ON doctors.doctor_id = appointments.doctor_id
+WHERE appointments.status = 'Completed'
+GROUP BY specialty
+ORDER BY appointment_count DESC;",,2883.21,1.0,"appointments, doctors, hospitals, patients, prescriptions, treatments",1,1110,44,
+demo,healthcare_patient_count_by_city,easy,answerable,wrong,"SELECT city, COUNT(*) AS patient_count FROM patients GROUP BY city;",,1578.11,1.0,"appointments, doctors, hospitals, patients, prescriptions, treatments",1,1110,15,
