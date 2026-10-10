@@ -32,13 +32,24 @@ _UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
 
 @dataclass(frozen=True)
 class IdentityPayload:
-    """The spec's immutable identity fields, in the spec's order.
+    """The spec's immutable identity fields, in the spec's order, then ``ollama_think``.
 
     ``subset`` is the subset's name or ``"full"``; ``subset_sha256`` is ``""`` for a full run.
     ``database_fingerprint`` is ``database_fingerprint(...)`` over the databases the selected
     cases query: the bytes actually read, which the suite hash and the source archive's
     hash do not pin (an extracted benchmark database is gitignored and can change in place).
     ``retry_policy`` is ``retry_policy(max_retries, retry_base_seconds)``.
+
+    ``ollama_think`` is the think flag an Ollama model run sent, ``"off"`` or ``"on"``, or
+    ``"default"`` when it sent none and left the model to its own setting; any other run
+    (another provider, or a gold run) records ``"n/a"``. It changes what is measured: the
+    512-token output cap is the SQL answer's budget, and a model that thinks inside it can
+    spend all of it and answer nothing. The field arrived after the first committed runs,
+    none of which sent the flag, so ``"default"`` and ``"n/a"`` are its legacy values. At
+    either one ``identity_hash`` leaves it out of the hashed JSON (``hashed_identity``): such a
+    payload hashes exactly as before the field existed, and every committed
+    ``identity_sha256`` reproduces. ``Manifest.from_dict`` gives a manifest without the field
+    the value its runner implied (``legacy_ollama_think``).
     """
 
     commit: str
@@ -61,9 +72,27 @@ class IdentityPayload:
     max_rows: int
     max_repair_attempts: int
     retry_policy: str
+    ollama_think: str
 
 
 IDENTITY_FIELDS: tuple[str, ...] = tuple(f.name for f in dataclasses.fields(IdentityPayload))
+
+# `ollama_think` values for a run that sent no think flag, as every run did before the field
+# existed. `hashed_identity` leaves the field out at these.
+_THINK_NOT_SENT = frozenset({"default", "n/a"})
+
+
+def is_ollama(provider: str) -> bool:
+    """Whether ``provider`` routes to Ollama, spelled any way ``llm.generate_sql`` accepts."""
+    return provider.strip().lower() == "ollama"
+
+
+def legacy_ollama_think(provider: str, mode: str) -> str:
+    """The ``ollama_think`` that a manifest from before the field existed implies.
+
+    That runner never sent a think flag: ``"default"`` for an Ollama model run, else ``"n/a"``.
+    """
+    return "default" if mode == "llm" and is_ollama(provider) else "n/a"
 
 
 def canonical_json(value: Any) -> str:
@@ -71,9 +100,22 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def hashed_identity(payload: IdentityPayload) -> dict[str, Any]:
+    """The fields ``identity_hash`` hashes: every one, ``ollama_think`` only once a flag is sent.
+
+    ``ollama_think`` enters the hashed JSON as ``"off"`` or ``"on"``, a flag the run sent. At
+    ``"default"`` or ``"n/a"`` it is left out, so a run that sent no flag hashes exactly as it
+    did before the field existed.
+    """
+    data = dataclasses.asdict(payload)
+    if data["ollama_think"] in _THINK_NOT_SENT:
+        del data["ollama_think"]
+    return data
+
+
 def identity_hash(payload: IdentityPayload) -> str:
-    """SHA-256 (lowercase hex) of the payload's canonical JSON."""
-    return hashlib.sha256(canonical_json(dataclasses.asdict(payload)).encode()).hexdigest()
+    """SHA-256 (lowercase hex) of ``hashed_identity(payload)``'s canonical JSON."""
+    return hashlib.sha256(canonical_json(hashed_identity(payload)).encode()).hexdigest()
 
 
 def identity_diff(saved: Mapping[str, Any], current: IdentityPayload) -> list[str]:
@@ -181,10 +223,19 @@ def sanitise(name: str) -> str:
     return _UNSAFE_NAME_CHARS.sub("-", name)
 
 
-def config_label(*, use_rag: bool, rag_top_k: int, evidence: bool) -> str:
-    """The directory name's ``<config>`` part: the settings that change outcomes."""
+def config_label(
+    *, use_rag: bool, rag_top_k: int, evidence: bool, ollama_think: str = "n/a"
+) -> str:
+    """The directory name's ``<config>`` part: the settings that change outcomes.
+
+    A think flag the run sent appends ``-think-off`` or ``-think-on``. ``"default"`` and
+    ``"n/a"`` append nothing, so every label written before ``ollama_think`` is unchanged.
+    """
     rag = f"rag-on-k{rag_top_k}" if use_rag else "rag-off"
-    return f"{rag}-evidence-{'on' if evidence else 'off'}"
+    label = f"{rag}-evidence-{'on' if evidence else 'off'}"
+    if ollama_think in ("off", "on"):
+        label += f"-think-{ollama_think}"
+    return label
 
 
 def run_dir_name(payload: IdentityPayload, *, started: datetime, config: str, nonce: str) -> str:

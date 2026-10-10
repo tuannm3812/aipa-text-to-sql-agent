@@ -28,6 +28,7 @@ def ask_database(
     max_repair_attempts: int = 1,
     work_limit: int | None = None,
     max_rows: int | None = None,
+    ollama_think: bool | None = False,
 ) -> QueryResult:
     """End-to-end Text-to-SQL wrapper: schema retrieval, generation, safety, execution.
 
@@ -53,6 +54,10 @@ def ask_database(
             benchmark's outcome.
         max_rows: Row cap passed to `execute_query`; `None` is
             `DEFAULT_MAX_ROWS`.
+        ollama_think: Ollama's think flag for the generation and every repair
+            call; see `generate_sql`. Off by default, so the app's Ollama calls
+            send `think: false`: the 512-token output cap is the SQL answer's
+            budget. Gemini ignores it.
 
     Returns:
         A `QueryResult`. `error` is set to `UNANSWERABLE_WITH_GIVEN_SCHEMA` if
@@ -78,7 +83,12 @@ def ask_database(
             else get_schema(db_path)
         )
         sql = generate_sql(
-            question, schema_text, model_name=model_name, provider=provider, engine=engine
+            question,
+            schema_text,
+            model_name=model_name,
+            provider=provider,
+            engine=engine,
+            ollama_think=ollama_think,
         )
 
         refusal = _sentinel_code(sql, engine=engine) or query_refusal(sql, engine=engine)
@@ -96,6 +106,7 @@ def ask_database(
                 provider=provider,
                 max_repair_attempts=max_repair_attempts,
                 engine=engine,
+                ollama_think=ollama_think,
             )
             if not repaired_sql:
                 raise
@@ -123,6 +134,7 @@ def ask_database_with_sql(
     max_repair_attempts: int = 1,
     work_limit: int | None = None,
     max_rows: int | None = None,
+    ollama_think: bool | None = False,
     on_repair_error: Callable[[Exception], None] | None = None,
 ) -> tuple[str, QueryResult]:
     """Same as `ask_database`, but also returns the generated SQL for UI display.
@@ -139,6 +151,8 @@ def ask_database_with_sql(
             that failed execution. `0` disables repair.
         work_limit: See `ask_database`.
         max_rows: See `ask_database`.
+        ollama_think: See `ask_database`; sent with the generation and every
+            repair call.
         on_repair_error: Called with the exception when the *repair* call to
             the model raises. The repair failure is still swallowed - the
             result is the first attempt's execution error, as always - so
@@ -172,7 +186,12 @@ def ask_database_with_sql(
     )
     try:
         sql = generate_sql(
-            question, schema_text, model_name=model_name, provider=provider, engine=engine
+            question,
+            schema_text,
+            model_name=model_name,
+            provider=provider,
+            engine=engine,
+            ollama_think=ollama_think,
         )
     except Exception as e:
         return "", QueryResult(columns=[], rows=[], error=f"{type(e).__name__}: {e}")
@@ -195,6 +214,7 @@ def ask_database_with_sql(
             provider=provider,
             max_repair_attempts=max_repair_attempts,
             engine=engine,
+            ollama_think=ollama_think,
             on_repair_error=on_repair_error,
         )
         if repaired_sql:
@@ -331,6 +351,7 @@ def _repair_sql(
     provider: str | None,
     max_repair_attempts: int,
     engine: Engine,
+    ollama_think: bool | None,
     on_repair_error: Callable[[Exception], None] | None = None,
 ) -> str | None:
     if max_repair_attempts < 1:
@@ -352,7 +373,12 @@ Return only one corrected {dialect_name} SELECT query.
 """
     try:
         return generate_sql(
-            repair_question, schema_text, model_name=model_name, provider=provider, engine=engine
+            repair_question,
+            schema_text,
+            model_name=model_name,
+            provider=provider,
+            engine=engine,
+            ollama_think=ollama_think,
         )
     except Exception as exc:
         if on_repair_error is not None:

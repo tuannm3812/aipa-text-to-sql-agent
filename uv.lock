@@ -585,15 +585,15 @@ wheels = [
 
 [[package]]
 name = "langchain-ollama"
-version = "0.2.3"
+version = "0.3.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "langchain-core" },
     { name = "ollama" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/47/76/dfcf5f09ba2f7651161110ba5ddb621e92634f9fb34e4ad919ae0428205a/langchain_ollama-0.2.3.tar.gz", hash = "sha256:d13fe8735176b652ca6e6656d7902c1265e8c0601097569f7c95433f3d034b38", size = 17231, upload-time = "2025-01-29T22:22:40.062Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/73/c9/ff996fc5fa2d8d23136f07c56e88a1013fe1e03a35ef3e65899baa73c49e/langchain_ollama-0.3.10.tar.gz", hash = "sha256:5d942d331c44351bae5c5c5965603ceb20b0ee4d70082290f4b15bc638559756", size = 35771, upload-time = "2025-10-02T15:53:20.974Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/85/72/f7301340a544fea1c139c64590044f0beb5bfba889b8f6e50766b933e660/langchain_ollama-0.2.3-py3-none-any.whl", hash = "sha256:c47700ca68b013358b1e954493ecafb3bd10fa2cda71a9f15ba7897587a9aab2", size = 19543, upload-time = "2025-01-29T22:22:38.96Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/f2/d87767a106021206fb53faf7ae4517d365d353dc29a1649b9f3e47eef940/langchain_ollama-0.3.10-py3-none-any.whl", hash = "sha256:7550792872e8f86d362568e9ceb0f8085428bc59946c7b44e726358ba4b280f9", size = 27646, upload-time = "2025-10-02T15:53:19.89Z" },
 ]
 
 [[package]]
@@ -1624,7 +1624,7 @@ requires-dist = [
     { name = "duckdb", marker = "extra == 'engines'", specifier = ">=1.0,<2" },
     { name = "google-genai", specifier = ">=1.0,<2" },
     { name = "langchain-core", specifier = ">=0.3,<0.4" },
-    { name = "langchain-ollama", specifier = ">=0.2,<0.3" },
+    { name = "langchain-ollama", specifier = ">=0.3.10,<0.4" },
     { name = "pandas", specifier = ">=2.1,<3" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'engines'", specifier = ">=3.1,<4" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3.1,<4" },

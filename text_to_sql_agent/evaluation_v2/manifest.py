@@ -27,6 +27,7 @@ from text_to_sql_agent.evaluation_v2.identity import (
     canonical_json,
     fingerprint_from_json,
     identity_hash,
+    legacy_ollama_think,
 )
 
 Status = Literal["complete", "incomplete"]
@@ -125,9 +126,19 @@ class Manifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Manifest:
-        """Rebuild a manifest from its ``to_dict`` form (derived fields are recomputed)."""
-        fields = {name: data[name] for name in IDENTITY_FIELDS}
+        """Rebuild a manifest from its ``to_dict`` form (derived fields are recomputed).
+
+        A manifest written before ``ollama_think`` existed lacks it and gets the value its
+        runner implied (``legacy_ollama_think``), under which its ``identity_sha256``
+        reproduces. Every other identity field is required.
+        """
+        fields = {name: data[name] for name in IDENTITY_FIELDS if name != "ollama_think"}
         fields["database_fingerprint"] = fingerprint_from_json(fields["database_fingerprint"])
+        fields["ollama_think"] = (
+            data["ollama_think"]
+            if "ollama_think" in data
+            else legacy_ollama_think(data["provider"], data["mode"])
+        )
         identity = IdentityPayload(**fields)
         return cls(
             identity=identity,

@@ -82,7 +82,7 @@ langchain-core==0.3.86
     # via
     #   langchain-ollama
     #   text-to-sql-agent
-langchain-ollama==0.2.3
+langchain-ollama==0.3.10
     # via text-to-sql-agent
 langsmith==0.12.4
     # via langchain-core

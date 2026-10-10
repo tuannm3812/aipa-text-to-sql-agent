@@ -20,6 +20,11 @@ Each run writes `<out-root>/<run id>/{manifest.json,cases.csv,report.md}`; nothi
 overwritten. `--resume DIR` continues an incomplete run in place and is refused - exit code
 2, naming the fields - unless the same arguments reproduce the saved identity.
 
+`--ollama-think` sets Ollama's think flag for `--mode llm --provider ollama` and is a usage
+error anywhere else. It defaults to `off`: the 512-token output cap is the SQL answer's
+budget, and thinking spent inside it can leave no answer. The value is part of the run
+identity, so `-think-off` or `-think-on` appears in the directory name.
+
 Exit codes: 0 every run complete (or every gate passed); 1 a run is incomplete (outages) or a
 gate failed; 2 refused.
 """
@@ -85,6 +90,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-rows", type=int, default=None, help="row cap; default: the app's DEFAULT_MAX_ROWS"
     )
+    parser.add_argument(
+        "--ollama-think",
+        choices=["off", "on", "default"],
+        default=None,
+        help="Ollama's think flag, for --mode llm --provider ollama only: off sends think: "
+        "false, on sends think: true, default sends no flag and leaves the model's own "
+        "setting. Unset means off: thinking would spend the 512-token output cap meant for "
+        "the SQL",
+    )
     parser.add_argument("--resume", type=Path, metavar="DIR", default=None)
     parser.add_argument(
         "--gate",
@@ -125,6 +139,7 @@ def _config(args: argparse.Namespace, suite: str) -> RunConfig:
         retry_base_seconds=args.retry_base_seconds,
         work_limit=args.work_limit,
         max_rows=args.max_rows,
+        ollama_think=args.ollama_think,
     )
 
 
@@ -230,6 +245,9 @@ def _regression(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Before `--mode` defaults to gold: a flag that is never sent must not reach an identity.
+    if args.ollama_think is not None and (args.mode != "llm" or args.provider != "ollama"):
+        parser.error("--ollama-think applies only to --mode llm --provider ollama")
     if args.gate == "regression":
         if args.suite or args.mode is not None:
             parser.error("--gate regression compares two run directories: no --suite or --mode")

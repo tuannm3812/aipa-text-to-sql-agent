@@ -3655,3 +3655,80 @@ unchanged (0 differ), so the published numbers stand. The assembled SQLite syste
 prompt hash is unchanged. Suite: 1205 passed, 350 skipped; ruff, ruff format and
 mypy clean. Next: start the full Spider and BIRD release runs, detached, from a
 clean tree.
+
+## 2026-10-10 — Codex: structural sentinel closure and token-accounting review
+
+Reviewed the changes after `80e2ab8` through `a8b5069`: structural control
+recognition, trailing-prose extraction, provider token capture and its use in
+the runner/report. The tree was clean before this review and HEAD remained
+`a8b5069` during verification.
+
+**The previous sentinel P2 is closed for the reproduced cases.** A fresh
+temporary SQLite probe through `ask_database_with_sql` now executes both
+`SELECT id FROM events /* BLOCKED_UNSAFE_SQL */` and the filter literal query
+`SELECT id FROM events WHERE status = 'BLOCKED_UNSAFE_SQL'`, returning
+`[(1,)]` without error. Both exact control responses still produce their
+intended error codes. The helper is shared by initial generation and repair;
+the added tests cover both public wrappers and repair paths.
+
+The trailing-prose positive control becomes the intended standalone
+UNANSWERABLE statement, while a following `REINDEX events;` remains in the
+extracted text for the validator to reject. Comparing the current extractor
+with its actual implementation at `80e2ab8` on all **627** committed
+2026-10-09 `generated_sql` values produced **zero differences**. This supports
+Claude's extraction-stability claim without rerunning a provider.
+
+### P2 — resuming an outage discards tokens already spent in the same run
+
+`text_to_sql_agent/evaluation_v2/runner.py:491` creates fresh token totals for
+each `evaluate_case` invocation. At line 953 the case loop replaces a saved
+`outage` row with the resumed evaluation's row, including its token columns.
+No previous usage is carried over. The directory and run identity stay the
+same, but the report's total cost loses usage recorded before the resume.
+
+Reproduced with a one-case SQLite suite and the real runner, patching only
+`pipeline.generate_sql` and recording counts through the actual usage
+accumulator:
+
+1. The first generation reports **100 prompt / 10 completion** tokens and
+   returns SQL with a missing column. Its repair raises a retryable 429. The
+   saved row is `outage`; the run is `incomplete`; its token columns correctly
+   contain **100 / 10**.
+2. Resume the same directory with a successful generation reporting
+   **50 prompt / 5 completion** tokens. The row becomes `correct` and the run
+   becomes `complete`, but its final token columns contain only **50 / 5**.
+
+The provider-reported counts accumulated over this run are **150 / 15**. This
+is a data-flow defect in resume, not a question about billing or estimating
+unreported usage. Within-session generation, repair and retry counts do sum;
+the loss occurs when the next session overwrites the checkpoint. It matters
+for the planned cost comparison in G8 and for long release runs that resume
+after provider outages.
+
+**For Claude:** retain the saved outage row's reported token counts when
+combining it with the resumed attempt, independently for prompt and
+completion. Preserve the distinction between no reported count and an
+explicit zero. If the intended metric is only the final successful attempt,
+name that separately and retain cumulative reported usage for the run; do not
+label the reduced value as the total over generation, repairs and retries.
+Add a resume fixture expecting **150 / 15**, a second-resume fixture proving
+previous counts are added once rather than doubled, and mixed blank/zero
+cases. Verify the CSV and report totals, while keeping terminal outcome and
+identity behavior unchanged.
+
+### Fresh verification and limits
+
+- Full `uv run pytest`: **1,205 passed, 350 skipped**, no PostgreSQL DSN.
+- Ruff check passed; format check: **113 files** already formatted; mypy:
+  no issues in **47 source files**.
+- Real CLI gold gate: demo PASS at **12/12**; safety PASS with **15**
+  structural cases and EX not applicable.
+- Fresh runtime probes confirmed the sentinel correction, the prose/stacked
+  SQL controls, and the token-loss reproduction above. The extractor audit
+  used the old function read directly from Git rather than a paraphrase.
+
+Commands used `UV_CACHE_DIR=/private/tmp/aipa-review-uv`. No provider/network
+call, live PostgreSQL test, remote CI check or full release run was performed.
+Only this append-only log entry was changed; no application fix, specification
+rewrite, result-artifact modification, commit, push or message to another
+agent was made.

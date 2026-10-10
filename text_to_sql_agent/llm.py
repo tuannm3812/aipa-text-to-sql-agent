@@ -224,7 +224,14 @@ def _extract_sql_from_text(raw_output: str) -> str:
     return raw_output
 
 
-def _call_provider(prompt: str, user_prompt: str, *, model_name: str, provider: str) -> str:
+def _call_provider(
+    prompt: str,
+    user_prompt: str,
+    *,
+    model_name: str,
+    provider: str,
+    ollama_think: bool | None = False,
+) -> str:
     """Send an assembled system prompt and the user prompt to the resolved provider.
 
     `prompt` is the dialect-aware system prompt from `_assemble_prompt` (SQLite's
@@ -232,6 +239,14 @@ def _call_provider(prompt: str, user_prompt: str, *, model_name: str, provider: 
     carries the schema and question. Both Gemini and Ollama branches route through
     here unchanged from their previous inline form in `generate_sql`, so a test can
     assert which system prompt reached the model without patching a vendor SDK.
+
+    `ollama_think` is Ollama's think flag, passed as `ChatOllama(reasoning=...)`: `False`
+    sends `think: false`, `True` sends `think: true`, and `None` sends no flag, leaving the
+    model's own setting - all this call did before the argument existed. It is off by
+    default because `num_predict=512` is the SQL answer's budget: a model that thinks inside
+    it can spend all of it and return no SQL. The Gemini branch ignores it. Thinking text
+    comes back in `additional_kwargs["reasoning_content"]` and is never read: only
+    `response.content` reaches the SQL extractor.
 
     Raises:
         ValueError: If `provider` is neither `"gemini"` nor `"ollama"`.
@@ -275,6 +290,7 @@ def _call_provider(prompt: str, user_prompt: str, *, model_name: str, provider: 
             model=model_name or DEFAULT_OLLAMA_MODEL,
             temperature=0.0,
             num_predict=512,
+            reasoning=ollama_think,
         )
         response = model.invoke(
             [
@@ -295,6 +311,7 @@ def generate_sql(
     model_name: str = DEFAULT_MODEL_NAME,
     provider: str | None = None,
     engine: Engine | None = None,
+    ollama_think: bool | None = False,
 ) -> str:
     """Call Gemini or Ollama to generate SQL from a question and schema.
 
@@ -308,6 +325,11 @@ def generate_sql(
         engine: The target database's engine, whose `prompt_dialect_section`
             is assembled into the system prompt so the model is instructed in
             the right dialect. Defaults to SQLite's when omitted.
+        ollama_think: Ollama's think flag. `False` (the default) sends
+            `think: false`, `True` sends `think: true`, and `None` sends no
+            flag, leaving the model's own setting. Off by default because the
+            512-token output cap is the SQL answer's budget, and thinking spent
+            inside it can leave no SQL. Gemini ignores it.
 
     Returns:
         The generated SQL text, extracted from the model's raw response.
@@ -341,5 +363,9 @@ def generate_sql(
 """
 
     return _call_provider(
-        system_prompt, user_prompt, model_name=model_name, provider=selected_provider
+        system_prompt,
+        user_prompt,
+        model_name=model_name,
+        provider=selected_provider,
+        ollama_think=ollama_think,
     )

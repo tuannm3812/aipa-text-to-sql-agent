@@ -293,6 +293,38 @@ def test_the_real_results_folder_lists_no_may_files_as_runs() -> None:
     assert not [n for n in names if n.startswith(("evaluation_llm_", "evaluation_gold"))]
 
 
+def test_every_finished_result_directory_loads_in_the_viewer() -> None:
+    """Including the runs written before `ollama_think` joined the run identity.
+
+    A run still in progress has no `report.md` yet and is left out.
+    """
+    root = evaluation.RESULTS_ROOT
+    finished = [
+        n for n in evaluation.list_result_directories() if (root / n / "report.md").is_file()
+    ]
+    assert len(finished) >= 6
+    for name in finished:
+        run = evaluation.load_result_directory(root / name)
+        assert run.manifest["identity_sha256"] in run.report, name
+        assert not run.cases.empty, name
+
+
+def test_the_live_model_run_sends_ollama_think_false() -> None:
+    """The tab builds its `RunConfig` without the flag, so it runs as the CLI does by default."""
+    flags: list[object] = []
+    answers = {case.question: case.gold_sql for case in load_suite(DEMO)}
+
+    def stub(question: str, schema_text: str, **kw: Any) -> str:
+        flags.append(kw.get("ollama_think", "absent"))
+        return answers[question]
+
+    with patch("text_to_sql_agent.pipeline.generate_sql", side_effect=stub):
+        df = _live("Selected LLM")
+
+    assert set(df["outcome"]) == {"correct"}
+    assert flags and set(flags) == {False}
+
+
 def test_loading_never_modifies_the_directory(tmp_path: Path) -> None:
     run = _make_run(tmp_path, "run-a")
     before = {p.name: p.read_bytes() for p in run.iterdir()}

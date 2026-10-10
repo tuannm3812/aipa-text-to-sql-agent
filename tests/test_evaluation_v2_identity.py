@@ -19,6 +19,7 @@ import pytest
 
 from text_to_sql_agent.evaluation_v2 import identity as identity_module
 from text_to_sql_agent.evaluation_v2.identity import (
+    REPO_ROOT,
     IdentityPayload,
     allocate_run_dir,
     config_label,
@@ -27,9 +28,11 @@ from text_to_sql_agent.evaluation_v2.identity import (
     identity_diff,
     identity_hash,
     retry_policy,
+    run_dir_name,
     sanitise,
 )
-from text_to_sql_agent.evaluation_v2.manifest import Manifest, manifest_sha256
+from text_to_sql_agent.evaluation_v2.manifest import Manifest, manifest_sha256, read_manifest
+from text_to_sql_agent.evaluation_v2.report import render_report
 
 STARTED = datetime(2026, 10, 9, 12, 0, 0, tzinfo=UTC)
 
@@ -54,6 +57,7 @@ SPEC_FIELDS = (
     "max_rows",
     "max_repair_attempts",
     "retry_policy",
+    "ollama_think",
 )
 
 
@@ -79,6 +83,7 @@ def _payload(**overrides: object) -> IdentityPayload:
         "max_rows": 1_000,
         "max_repair_attempts": 1,
         "retry_policy": "0x20.0",
+        "ollama_think": "default",
     }
     fields.update(overrides)
     return IdentityPayload(**fields)  # type: ignore[arg-type]
@@ -124,6 +129,8 @@ def test_identity_hash_is_sha256_hex_and_deterministic() -> None:
         ("prompt_sha256", "d" * 64),
         ("retry_policy", "3x20.0"),
         ("database_fingerprint", (("data/demo.db", "e" * 64),)),
+        ("ollama_think", "off"),
+        ("ollama_think", "on"),
     ],
 )
 def test_identity_hash_changes_with_every_immutable_field(field: str, value: object) -> None:
@@ -255,6 +262,127 @@ def test_the_fingerprint_survives_a_json_round_trip() -> None:
     saved = json.loads(json.dumps(_manifest(payload).to_dict()))
     assert identity_diff(saved, payload) == []
     assert Manifest.from_dict(saved).identity == payload
+
+
+# --- ollama_think: an identity field added after the first committed runs -----------------
+
+# `identity_hash` of `_payload()` with each provider (and a model for it), computed at 509998b,
+# before `ollama_think` existed. A payload holding the value the field's absence implies must
+# still hash to exactly these.
+PRE_FIELD_HASHES = {
+    "ollama": "875aa7abf391ff17e719e29fdbb775ce7cd2cb981985c8a67b3697663dc9ecee",
+    "gemini": "3105670fbe9bc91270effb467932ed0696bfdc56108aa671af53e99cac8a9112",
+    "gold": "e9d426811774f072feede234e15ef9e93c37bb9c6577d83701a5afdf78c05232",
+}
+# provider, model, mode, and the `ollama_think` a manifest from before the field implies.
+LEGACY_SHAPES = [
+    ("ollama", "llama3:latest", "llm", "default"),
+    ("gemini", "gemini-2.5-flash", "llm", "n/a"),
+    ("gold", "gold", "gold", "n/a"),
+]
+
+
+@pytest.mark.parametrize("provider,model,mode,legacy", LEGACY_SHAPES)
+def test_a_legacy_ollama_think_hashes_exactly_as_before_the_field_existed(
+    provider: str, model: str, mode: str, legacy: str
+) -> None:
+    payload = _payload(provider=provider, model=model, ollama_think=legacy)
+    assert identity_hash(payload) == PRE_FIELD_HASHES[provider]
+
+
+@pytest.mark.parametrize("provider,model,mode,legacy", LEGACY_SHAPES)
+def test_a_manifest_without_the_field_gets_the_value_its_runner_implied(
+    provider: str, model: str, mode: str, legacy: str
+) -> None:
+    data = _manifest(_payload(provider=provider, model=model, ollama_think=legacy), mode=mode)
+    written = json.loads(json.dumps(data.to_dict()))
+    del written["ollama_think"]
+    loaded = Manifest.from_dict(written)
+    assert loaded.identity.ollama_think == legacy
+    assert identity_hash(loaded.identity) == written["identity_sha256"]
+    assert written["identity_sha256"] == PRE_FIELD_HASHES[provider]
+
+
+def test_a_sent_think_flag_enters_the_hash_and_round_trips() -> None:
+    off, on = _payload(ollama_think="off"), _payload(ollama_think="on")
+    assert len({identity_hash(off), identity_hash(on), PRE_FIELD_HASHES["ollama"]}) == 3
+    for payload in (off, on):
+        saved = json.loads(json.dumps(_manifest(payload).to_dict()))
+        assert saved["ollama_think"] == payload.ollama_think
+        assert Manifest.from_dict(saved).identity == payload
+
+
+def test_config_label_names_a_sent_think_flag_and_nothing_else() -> None:
+    def label(think: str, *, use_rag: bool = True, evidence: bool = False) -> str:
+        return config_label(use_rag=use_rag, rag_top_k=6, evidence=evidence, ollama_think=think)
+
+    assert label("off") == "rag-on-k6-evidence-off-think-off"
+    assert label("on") == "rag-on-k6-evidence-off-think-on"
+    assert label("on", use_rag=False, evidence=True) == "rag-off-evidence-on-think-on"
+    # What every run before the field records: those labels stay byte-identical.
+    assert label("default") == label("n/a") == "rag-on-k6-evidence-off"
+    assert config_label(use_rag=True, rag_top_k=6, evidence=False) == "rag-on-k6-evidence-off"
+
+
+RESULTS = REPO_ROOT / "evaluation" / "results"
+# The run directories committed before `ollama_think` existed (509998b and earlier). None sent
+# a think flag, so each must load as "default" and keep its directory name and hash.
+LEGACY_RUN_NAMES = (
+    "2026-10-09T052607_demo_full_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off_bdbb6f00_5980",
+    "2026-10-09T053032_safety_full_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off_96810104_3aea",
+    "2026-10-09T053348_spider_dev_subset200_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off"
+    "_d8f16b52_22eb",
+    "2026-10-09T065121_bird_dev_subset200_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-on"
+    "_914813fa_a643",
+    "2026-10-09T081747_bird_dev_subset200_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off"
+    "_451a3ae6_72c7",
+    "2026-10-09T144616_spider_dev_full_ollama_qwen3.5-9b-q4_K_M_rag-on-k6-evidence-off"
+    "_39d3e0ef_8d5a",
+)
+
+
+@pytest.mark.parametrize(
+    "run_dir", sorted(p.parent for p in RESULTS.glob("*/manifest.json")), ids=lambda p: p.name
+)
+def test_every_result_manifest_reproduces_its_identity_hash(run_dir: Path) -> None:
+    """Holds at 509998b too, before the field existed: `from_dict` round-trips faithfully."""
+    data = read_manifest(run_dir / "manifest.json")
+    manifest = Manifest.from_dict(data)
+    assert identity_hash(manifest.identity) == data["identity_sha256"]
+    assert manifest.to_dict()["identity_sha256"] == data["identity_sha256"]
+
+
+def _identity_section(report: str) -> list[str]:
+    lines = report.splitlines()
+    return lines[lines.index("## Identity") : lines.index("## Metrics")]
+
+
+@pytest.mark.parametrize("name", LEGACY_RUN_NAMES)
+def test_a_committed_run_from_before_the_field_loads_as_an_unflagged_ollama_run(
+    name: str,
+) -> None:
+    run_dir = RESULTS / name
+    data = read_manifest(run_dir / "manifest.json")
+    assert "ollama_think" not in data
+    assert (data["provider"], data["mode"]) == ("ollama", "llm")
+
+    manifest = Manifest.from_dict(data)
+
+    assert manifest.identity.ollama_think == "default"
+    assert identity_hash(manifest.identity) == data["identity_sha256"]
+    label = config_label(
+        use_rag=data["use_rag"],
+        rag_top_k=data["rag_top_k"],
+        evidence=data["evidence"],
+        ollama_think=manifest.identity.ollama_think,
+    )
+    started = datetime.fromisoformat(data["started"])
+    assert run_dir_name(manifest.identity, started=started, config=label, nonce=name[-4:]) == name
+    # Re-rendered, the identity table differs from the committed report by the new row alone.
+    committed = _identity_section((run_dir / "report.md").read_text(encoding="utf-8"))
+    after = committed.index(f"| retry_policy | `{data['retry_policy']}` |") + 1
+    expected = [*committed[:after], "| ollama_think | `default` |", *committed[after:]]
+    assert _identity_section(render_report(manifest, [])) == expected
 
 
 # --- database fingerprint ------------------------------------------------------------------

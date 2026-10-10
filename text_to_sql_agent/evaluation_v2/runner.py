@@ -9,7 +9,8 @@
 3. for each case not yet terminal, runs the reference through ``run_gold`` (never
    ``execute_query`` directly), runs the model through ``ask_database_with_sql`` - or, in gold
    mode, uses the reference result as the model's - scores it with ``score_v2``, and
-   checkpoints the **whole** ``cases.csv`` atomically (temp file, then ``os.replace``);
+   checkpoints the **whole** ``cases.csv`` atomically (temp file, then ``os.replace``). A
+   re-run ``outage`` row keeps the tokens spent before it: they are added to the new row's;
 4. writes ``report.md`` and the final manifest, ``complete`` only when every selected case
    has a terminal row and none is ``outage``.
 
@@ -64,6 +65,7 @@ from text_to_sql_agent.evaluation_v2.identity import (
     fingerprint_changes,
     git_state,
     identity_diff,
+    is_ollama,
     retry_policy,
 )
 from text_to_sql_agent.evaluation_v2.manifest import (
@@ -112,6 +114,8 @@ CSV_COLUMNS: tuple[str, ...] = (
     "completion_tokens",
     "generation_failure",
 )
+# Provider-reported counts: a whole number, or blank when the provider reported nothing.
+TOKEN_COLUMNS: tuple[str, ...] = ("prompt_tokens", "completion_tokens")
 
 OUTAGE = "outage"
 # A gold run has nothing to run for a refusal or unanswerable case: there is no reference and
@@ -152,6 +156,10 @@ _RETRYABLE = re.compile(
 MAX_WORK_LIMIT = 2**31 - 1
 
 Mode = Literal["gold", "llm"]
+# `--ollama-think`: the flag an Ollama model run sends, or "default" to send none.
+OllamaThink = Literal["off", "on", "default"]
+# Each choice as the pipeline's `ollama_think` argument (`ChatOllama(reasoning=...)`).
+_THINK_FLAGS: dict[str, bool | None] = {"off": False, "on": True, "default": None}
 _T = TypeVar("_T")
 
 
@@ -168,6 +176,9 @@ class RunConfig:
     ``work_limit`` (the engine's own unit; ``0`` disables the guard) and ``max_rows`` are the
     execution budget for both the reference and the model's query; ``None`` means the
     engine's ``default_work_limit`` and ``DEFAULT_MAX_ROWS`` - the app's demo guards.
+    ``ollama_think`` is Ollama's think flag for an Ollama model run: ``"off"`` sends
+    ``think: false``, ``"on"`` sends ``think: true`` and ``"default"`` sends nothing. There,
+    ``None`` means ``"off"``; any other run must leave it ``None`` (``resolve_ollama_think``).
     """
 
     suite: str
@@ -185,6 +196,7 @@ class RunConfig:
     retry_base_seconds: float = 20.0
     work_limit: int | None = None
     max_rows: int | None = None
+    ollama_think: OllamaThink | None = None
 
 
 @dataclass(frozen=True)
@@ -254,6 +266,33 @@ def _prompt_sha256(engine: Engine) -> str:
         engine.prompt_engine_rules_block,
     )
     return hashlib.sha256(prompt.encode()).hexdigest()
+
+
+def resolve_ollama_think(config: RunConfig) -> str:
+    """The run's ``ollama_think`` identity value: the think flag it sends, if any.
+
+    An Ollama model run records ``config.ollama_think``, or ``"off"`` when that is ``None``:
+    the 512-token output cap is the SQL answer's budget, and thinking spent inside it can
+    leave no answer. Every other run - another provider, or gold mode, which calls no model -
+    records ``"n/a"``.
+
+    Raises:
+        ValueError: If ``config.ollama_think`` is not ``off``, ``on`` or ``default``, or is set
+            for a run that sends no flag, where it would be recorded but never sent.
+    """
+    requested = config.ollama_think
+    if requested is not None and requested not in _THINK_FLAGS:
+        raise ValueError(
+            f"ollama_think must be one of {', '.join(_THINK_FLAGS)}, got {requested!r}"
+        )
+    if config.mode == "llm" and is_ollama(config.provider):
+        return "off" if requested is None else requested
+    if requested is not None:
+        raise ValueError(
+            "ollama_think applies only to an Ollama model run (mode 'llm', provider 'ollama'), "
+            f"not to mode {config.mode!r} with provider {config.provider!r}"
+        )
+    return "n/a"
 
 
 def _single(values: set[_T], what: str) -> _T:
@@ -336,6 +375,7 @@ def build_identity(
         max_rows=DEFAULT_MAX_ROWS if config.max_rows is None else config.max_rows,
         max_repair_attempts=config.max_repair_attempts,
         retry_policy=retry_policy(config.max_retries, config.retry_base_seconds),
+        ollama_think=resolve_ollama_think(config),
     )
     return payload, source
 
@@ -395,6 +435,9 @@ def _ask_model(
     attempts are excluded, so latency describes the pipeline rather than the provider's
     rate limiter.
     """
+    # The flag the identity records; "n/a" passes the pipeline's default, which only the
+    # Ollama call reads.
+    think = _THINK_FLAGS.get(resolve_ollama_think(config), False)
     attempt = 0
     while True:
         started = time.perf_counter()
@@ -410,6 +453,7 @@ def _ask_model(
                 max_repair_attempts=config.max_repair_attempts,
                 work_limit=config.work_limit,
                 max_rows=config.max_rows,
+                ollama_think=think,
                 on_repair_error=repair_errors.append,
             )
         except Exception as exc:
@@ -522,8 +566,9 @@ def evaluate_case(case: Case, config: RunConfig) -> Row:
         "schema_recall": recall,
         "retrieved_tables": retrieved,
         "attempts": attempts,
-        # Summed by `usage_scope` over the generation, every repair and every retry. Blank
-        # means "not reported" (gold runs, or a provider that gave no usage), never zero.
+        # Summed by `usage_scope` over the generation, every repair and every retry, and by a
+        # resume over the sessions before an outage (`_keep_spent_tokens`). Blank means "not
+        # reported" (gold runs, or a provider that gave no usage), never zero.
         "prompt_tokens": "" if usage.prompt_tokens is None else str(usage.prompt_tokens),
         "completion_tokens": (
             "" if usage.completion_tokens is None else str(usage.completion_tokens)
@@ -761,6 +806,15 @@ def _check_saved_row(row: Row, case: Case, mode: str, cases_path: Path) -> None:
                 f"{cases_path}: row '{case.id}' has {field} {row[field]!r}, but the case "
                 f"says {getattr(case, field)!r}"
             )
+    # Checked here, before anything runs: a resumed outage adds its saved counts to the new
+    # attempt's (`_keep_spent_tokens`), and the report sums every row's.
+    for field in TOKEN_COLUMNS:
+        cell = row[field]
+        if cell and not (cell.isascii() and cell.isdigit()):
+            raise ResumeRefused(
+                f"{cases_path}: row '{case.id}' has {field} {cell!r}, which the runner never "
+                "writes (a whole number of tokens, or blank)"
+            )
 
 
 def _saved_vs_now(name: str, saved: dict[str, Any], now: dict[str, Any]) -> str:
@@ -856,6 +910,29 @@ def _generation_failures(rows: Sequence[Row]) -> int:
     return sum(1 for row in rows if row["outcome"] != OUTAGE and row["generation_failure"])
 
 
+def _add_token_cells(earlier: str, latest: str) -> str:
+    """Two token cells added, keeping blank ("not reported") apart from an explicit ``0``.
+
+    Blank plus blank stays blank; a count plus blank is that count; two counts are summed.
+    """
+    if not earlier:
+        return latest
+    if not latest:
+        return earlier
+    return str(int(earlier) + int(latest))
+
+
+def _keep_spent_tokens(outage_row: Row, row: Row) -> Row:
+    """``row``, which replaces a saved ``outage`` row, with that row's token counts added.
+
+    Tokens a session spent on the case before its outage were spent in this run, so a resume
+    keeps them in the case's totals, prompt and completion each on its own. The saved cells
+    already hold every earlier session's sum, so each resume adds the previous total exactly
+    once. Every other cell, the outcome included, is the new attempt's.
+    """
+    return row | {name: _add_token_cells(outage_row[name], row[name]) for name in TOKEN_COLUMNS}
+
+
 def run_suite(
     cases: Sequence[Case],
     *,
@@ -866,7 +943,8 @@ def run_suite(
     """Run ``cases`` into a new directory under ``out_root``, or resume ``resume_dir``.
 
     ``cases`` must be exactly ``select_cases(config)``. On resume: every saved terminal row is
-    kept, and the cases that are unattempted or ``outage`` are run, each exactly once.
+    kept, and the cases that are unattempted or ``outage`` are run, each exactly once. An
+    ``outage`` row's token counts are added to the row that replaces it.
 
     Raises:
         ResumeRefused: If ``resume_dir`` is locked by another session, is not an incomplete
@@ -889,7 +967,10 @@ def run_suite(
     if resume_dir is None:
         started = datetime.now(UTC).replace(microsecond=0)
         label = config_label(
-            use_rag=config.use_rag, rag_top_k=config.rag_top_k, evidence=config.evidence
+            use_rag=config.use_rag,
+            rag_top_k=config.rag_top_k,
+            evidence=config.evidence,
+            ollama_think=payload.ollama_think,
         )
         run_dir = allocate_run_dir(out_root, payload, started=started, config=label)
     else:
@@ -950,7 +1031,9 @@ def _run_locked(
         saved_row = rows.get(case.id)
         if saved_row is not None and saved_row["outcome"] != OUTAGE:
             continue
-        rows[case.id] = evaluate_case(case, config)
+        row = evaluate_case(case, config)
+        # A saved row reaching here is an outage being retried: its spent tokens carry over.
+        rows[case.id] = row if saved_row is None else _keep_spent_tokens(saved_row, row)
         write_rows(run_dir / CASES_FILE, [rows[i] for i in ids if i in rows])
         # Still `incomplete`: refreshed only so an interrupted session keeps its elapsed time
         # and outage count for the resume that follows.

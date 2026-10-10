@@ -635,6 +635,177 @@ def test_gold_runs_leave_the_token_cells_blank(tmp_path: Path) -> None:
     }
 
 
+# Resuming an outage keeps the tokens spent before it (Codex, 2026-10-10): the resumed row's
+# counts are the saved outage row's plus the new attempt's, prompt and completion apart.
+
+MISSING_COLUMN_SQL = "SELECT no_such_column FROM students"
+
+
+def _rate_limited() -> RuntimeError:
+    return RuntimeError("429 Too Many Requests")
+
+
+class ScriptedProvider:
+    """Stands in for ``generate_sql``, one scripted call at a time.
+
+    Each step is ``(prompt, completion, answer)``. The counts go through the real usage
+    accumulator (``None`` reports nothing for that direction); then ``answer`` is returned, or
+    raised if it is an exception - a provider that bills a call and then fails.
+    """
+
+    def __init__(self, *steps: tuple[int | None, int | None, str | BaseException]) -> None:
+        self.steps = list(steps)
+
+    def __call__(self, question: str, schema_text: str, **_: Any) -> str:
+        from text_to_sql_agent.llm import _record_usage
+
+        prompt, completion, answer = self.steps.pop(0)
+        _record_usage(prompt, completion)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+
+def _outage_after(prompt: int | None, completion: int | None) -> ScriptedProvider:
+    """A generation that spends tokens on SQL naming a missing column; its repair hits a 429."""
+    return ScriptedProvider((prompt, completion, MISSING_COLUMN_SQL), (None, None, _rate_limited()))
+
+
+def _session(
+    cases: list[Case],
+    pick: dict[str, Any],
+    provider: ScriptedProvider,
+    out_root: Path,
+    resume: Path | None = None,
+) -> RunResult:
+    with patch("text_to_sql_agent.pipeline.generate_sql", provider):
+        result = run_suite(cases, config=_llm(**pick), out_root=out_root, resume_dir=resume)
+    assert not provider.steps, "a scripted provider call was never made"
+    return result
+
+
+def _token_cells(result: RunResult) -> tuple[str, str]:
+    """The one case's token cells as ``cases.csv`` holds them on disk."""
+    (row,) = _rows(result.run_dir)
+    return row["prompt_tokens"], row["completion_tokens"]
+
+
+def _report_token_lines(prompt: str, completion: str) -> list[str]:
+    """What ``report.md`` says about a one-case run's token cells."""
+    if not prompt and not completion:
+        return ["- Tokens: not reported by this provider interface"]
+    return [
+        f"- Tokens, {label}: {cell} total, {int(cell):.1f} mean over 1 cases"
+        if cell
+        else f"- Tokens, {label}: not reported"
+        for label, cell in (("prompt", prompt), ("completion", completion))
+    ]
+
+
+def test_a_resumed_outage_keeps_the_tokens_spent_before_it(tmp_path: Path) -> None:
+    """Codex's reproduction: 100/10 spent, then an outage; the resume spends 50/5 and succeeds."""
+    cases, pick = _first(tmp_path, 1)
+    out = tmp_path / "out"
+    first = _session(cases, pick, _outage_after(100, 10), out)
+    assert (first.rows[0]["outcome"], first.manifest.status) == ("outage", "incomplete")
+    assert _token_cells(first) == ("100", "10")
+
+    resumed = _session(
+        cases, pick, ScriptedProvider((50, 5, cases[0].gold_sql)), out, resume=first.run_dir
+    )
+
+    assert resumed.run_dir == first.run_dir
+    assert (resumed.manifest.status, resumed.manifest.outage_count) == ("complete", 0)
+    row = resumed.rows[0]
+    # Only the token cells carry the earlier session; every other cell is the new attempt's.
+    assert (row["outcome"], row["attempts"], row["error"]) == ("correct", "1", "")
+    assert (row["generated_sql"], row["generation_failure"]) == (cases[0].gold_sql, "")
+    assert (row["prompt_tokens"], row["completion_tokens"]) == ("150", "15")
+    assert _token_cells(resumed) == ("150", "15")
+    report = (resumed.run_dir / "report.md").read_text(encoding="utf-8")
+    assert "- Tokens, prompt: 150 total, 150.0 mean over 1 cases" in report
+    assert "- Tokens, completion: 15 total, 15.0 mean over 1 cases" in report
+
+
+def test_a_second_resume_adds_each_earlier_total_exactly_once(tmp_path: Path) -> None:
+    cases, pick = _first(tmp_path, 1)
+    out = tmp_path / "out"
+    first = _session(cases, pick, _outage_after(100, 10), out)
+    second = _session(cases, pick, _outage_after(50, 5), out, resume=first.run_dir)
+    assert (second.rows[0]["outcome"], _token_cells(second)) == ("outage", ("150", "15"))
+
+    third = _session(
+        cases, pick, ScriptedProvider((7, 3, cases[0].gold_sql)), out, resume=first.run_dir
+    )
+
+    assert (third.rows[0]["outcome"], third.manifest.status) == ("correct", "complete")
+    # 100 + 50 + 7 and 10 + 5 + 3: the 150/15 saved after the second session is added once.
+    assert _token_cells(third) == ("157", "18")
+    report = (third.run_dir / "report.md").read_text(encoding="utf-8")
+    for line in _report_token_lines("157", "18"):
+        assert line in report
+
+
+@pytest.mark.parametrize(
+    "before,after,expected",
+    [
+        ((None, None), (None, None), ("", "")),  # blank + blank = blank
+        ((None, None), (50, 5), ("50", "5")),  # blank + N = N
+        ((100, 10), (None, None), ("100", "10")),  # M + blank = M
+        ((100, 10), (50, 5), ("150", "15")),  # M + N = M + N
+        ((0, 0), (None, None), ("0", "0")),  # an explicit zero is a count, never blank
+        ((None, None), (0, 0), ("0", "0")),
+        ((0, 0), (0, 0), ("0", "0")),
+        ((100, None), (None, 5), ("100", "5")),  # prompt and completion add independently
+        ((0, 10), (50, None), ("50", "10")),
+    ],
+)
+def test_a_resumed_outage_adds_blank_and_zero_counts_by_the_rules(
+    tmp_path: Path,
+    before: tuple[int | None, int | None],
+    after: tuple[int | None, int | None],
+    expected: tuple[str, str],
+) -> None:
+    cases, pick = _first(tmp_path, 1)
+    out = tmp_path / "out"
+    # This time the generation itself is rate limited, after the provider reported its counts.
+    first = _session(cases, pick, ScriptedProvider((*before, _rate_limited())), out)
+    assert first.rows[0]["outcome"] == "outage"
+
+    resumed = _session(
+        cases, pick, ScriptedProvider((*after, cases[0].gold_sql)), out, resume=first.run_dir
+    )
+
+    assert resumed.rows[0]["outcome"] == "correct"
+    assert _token_cells(resumed) == expected
+    report = (resumed.run_dir / "report.md").read_text(encoding="utf-8")
+    for line in _report_token_lines(*expected):
+        assert line in report
+
+
+def test_a_malformed_token_cell_on_a_saved_outage_is_refused_before_any_call(
+    tmp_path: Path,
+) -> None:
+    """The resume parses a saved outage's counts, so one it cannot add is refused up front."""
+    cases, pick = _first(tmp_path, 1)
+    out = tmp_path / "out"
+    first = _session(cases, pick, _outage_after(100, 10), out)
+    rows = _rows(first.run_dir)
+    rows[0]["prompt_tokens"] = "100.0"
+    runner.write_rows(first.run_dir / "cases.csv", rows)
+    before = {p.name: p.read_bytes() for p in first.run_dir.iterdir()}
+    provider = ScriptedProvider((50, 5, cases[0].gold_sql))
+
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", provider),
+        pytest.raises(ResumeRefused, match="prompt_tokens '100.0'"),
+    ):
+        run_suite(cases, config=_llm(**pick), out_root=out, resume_dir=first.run_dir)
+
+    assert len(provider.steps) == 1, "the provider was called"
+    assert {p.name: p.read_bytes() for p in first.run_dir.iterdir()} == before
+
+
 # --- evidence and schema recall ------------------------------------------------------------
 
 
@@ -941,6 +1112,126 @@ def test_cli_resume_refusal_exits_non_zero_naming_the_field(
 def test_cli_rejects_resume_with_more_than_one_suite(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
         cli.main(["--suite", "demo", "safety", "--resume", str(tmp_path)])
+
+
+# --- Ollama's think flag in the run identity -----------------------------------------------
+
+
+class FlagRecorder(StubGenerator):
+    """A ``StubGenerator`` that also records the ``ollama_think`` each call was given."""
+
+    def __init__(self, cases: list[Case]) -> None:
+        super().__init__(cases)
+        self.flags: list[object] = []
+
+    def __call__(self, question: str, schema_text: str, **kw: Any) -> str:
+        self.flags.append(kw.get("ollama_think", "absent"))
+        return super().__call__(question, schema_text, **kw)
+
+
+@pytest.mark.parametrize(
+    "overrides,recorded,sent,suffix",
+    [
+        ({}, "off", False, "-think-off"),  # an Ollama model run thinks only when told to
+        ({"ollama_think": "off"}, "off", False, "-think-off"),
+        ({"ollama_think": "on"}, "on", True, "-think-on"),
+        ({"ollama_think": "default"}, "default", None, ""),
+        ({"provider": "gemini", "model": "gemini-2.5-flash"}, "n/a", False, ""),
+    ],
+)
+def test_a_model_run_records_the_think_flag_it_sends(
+    tmp_path: Path, overrides: dict[str, str], recorded: str, sent: bool | None, suffix: str
+) -> None:
+    cases, pick = _first(tmp_path, 1)
+    stub = FlagRecorder(cases)
+    with patch("text_to_sql_agent.pipeline.generate_sql", stub):
+        result = run_suite(cases, config=_llm(**pick, **overrides), out_root=tmp_path / "out")
+    assert _manifest(result.run_dir)["ollama_think"] == recorded
+    assert result.manifest.identity.ollama_think == recorded
+    assert stub.flags == [sent]
+    assert f"_rag-on-k6-evidence-off{suffix}_" in result.run_dir.name
+    assert f"| ollama_think | `{recorded}` |" in (result.run_dir / "report.md").read_text("utf-8")
+
+
+def test_a_gold_run_records_ollama_think_as_not_applicable(tmp_path: Path) -> None:
+    # `_config()` names provider "ollama", but a gold run calls no model.
+    result = run_suite(load_suite(DEMO), config=_config(), out_root=tmp_path)
+    assert _manifest(result.run_dir)["ollama_think"] == "n/a"
+    assert "_rag-on-k6-evidence-off_" in result.run_dir.name
+
+
+@pytest.mark.parametrize(
+    "overrides,message",
+    [
+        ({"mode": "llm", "provider": "gemini", "ollama_think": "off"}, "provider 'gemini'"),
+        ({"mode": "gold", "ollama_think": "on"}, "mode 'gold'"),
+        ({"mode": "llm", "ollama_think": "maybe"}, "'maybe'"),
+    ],
+)
+def test_an_ollama_think_that_cannot_be_sent_is_refused_before_anything_is_written(
+    tmp_path: Path, overrides: dict[str, str], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        run_suite(load_suite(DEMO), config=_config(**overrides), out_root=tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_resume_refuses_a_changed_ollama_think_naming_it(tmp_path: Path) -> None:
+    cases = load_suite(DEMO)
+    stub = StubGenerator(cases, fail={cases[1].question: KeyboardInterrupt()})
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", stub),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        run_suite(cases, config=_llm(ollama_think="on"), out_root=tmp_path)
+    with (
+        patch("text_to_sql_agent.pipeline.generate_sql", StubGenerator(cases)),
+        pytest.raises(ResumeRefused, match="ollama_think"),
+    ):
+        run_suite(cases, config=_llm(), out_root=tmp_path, resume_dir=_only_dir(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--mode", "llm", "--provider", "gemini", "--ollama-think", "off"],
+        ["--mode", "gold", "--provider", "ollama", "--ollama-think", "on"],
+        ["--provider", "ollama", "--ollama-think", "default"],  # gold is the default mode
+        ["--gate", "gold", "--provider", "ollama", "--ollama-think", "off"],
+    ],
+)
+def test_cli_refuses_ollama_think_outside_an_ollama_model_run(
+    tmp_path: Path, argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["--suite", "demo", *argv, "--out-root", str(tmp_path / "out")])
+    assert exited.value.code == 2
+    assert "--ollama-think applies only to --mode llm --provider ollama" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_refuses_ollama_think_with_the_regression_gate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = ["--gate", "regression", "--new", "a", "--baseline", "b", "--ollama-think", "on"]
+    with pytest.raises(SystemExit) as exited:
+        cli.main(argv)
+    assert exited.value.code == 2
+    assert "--ollama-think" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "flag,recorded",
+    [([], "off"), (["--ollama-think", "on"], "on"), (["--ollama-think", "default"], "default")],
+)
+def test_cli_records_the_resolved_ollama_think(
+    tmp_path: Path, flag: list[str], recorded: str
+) -> None:
+    argv = ["--suite", "demo", "--mode", "llm", "--provider", "ollama", "--model", "stub:latest"]
+    with patch("text_to_sql_agent.pipeline.generate_sql", StubGenerator(load_suite(DEMO))):
+        code = cli.main([*argv, *flag, "--out-root", str(tmp_path)])
+    assert code == 0
+    assert _manifest(_only_dir(tmp_path))["ollama_think"] == recorded
 
 
 # --- execution budget ----------------------------------------------------------------------
@@ -1331,6 +1622,8 @@ def test_resume_refuses_a_changed_case_count(tmp_path: Path) -> None:
         ("outcome", "not_applicable", "'not_applicable'"),
         ("expected", "expect_refusal", "expected"),
         ("hardness", "extra", "hardness"),
+        ("prompt_tokens", "12.5", "prompt_tokens '12.5'"),
+        ("completion_tokens", "lots", "completion_tokens 'lots'"),
     ],
 )
 def test_resume_refuses_a_saved_row_the_runner_could_not_have_written(
