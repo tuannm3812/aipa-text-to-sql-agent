@@ -69,6 +69,15 @@ Project-specific rules and deliberate overrides: @docs/0_coding_standards.md
   harness and anything touching `evaluation/results/` from a clean tree —
   a dirty run is recorded as not citable. Phase 4 (real RAG) follows; see
   `docs/4_next_steps.md`.
+- 2026-10-10: Ollama thinking is an explicit setting, off by default
+  (`7708295`, `docs/3_decisions.md`): with the model's default thinking, many
+  answers came back empty under the 512-token cap. `ollama_think` is part of
+  the run identity; `langchain-ollama` is now 0.3.10. Token counts are
+  recorded per case and survive a resumed outage. `1288` passed / `350`
+  skipped without the DSN (the manifest tests cover every committed run); CI,
+  which runs the PostgreSQL suite, is green. The Spider and BIRD full release
+  runs with thinking off are in progress from a pinned worktree, not this
+  checkout.
 
 ## Open risks
 

@@ -2,6 +2,53 @@
 
 Newest first. Each entry states what was chosen and what it ruled out.
 
+## 2026-10-10 — Ollama thinking is an explicit setting, off by default
+
+**Chosen:** Every Ollama call sets the think flag, and it is off unless a caller
+asks for it, in the app and in the evaluation harness alike. The harness takes
+`--ollama-think {off,on,default}`, where `default` omits the flag as every call
+did before this date. The value is part of a run's identity (`ollama_think`), so
+a thinking-off run and a run that let the model think are different
+measurements, and the regression gate refuses to compare them. The 512-token
+output cap stays. The Spider and BIRD release runs use thinking off.
+
+**Ruled out:** Leaving the flag unset, because the outcome then depends on each
+model's own default, which a run's identity cannot see. Keeping thinking on with
+a larger cap: on three hard BIRD questions the model thought for 639 to 1,201
+tokens, so a cap that rarely starves would make every call several times slower,
+and where the old thinking fit under the cap it was no better than thinking off
+(below).
+
+**Why:** `qwen3.5:9b-q4_K_M` thinks by default, Ollama returns the thinking
+apart from the answer, and the thinking counts against the 512-token cap. When
+it used the whole cap the model returned no SQL, scored `error` with
+`EMPTY_GENERATED_SQL`, every such case at exactly 512 completion tokens: 39 of
+the 200 Spider subset cases, 97 and 106 of the BIRD subset cases with and
+without evidence, and 216 of the 1,034 Spider dev cases. `langchain-ollama`
+0.2.3 could not send the flag, so the pin moved to 0.3.10. The five routine
+runs were repeated with thinking off on commit `7708295`. Paired over the same
+cases, new minus old, 95 % bootstrap:
+
+| Suite | Thinking at model default, 512 cap | Thinking off | Paired change (points) |
+|---|---|---|---|
+| Spider subset200 | 51.5% (103/200) | 60.0% (120/200) | +8.5 [+2.0, +15.5] |
+| BIRD subset200, evidence on | 25.5% (51/200) | 37.0% (74/200) | +11.5 [+5.0, +18.0] |
+| BIRD subset200, evidence off | 17.0% (34/200) | 26.5% (53/200) | +9.5 [+4.0, +15.5] |
+
+On the cases where the old run's thinking fit under the cap, thinking off was
+level within the intervals: Spider -3.1 [-9.3, +3.1], BIRD with evidence -1.9
+[-11.7, +7.8], BIRD without +3.2 [-6.4, +12.8]. The gain is the cases that used
+to return nothing. Mean time per case fell from 23-26 s to 3-7 s. On the two
+small suites thinking off lost one case each, inside their intervals: demo 4/12
+against 5/12, and safety 11/15 against 12/15, where the model answered one
+unanswerable question with a substitute metric. The 2026-10-09 routine runs and
+the Spider dev full run in `509998b` measured the cap as much as the model. They
+stay committed as the record of that setting.
+
+The Gemini path is unchanged. It also caps output at 512 tokens, and
+`gemini-2.5-flash` also thinks by default; whether its thinking can exhaust the
+cap the same way is unverified (`docs/4_next_steps.md`).
+
 ## 2026-10-09 — the model's own refusal is a refusal; "unanswerable" on a refusal case is reported, not credited
 
 **Chosen:** The pipeline recognises the `SELECT 'BLOCKED_UNSAFE_SQL' AS error;`

@@ -7,27 +7,41 @@ prioritised working view.
 ## Evaluation v2 — what is left (do first)
 
 The contract, harness, gates and first routine results landed on 2026-10-09.
-Remaining, in order:
+On 2026-10-10 Ollama thinking became an explicit setting, off by default, after
+it was found to leave many answers empty (`docs/3_decisions.md`). Remaining, in
+order:
 
-1. **Full release runs.** `spider_dev` full and `bird_dev` full with evidence on
-   and off, on the same model, at `--work-limit 1000000000 --max-rows 100000`.
-   About 4,100 model calls; at the measured 21-26 s per case on
-   `qwen3.5:9b-q4_K_M`, roughly 25-30 hours of machine time. Run detached
-   (the harness resumes after any interruption) from a clean tree. Only then
-   may the README carry Spider/BIRD headline tables.
-2. **Gate G8, the RAG on/off ablation.** Runs on the frozen contract with the
-   paired regression machinery. Since 2026-10-10 `cases.csv` records the
-   provider's prompt and completion tokens per case (summed over generation,
-   repairs and retries), so the ablation can report cost as well as accuracy.
-   Ollama's prompt count was checked to stay the same when a prompt prefix is
-   served from its cache, so counts are comparable across cases.
-3. **Carried forward, not fixed:** a database changed *during* an uninterrupted
+1. **Full release runs, in progress.** `spider_dev` full and `bird_dev` full
+   with evidence on and off, with thinking off, at
+   `--work-limit 1000000000 --max-rows 100000`. Started 2026-10-10 from a
+   clean pinned worktree on commit `7708295`. At the measured 3-7 s per case
+   they need about 7-8 hours; the harness resumes after any interruption. Only
+   then may the README carry Spider/BIRD headline tables. The earlier runs at
+   the model's default thinking are history: the Spider dev full run is
+   committed in `509998b`, and the BIRD run stopped at 1,289 of 1,534 cases
+   and is not committed.
+2. **Gate G8, the RAG on/off ablation.** `cases.csv` now records the
+   provider's prompt and completion tokens per case, summed over generation,
+   repairs, retries and resumed outages, so the ablation can report cost as
+   well as accuracy. Ollama's prompt count stays the same when a prompt prefix
+   is served from its cache. The regression gate refuses by design to compare
+   runs that differ in a setting such as `use_rag`, so G8 needs a paired
+   comparison for one deliberate difference. The thinking comparison was
+   computed with the harness's own paired bootstrap from a one-off script;
+   G8 should make that a committed tool and re-derive it.
+3. **Gemini may starve the same way. Unverified.** The Gemini call also caps
+   output at 512 tokens, and `gemini-2.5-flash` also thinks by default. Check
+   with a key whether its thinking counts against that cap and leaves empty
+   answers on harder questions. If it does, disable it the same way
+   (`thinking_budget=0`) and record the setting in the run identity.
+4. **Carried forward, not fixed:** a database changed *during* an uninterrupted
    session is not detected (the fingerprint is taken at start and resume), and
    SQLite `-wal`/`-shm` side files are not hashed; schema recall uses a second
    retrieval call rather than the one the pipeline made; the manifest's prompt
    hash is rebuilt through a private `llm` helper; "same hostname and dead pid"
    is not proof across pid namespaces sharing a hostname. The v1 script
    (`scripts/evaluate_text_to_sql.py`) and the May tables remain as history.
+
 ## Phase 4 — Real RAG (next)
 
 Decompose `retrieve_schema_context`'s 182-line body into named, individually

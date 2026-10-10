@@ -3732,3 +3732,74 @@ call, live PostgreSQL test, remote CI check or full release run was performed.
 Only this append-only log entry was changed; no application fix, specification
 rewrite, result-artifact modification, commit, push or message to another
 agent was made.
+
+## 2026-10-10 — Claude: empty answers traced to thinking under the output cap; Codex's token P2 fixed
+
+**Codex P2, resumed outage loses tokens: fixed in `af73b75`.** The case loop now
+adds a replaced outage row's token counts to the resumed attempt's, prompt and
+completion each on its own, with blank ("not reported") kept apart from `0`. The
+stored cells are cumulative, so a second resume adds the previous total once.
+Tests cover Codex's 150/15 reproduction, a second resume (157/18), the blank and
+zero rules, and the `cases.csv` cells and `report.md` totals. Resume also now
+refuses, before any call, a saved token cell that is neither blank nor a whole
+number, since the merge parses cells the old loop only overwrote.
+
+**What the release runs exposed.** The Spider dev full run finished complete and
+citable at EX 56.1% [53.1, 59.2], but 216 of its 1,034 cases returned no SQL,
+every one at exactly 512 completion tokens. The cause, verified:
+
+- `qwen3.5:9b-q4_K_M` thinks by default (`ollama show`: thinking, default true).
+- Ollama 0.35 returns thinking apart from `message.content`.
+- The Ollama call capped output at `num_predict=512` and never set the think
+  flag, which `langchain-ollama` 0.2.3 could not send.
+
+The same defect explains the empty answers in every 2026-10-09 run: 39 of 200
+on the Spider subset, 97 and 106 of 200 on the BIRD subsets. Probes scored with
+the harness's own code: thinking off returned SQL for 18 of 18 previously empty
+cases. Thinking on with an 8,192-token cap needed 639 to 1,201 tokens on three
+hard BIRD cases.
+
+**Owner decision: stop, fix, compare, then re-run.** The BIRD full run with
+evidence was stopped at 1,289 of 1,534 cases, 660 of them empty. It is not
+citable and not committed; its directory stays untracked in the release
+worktree and can no longer be resumed from the current commit. The Spider full
+run is committed in `509998b` as the record of the shipped setting.
+
+**The fix, `7708295`.** The Ollama think flag is now explicit and off by default
+in the app and the harness. `langchain-ollama` moved from 0.2.3 to 0.3.10, the
+only locked package that changed. `ollama_think` is the last field of the run
+identity. A manifest written before the field existed loads with the value its
+runner implied, and `identity_hash` leaves the field out at those legacy
+values, so every committed `identity_sha256` reproduces; tests check all six
+committed manifests. The regression gate refuses to compare a thinking-off run
+with a legacy run and names the field. Real calls: thinking off answered a
+simple question in 19 completion tokens; thinking on filled all 512 and
+returned no SQL; `qwen2.5:3b`, which cannot think, accepts the off flag.
+
+**The comparison, five runs committed in `f4b9412`.** The 2026-10-09 routine
+runs repeated on `7708295` with `--ollama-think off`, paired on the same cases
+with the harness's paired bootstrap (10,000 resamples, seed 0), new minus old:
+
+| Suite | Old EX | New EX | Paired change | Helped / hurt |
+|---|---|---|---|---|
+| Spider subset200 | 51.5% | 60.0% | +8.5 [+2.0, +15.5] | 33 / 16 |
+| BIRD subset200, evidence on | 25.5% | 37.0% | +11.5 [+5.0, +18.0] | 36 / 13 |
+| BIRD subset200, evidence off | 17.0% | 26.5% | +9.5 [+4.0, +15.5] | 28 / 9 |
+
+On cases where the old thinking fit under the cap, the two settings are level
+within the intervals: -3.1, -1.9 and +3.2 points. Mean time per case fell from
+23-26 s to 3-7 s. Demo went from 5/12 to 4/12 and safety from 12/15 to 11/15,
+both inside their intervals; with thinking off the model answered one
+unanswerable safety question, shipping weight, with average unit cost.
+
+**Release runs restarted.** Spider dev full and BIRD dev full with evidence on
+and off, thinking off, from the pinned worktree at `7708295`, started at 18:17
+local time. Expected about 7-8 hours. The README now shows demo and safety
+under both settings and links every subset run; Spider/BIRD headline tables
+wait for the full runs.
+
+Verified: suite 1283 passed, 350 skipped without the DSN at `7708295`, and 1288
+once the five new runs are committed, because the manifest tests cover every
+committed run; ruff, ruff format and mypy clean; CI green on both branches at
+`7708295`. Next: commit the full runs
+and fill the README tables, then Codex's review of this entry.
