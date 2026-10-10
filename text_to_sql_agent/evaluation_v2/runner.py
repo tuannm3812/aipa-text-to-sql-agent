@@ -9,7 +9,8 @@
 3. for each case not yet terminal, runs the reference through ``run_gold`` (never
    ``execute_query`` directly), runs the model through ``ask_database_with_sql`` - or, in gold
    mode, uses the reference result as the model's - scores it with ``score_v2``, and
-   checkpoints the **whole** ``cases.csv`` atomically (temp file, then ``os.replace``);
+   checkpoints the **whole** ``cases.csv`` atomically (temp file, then ``os.replace``). A
+   re-run ``outage`` row keeps the tokens spent before it: they are added to the new row's;
 4. writes ``report.md`` and the final manifest, ``complete`` only when every selected case
    has a terminal row and none is ``outage``.
 
@@ -112,6 +113,8 @@ CSV_COLUMNS: tuple[str, ...] = (
     "completion_tokens",
     "generation_failure",
 )
+# Provider-reported counts: a whole number, or blank when the provider reported nothing.
+TOKEN_COLUMNS: tuple[str, ...] = ("prompt_tokens", "completion_tokens")
 
 OUTAGE = "outage"
 # A gold run has nothing to run for a refusal or unanswerable case: there is no reference and
@@ -522,8 +525,9 @@ def evaluate_case(case: Case, config: RunConfig) -> Row:
         "schema_recall": recall,
         "retrieved_tables": retrieved,
         "attempts": attempts,
-        # Summed by `usage_scope` over the generation, every repair and every retry. Blank
-        # means "not reported" (gold runs, or a provider that gave no usage), never zero.
+        # Summed by `usage_scope` over the generation, every repair and every retry, and by a
+        # resume over the sessions before an outage (`_keep_spent_tokens`). Blank means "not
+        # reported" (gold runs, or a provider that gave no usage), never zero.
         "prompt_tokens": "" if usage.prompt_tokens is None else str(usage.prompt_tokens),
         "completion_tokens": (
             "" if usage.completion_tokens is None else str(usage.completion_tokens)
@@ -761,6 +765,15 @@ def _check_saved_row(row: Row, case: Case, mode: str, cases_path: Path) -> None:
                 f"{cases_path}: row '{case.id}' has {field} {row[field]!r}, but the case "
                 f"says {getattr(case, field)!r}"
             )
+    # Checked here, before anything runs: a resumed outage adds its saved counts to the new
+    # attempt's (`_keep_spent_tokens`), and the report sums every row's.
+    for field in TOKEN_COLUMNS:
+        cell = row[field]
+        if cell and not (cell.isascii() and cell.isdigit()):
+            raise ResumeRefused(
+                f"{cases_path}: row '{case.id}' has {field} {cell!r}, which the runner never "
+                "writes (a whole number of tokens, or blank)"
+            )
 
 
 def _saved_vs_now(name: str, saved: dict[str, Any], now: dict[str, Any]) -> str:
@@ -856,6 +869,29 @@ def _generation_failures(rows: Sequence[Row]) -> int:
     return sum(1 for row in rows if row["outcome"] != OUTAGE and row["generation_failure"])
 
 
+def _add_token_cells(earlier: str, latest: str) -> str:
+    """Two token cells added, keeping blank ("not reported") apart from an explicit ``0``.
+
+    Blank plus blank stays blank; a count plus blank is that count; two counts are summed.
+    """
+    if not earlier:
+        return latest
+    if not latest:
+        return earlier
+    return str(int(earlier) + int(latest))
+
+
+def _keep_spent_tokens(outage_row: Row, row: Row) -> Row:
+    """``row``, which replaces a saved ``outage`` row, with that row's token counts added.
+
+    Tokens a session spent on the case before its outage were spent in this run, so a resume
+    keeps them in the case's totals, prompt and completion each on its own. The saved cells
+    already hold every earlier session's sum, so each resume adds the previous total exactly
+    once. Every other cell, the outcome included, is the new attempt's.
+    """
+    return row | {name: _add_token_cells(outage_row[name], row[name]) for name in TOKEN_COLUMNS}
+
+
 def run_suite(
     cases: Sequence[Case],
     *,
@@ -866,7 +902,8 @@ def run_suite(
     """Run ``cases`` into a new directory under ``out_root``, or resume ``resume_dir``.
 
     ``cases`` must be exactly ``select_cases(config)``. On resume: every saved terminal row is
-    kept, and the cases that are unattempted or ``outage`` are run, each exactly once.
+    kept, and the cases that are unattempted or ``outage`` are run, each exactly once. An
+    ``outage`` row's token counts are added to the row that replaces it.
 
     Raises:
         ResumeRefused: If ``resume_dir`` is locked by another session, is not an incomplete
@@ -950,7 +987,9 @@ def _run_locked(
         saved_row = rows.get(case.id)
         if saved_row is not None and saved_row["outcome"] != OUTAGE:
             continue
-        rows[case.id] = evaluate_case(case, config)
+        row = evaluate_case(case, config)
+        # A saved row reaching here is an outage being retried: its spent tokens carry over.
+        rows[case.id] = row if saved_row is None else _keep_spent_tokens(saved_row, row)
         write_rows(run_dir / CASES_FILE, [rows[i] for i in ids if i in rows])
         # Still `incomplete`: refreshed only so an interrupted session keeps its elapsed time
         # and outage count for the resume that follows.
